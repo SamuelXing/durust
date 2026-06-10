@@ -1,17 +1,15 @@
 use crate::error::Result;
 use crate::provider::{StateProvider, WorkflowStatus, STATUS_PENDING};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::time::Duration;
 use tokio::sync::Mutex;
 
 #[derive(Default)]
 struct Inner {
     workflows: HashMap<String, WorkflowStatus>,
     steps: HashMap<(String, i32), Value>,
-    timers: HashMap<(String, i32), DateTime<Utc>>,
 }
 
 /// In-memory [`StateProvider`] for tests and quick starts (no database needed).
@@ -91,22 +89,6 @@ impl StateProvider for InMemoryProvider {
             .or_insert(value)
             .clone();
         Ok(canonical)
-    }
-
-    async fn get_or_set_wakeup(
-        &self,
-        workflow_id: &str,
-        seq: i32,
-        dur: Duration,
-    ) -> Result<DateTime<Utc>> {
-        let proposed = Utc::now()
-            + chrono::Duration::from_std(dur).unwrap_or_else(|_| chrono::Duration::zero());
-        let mut g = self.inner.lock().await;
-        let wake = *g
-            .timers
-            .entry((workflow_id.to_string(), seq))
-            .or_insert(proposed);
-        Ok(wake)
     }
 
     async fn list_incomplete_workflows(&self) -> Result<Vec<WorkflowStatus>> {

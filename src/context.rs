@@ -204,15 +204,33 @@ impl DurableContext {
 
     /// Durably sleep for `dur`.
     ///
-    /// The absolute wake time is fixed and persisted on the first call, so the
-    /// timer does not drift if the workflow crashes and is replayed: a replay
-    /// reads the same wake instant and only waits the *remaining* time.
+    /// The absolute wake time is fixed and persisted on the first call as an
+    /// ordinary `DBOS.sleep` step (the same way the Go SDK records it in
+    /// `operation_outputs`), so the timer does not drift if the workflow crashes
+    /// and is replayed: a replay reads the same wake instant and only waits the
+    /// *remaining* time.
     pub async fn sleep(&self, dur: Duration) -> Result<()> {
         let seq = self.next_seq();
-        let wake_at = self
-            .provider
-            .get_or_set_wakeup(&self.workflow_id, seq, dur)
-            .await?;
+
+        // First call fixes the wake instant; replays read the stored one.
+        let wake_at: chrono::DateTime<chrono::Utc> =
+            match self.provider.get_step_result(&self.workflow_id, seq).await? {
+                Some(stored) => serde_json::from_value(stored)?,
+                None => {
+                    let proposed = chrono::Utc::now()
+                        + chrono::Duration::from_std(dur).unwrap_or_else(|_| chrono::Duration::zero());
+                    let canonical = self
+                        .provider
+                        .record_step_result(
+                            &self.workflow_id,
+                            seq,
+                            "DBOS.sleep",
+                            serde_json::to_value(proposed)?,
+                        )
+                        .await?;
+                    serde_json::from_value(canonical)?
+                }
+            };
 
         let now = chrono::Utc::now();
         if wake_at > now {

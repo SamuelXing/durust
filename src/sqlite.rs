@@ -3,61 +3,65 @@ use crate::provider::{StateProvider, WorkflowStatus, STATUS_PENDING};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
+use std::str::FromStr;
 
-/// Columns selected when materializing a [`WorkflowStatus`] from `workflow_status`.
 const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, executor_id, \
      application_version, queue_name, priority, deduplication_id, recovery_attempts, \
      parent_workflow_id, workflow_deadline_epoch_ms, created_at, updated_at";
 
-/// Postgres-backed [`StateProvider`], built on sqlx and the canonical DBOS
-/// schema (`workflow_status` / `operation_outputs`).
-pub struct PostgresProvider {
-    pool: PgPool,
+/// SQLite-backed [`StateProvider`].
+///
+/// Gives durable, crash-recoverable state without running a database server —
+/// the embedded counterpart to [`crate::PostgresProvider`], using the same
+/// canonical DBOS schema. A file URL (`sqlite://durust.db`) survives process
+/// restarts; `sqlite::memory:` is handy for tests within a single process.
+pub struct SqliteProvider {
+    pool: SqlitePool,
 }
 
-impl PostgresProvider {
-    /// Connect to Postgres using a standard connection URL, e.g.
-    /// `postgres://user:pass@localhost:5432/durust`.
+impl SqliteProvider {
+    /// Connect using a sqlx SQLite URL, e.g. `sqlite://durust.db` (created if
+    /// missing) or `sqlite::memory:`. Foreign keys are enabled on every
+    /// connection, as the schema's `ON DELETE CASCADE` relationships require.
     pub async fn connect(database_url: &str) -> Result<Self> {
-        let pool = PgPoolOptions::new()
-            .max_connections(8)
-            .connect(database_url)
+        let opts = SqliteConnectOptions::from_str(database_url)?
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(opts)
             .await?;
         Ok(Self { pool })
     }
 
-    /// Build a provider from an existing pool (useful if your app already owns one).
-    pub fn from_pool(pool: PgPool) -> Self {
+    /// Build a provider from an existing pool.
+    pub fn from_pool(pool: SqlitePool) -> Self {
         Self { pool }
     }
 }
 
-/// Epoch-millis (as stored) → `DateTime<Utc>`.
 fn ms_to_dt(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).unwrap_or_else(Utc::now)
 }
 
-/// Parse a stored TEXT column into a JSON [`Value`], if present.
 fn parse_opt(s: Option<String>) -> Option<Value> {
     s.and_then(|t| serde_json::from_str(&t).ok())
 }
 
-/// Map a `workflow_status` row to a [`WorkflowStatus`].
-fn row_to_status(row: &sqlx::postgres::PgRow) -> WorkflowStatus {
-    let inputs: Option<String> = row.try_get("inputs").ok().flatten();
+fn row_to_status(row: &sqlx::sqlite::SqliteRow) -> WorkflowStatus {
     WorkflowStatus {
         id: row.get("workflow_uuid"),
         name: row.get("name"),
         status: row.get("status"),
-        input: parse_opt(inputs).unwrap_or(Value::Null),
+        input: parse_opt(row.try_get("inputs").ok().flatten()).unwrap_or(Value::Null),
         output: parse_opt(row.try_get("output").ok().flatten()),
         error: row.try_get("error").ok().flatten(),
         executor_id: row.get("executor_id"),
         app_version: row.get("application_version"),
         queue_name: row.try_get("queue_name").ok().flatten(),
-        priority: row.get("priority"),
+        priority: row.get::<i64, _>("priority") as i32,
         dedup_id: row.try_get("deduplication_id").ok().flatten(),
         recovery_attempts: row.get::<i64, _>("recovery_attempts") as i32,
         parent_workflow_id: row.try_get("parent_workflow_id").ok().flatten(),
@@ -68,25 +72,19 @@ fn row_to_status(row: &sqlx::postgres::PgRow) -> WorkflowStatus {
 }
 
 #[async_trait]
-impl StateProvider for PostgresProvider {
+impl StateProvider for SqliteProvider {
     async fn init(&self) -> Result<()> {
-        // Embedded migrations (baked in at compile time from ./migrations/postgres).
-        // sqlx tracks applied versions in `_sqlx_migrations` and applies only what
-        // is pending, so this is safe on every startup and upgrades existing DBs.
-        sqlx::migrate!("./migrations/postgres")
-            .run(&self.pool)
-            .await?;
+        sqlx::migrate!("./migrations/sqlite").run(&self.pool).await?;
         Ok(())
     }
 
     async fn insert_workflow_status(&self, s: WorkflowStatus) -> Result<WorkflowStatus> {
-        // Idempotent create: an existing id is left untouched.
         sqlx::query(
             "INSERT INTO workflow_status
                  (workflow_uuid, name, inputs, status, executor_id, application_version,
                   queue_name, priority, deduplication_id, parent_workflow_id,
                   workflow_deadline_epoch_ms, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (workflow_uuid) DO NOTHING",
         )
         .bind(&s.id)
@@ -106,7 +104,7 @@ impl StateProvider for PostgresProvider {
         .await?;
 
         let row = sqlx::query(&format!(
-            "SELECT {SELECT_COLS} FROM workflow_status WHERE workflow_uuid = $1"
+            "SELECT {SELECT_COLS} FROM workflow_status WHERE workflow_uuid = ?"
         ))
         .bind(&s.id)
         .fetch_one(&self.pool)
@@ -116,7 +114,7 @@ impl StateProvider for PostgresProvider {
 
     async fn get_workflow_status(&self, id: &str) -> Result<Option<WorkflowStatus>> {
         let row = sqlx::query(&format!(
-            "SELECT {SELECT_COLS} FROM workflow_status WHERE workflow_uuid = $1"
+            "SELECT {SELECT_COLS} FROM workflow_status WHERE workflow_uuid = ?"
         ))
         .bind(id)
         .fetch_optional(&self.pool)
@@ -134,17 +132,17 @@ impl StateProvider for PostgresProvider {
         let output_str = output.map(serde_json::to_string).transpose()?;
         sqlx::query(
             "UPDATE workflow_status
-             SET status = $2,
-                 output = COALESCE($3, output),
-                 error  = COALESCE($4, error),
-                 updated_at = $5
-             WHERE workflow_uuid = $1",
+             SET status = ?,
+                 output = COALESCE(?, output),
+                 error  = COALESCE(?, error),
+                 updated_at = ?
+             WHERE workflow_uuid = ?",
         )
-        .bind(id)
         .bind(status)
         .bind(output_str)
         .bind(error)
         .bind(Utc::now().timestamp_millis())
+        .bind(id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -152,7 +150,7 @@ impl StateProvider for PostgresProvider {
 
     async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<Value>> {
         let row = sqlx::query(
-            "SELECT output FROM operation_outputs WHERE workflow_uuid = $1 AND function_id = $2",
+            "SELECT output FROM operation_outputs WHERE workflow_uuid = ? AND function_id = ?",
         )
         .bind(workflow_id)
         .bind(seq)
@@ -170,7 +168,7 @@ impl StateProvider for PostgresProvider {
     ) -> Result<Value> {
         sqlx::query(
             "INSERT INTO operation_outputs (workflow_uuid, function_id, function_name, output)
-             VALUES ($1, $2, $3, $4)
+             VALUES (?, ?, ?, ?)
              ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
         )
         .bind(workflow_id)
@@ -180,9 +178,8 @@ impl StateProvider for PostgresProvider {
         .execute(&self.pool)
         .await?;
 
-        // Read back the canonical value (ours, or a racing writer's that won).
         let row = sqlx::query(
-            "SELECT output FROM operation_outputs WHERE workflow_uuid = $1 AND function_id = $2",
+            "SELECT output FROM operation_outputs WHERE workflow_uuid = ? AND function_id = ?",
         )
         .bind(workflow_id)
         .bind(seq)
@@ -193,7 +190,7 @@ impl StateProvider for PostgresProvider {
 
     async fn list_incomplete_workflows(&self) -> Result<Vec<WorkflowStatus>> {
         let rows = sqlx::query(&format!(
-            "SELECT {SELECT_COLS} FROM workflow_status WHERE status = $1"
+            "SELECT {SELECT_COLS} FROM workflow_status WHERE status = ?"
         ))
         .bind(STATUS_PENDING)
         .fetch_all(&self.pool)

@@ -2,7 +2,6 @@ use crate::error::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use std::time::Duration;
 
 /// Workflow lifecycle states, aligned with the DBOS Go SDK.
 ///
@@ -135,6 +134,10 @@ pub trait StateProvider: Send + Sync {
     /// Returns the **canonical** stored value: if a concurrent/duplicate
     /// execution already wrote this step, the previously-stored value wins and is
     /// returned, guaranteeing every caller observes the same result.
+    ///
+    /// Durable sleep is built on this too: the wake instant is recorded as an
+    /// ordinary step (`DBOS.sleep`), exactly as the Go SDK stores it in
+    /// `operation_outputs` — there is no separate timers table.
     async fn record_step_result(
         &self,
         workflow_id: &str,
@@ -142,16 +145,6 @@ pub trait StateProvider: Send + Sync {
         name: &str,
         value: Value,
     ) -> Result<Value>;
-
-    /// Idempotently resolve the wake time for a durable sleep keyed by
-    /// `(workflow_id, seq)`. The first call fixes `now + dur`; later calls (e.g.
-    /// after a crash) return the *same* absolute instant so timers do not drift.
-    async fn get_or_set_wakeup(
-        &self,
-        workflow_id: &str,
-        seq: i32,
-        dur: Duration,
-    ) -> Result<DateTime<Utc>>;
 
     /// All workflows that are not in a terminal state — the recovery set.
     async fn list_incomplete_workflows(&self) -> Result<Vec<WorkflowStatus>>;
