@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::provider::{StateProvider, WorkflowRecord, STATUS_COMPLETED, STATUS_FAILED, STATUS_PENDING};
+use crate::provider::{StateProvider, WorkflowStatus, STATUS_PENDING};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -7,16 +7,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
-#[derive(Clone)]
-struct WfRow {
-    name: String,
-    input: Value,
-    status: String,
-}
-
 #[derive(Default)]
 struct Inner {
-    workflows: HashMap<String, WfRow>,
+    workflows: HashMap<String, WorkflowStatus>,
     steps: HashMap<(String, i32), Value>,
     timers: HashMap<(String, i32), DateTime<Utc>>,
 }
@@ -43,23 +36,40 @@ impl StateProvider for InMemoryProvider {
         Ok(())
     }
 
-    async fn start_workflow(&self, id: &str, name: &str, input: &Value) -> Result<WorkflowRecord> {
+    async fn insert_workflow_status(&self, status: WorkflowStatus) -> Result<WorkflowStatus> {
         let mut g = self.inner.lock().await;
         let row = g
             .workflows
-            .entry(id.to_string())
-            .or_insert_with(|| WfRow {
-                name: name.to_string(),
-                input: input.clone(),
-                status: STATUS_PENDING.to_string(),
-            })
+            .entry(status.id.clone())
+            .or_insert(status)
             .clone();
-        Ok(WorkflowRecord {
-            id: id.to_string(),
-            name: row.name,
-            input: row.input,
-            status: row.status,
-        })
+        Ok(row)
+    }
+
+    async fn get_workflow_status(&self, id: &str) -> Result<Option<WorkflowStatus>> {
+        let g = self.inner.lock().await;
+        Ok(g.workflows.get(id).cloned())
+    }
+
+    async fn set_workflow_status(
+        &self,
+        id: &str,
+        status: &str,
+        output: Option<&Value>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        if let Some(row) = g.workflows.get_mut(id) {
+            row.status = status.to_string();
+            if let Some(o) = output {
+                row.output = Some(o.clone());
+            }
+            if let Some(e) = error {
+                row.error = Some(e.to_string());
+            }
+            row.updated_at = Utc::now();
+        }
+        Ok(())
     }
 
     async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<Value>> {
@@ -99,33 +109,12 @@ impl StateProvider for InMemoryProvider {
         Ok(wake)
     }
 
-    async fn complete_workflow(&self, id: &str, _output: &Value) -> Result<()> {
-        let mut g = self.inner.lock().await;
-        if let Some(row) = g.workflows.get_mut(id) {
-            row.status = STATUS_COMPLETED.to_string();
-        }
-        Ok(())
-    }
-
-    async fn fail_workflow(&self, id: &str, _error: &str) -> Result<()> {
-        let mut g = self.inner.lock().await;
-        if let Some(row) = g.workflows.get_mut(id) {
-            row.status = STATUS_FAILED.to_string();
-        }
-        Ok(())
-    }
-
-    async fn list_incomplete_workflows(&self) -> Result<Vec<WorkflowRecord>> {
+    async fn list_incomplete_workflows(&self) -> Result<Vec<WorkflowStatus>> {
         let g = self.inner.lock().await;
         Ok(g.workflows
-            .iter()
-            .filter(|(_, r)| r.status == STATUS_PENDING)
-            .map(|(id, r)| WorkflowRecord {
-                id: id.clone(),
-                name: r.name.clone(),
-                input: r.input.clone(),
-                status: r.status.clone(),
-            })
+            .values()
+            .filter(|r| r.status == STATUS_PENDING)
+            .cloned()
             .collect())
     }
 }

@@ -4,26 +4,102 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::time::Duration;
 
-/// Terminal and non-terminal states a workflow instance can be in.
+/// Workflow lifecycle states, aligned with the DBOS Go SDK.
+///
+/// `ENQUEUED` — sitting in a queue, not yet dispatched (Phase 2).
+/// `PENDING` — claimed by an executor and running.
+/// `SUCCESS` / `ERROR` — terminal outcomes.
+/// `CANCELLED` — terminated by an operator; replay is refused.
+/// `MAX_RECOVERY_ATTEMPTS_EXCEEDED` — recovered too many times; parked (Phase 4).
+pub const STATUS_ENQUEUED: &str = "ENQUEUED";
 pub const STATUS_PENDING: &str = "PENDING";
-pub const STATUS_COMPLETED: &str = "COMPLETED";
-pub const STATUS_FAILED: &str = "FAILED";
+pub const STATUS_SUCCESS: &str = "SUCCESS";
+pub const STATUS_ERROR: &str = "ERROR";
+pub const STATUS_CANCELLED: &str = "CANCELLED";
+pub const STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED: &str = "MAX_RECOVERY_ATTEMPTS_EXCEEDED";
 
-/// A persisted workflow instance row.
+/// `true` if `status` is terminal (no further execution will occur).
+pub fn is_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        STATUS_SUCCESS | STATUS_ERROR | STATUS_CANCELLED | STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED
+    )
+}
+
+/// A persisted workflow instance — the Go SDK's `WorkflowStatus`.
+///
+/// Carries everything the engine, queues, and management APIs need. Many fields
+/// are unused until later phases (queues, scheduling, recovery hardening) but
+/// live here from the start so the storage schema is stable.
 #[derive(Clone, Debug)]
-pub struct WorkflowRecord {
+pub struct WorkflowStatus {
     pub id: String,
     pub name: String,
-    pub input: Value,
     pub status: String,
+    pub input: Value,
+    /// Present once the workflow reaches `SUCCESS`.
+    pub output: Option<Value>,
+    /// Present once the workflow reaches `ERROR`.
+    pub error: Option<String>,
+    /// The executor (process) that owns this run; empty until claimed.
+    pub executor_id: String,
+    /// Application version that produced this row — recovery is version-gated.
+    pub app_version: String,
+    /// Queue this workflow was enqueued on, if any (Phase 2).
+    pub queue_name: Option<String>,
+    /// Dispatch priority within a queue; lower runs first (Phase 2).
+    pub priority: i32,
+    /// Deduplication key within a queue (Phase 2).
+    pub dedup_id: Option<String>,
+    /// How many times recovery has re-dispatched this workflow (Phase 4).
+    pub recovery_attempts: i32,
+    /// Parent workflow id for child workflows (Phase 4+).
+    pub parent_workflow_id: Option<String>,
+    /// Absolute deadline in epoch millis, if a timeout was set (Phase 5).
+    pub deadline_ms: Option<i64>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl WorkflowStatus {
+    /// A fresh row for `id`/`name`/`input` in the given non-terminal `status`,
+    /// stamped with the owning executor and app version. Optional fields default
+    /// to empty; callers set queue/priority/etc. as needed.
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        input: Value,
+        status: impl Into<String>,
+        executor_id: impl Into<String>,
+        app_version: impl Into<String>,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: id.into(),
+            name: name.into(),
+            status: status.into(),
+            input,
+            output: None,
+            error: None,
+            executor_id: executor_id.into(),
+            app_version: app_version.into(),
+            queue_name: None,
+            priority: 0,
+            dedup_id: None,
+            recovery_attempts: 0,
+            parent_workflow_id: None,
+            deadline_ms: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
 }
 
 /// The pluggable durable-state backend.
 ///
-/// This is the single seam that decouples the runtime from storage. The v0.1
-/// ships a Postgres implementation and an in-memory one; a DynamoDB / Aurora
-/// DSQL implementation can be added later **without touching the engine** —
-/// that is the whole point of this trait.
+/// This is the single seam that decouples the runtime from storage. v0.1 ships a
+/// Postgres implementation and an in-memory one; a DynamoDB / Aurora DSQL
+/// implementation can be added later **without touching the engine**.
 ///
 /// Every method must be **idempotent** with respect to its keys, because the
 /// engine may re-run a workflow after a crash and replay completed steps.
@@ -32,10 +108,24 @@ pub trait StateProvider: Send + Sync {
     /// Create tables / indexes if they do not yet exist.
     async fn init(&self) -> Result<()>;
 
-    /// Idempotently create a workflow instance. If `id` already exists, the
-    /// existing row is returned unchanged (so a re-submitted workflow id is a
-    /// no-op, not a duplicate).
-    async fn start_workflow(&self, id: &str, name: &str, input: &Value) -> Result<WorkflowRecord>;
+    /// Idempotently insert a workflow row. If `status.id` already exists, the
+    /// existing row is returned unchanged (so a re-submitted id is a no-op, not a
+    /// duplicate). This is the single creation path for both direct runs and
+    /// enqueues.
+    async fn insert_workflow_status(&self, status: WorkflowStatus) -> Result<WorkflowStatus>;
+
+    /// Fetch a workflow row by id, if it exists.
+    async fn get_workflow_status(&self, id: &str) -> Result<Option<WorkflowStatus>>;
+
+    /// Transition a workflow to a new status, optionally writing its terminal
+    /// `output` or `error`. Bumps `updated_at`.
+    async fn set_workflow_status(
+        &self,
+        id: &str,
+        status: &str,
+        output: Option<&Value>,
+        error: Option<&str>,
+    ) -> Result<()>;
 
     /// Return a previously checkpointed step result, if any.
     async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<Value>>;
@@ -43,8 +133,8 @@ pub trait StateProvider: Send + Sync {
     /// Idempotently record a step result keyed by `(workflow_id, seq)`.
     ///
     /// Returns the **canonical** stored value: if a concurrent/duplicate
-    /// execution already wrote this step, the previously-stored value wins and
-    /// is returned, guaranteeing every caller observes the same result.
+    /// execution already wrote this step, the previously-stored value wins and is
+    /// returned, guaranteeing every caller observes the same result.
     async fn record_step_result(
         &self,
         workflow_id: &str,
@@ -54,9 +144,8 @@ pub trait StateProvider: Send + Sync {
     ) -> Result<Value>;
 
     /// Idempotently resolve the wake time for a durable sleep keyed by
-    /// `(workflow_id, seq)`. The first call fixes `now + dur`; later calls
-    /// (e.g. after a crash) return the *same* absolute instant so timers do
-    /// not drift across replays.
+    /// `(workflow_id, seq)`. The first call fixes `now + dur`; later calls (e.g.
+    /// after a crash) return the *same* absolute instant so timers do not drift.
     async fn get_or_set_wakeup(
         &self,
         workflow_id: &str,
@@ -64,12 +153,6 @@ pub trait StateProvider: Send + Sync {
         dur: Duration,
     ) -> Result<DateTime<Utc>>;
 
-    /// Mark a workflow COMPLETED with its output.
-    async fn complete_workflow(&self, id: &str, output: &Value) -> Result<()>;
-
-    /// Mark a workflow FAILED with an error message.
-    async fn fail_workflow(&self, id: &str, error: &str) -> Result<()>;
-
     /// All workflows that are not in a terminal state — the recovery set.
-    async fn list_incomplete_workflows(&self) -> Result<Vec<WorkflowRecord>>;
+    async fn list_incomplete_workflows(&self) -> Result<Vec<WorkflowStatus>>;
 }

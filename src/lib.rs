@@ -37,16 +37,21 @@
 mod context;
 mod engine;
 mod error;
+mod handle;
 mod memory;
 mod postgres;
 mod provider;
 
-pub use context::DurableContext;
-pub use engine::{erase, DurableEngine, WorkflowFn, WorkflowRegistration};
+pub use context::{DurableContext, StepOptions};
+pub use engine::{erase, DurableEngine, WorkflowFn, WorkflowOptions, WorkflowRegistration};
 pub use error::{Error, Result};
+pub use handle::WorkflowHandle;
 pub use memory::InMemoryProvider;
 pub use postgres::PostgresProvider;
-pub use provider::{StateProvider, WorkflowRecord, STATUS_COMPLETED, STATUS_FAILED, STATUS_PENDING};
+pub use provider::{
+    is_terminal, StateProvider, WorkflowStatus, STATUS_CANCELLED, STATUS_ENQUEUED, STATUS_ERROR,
+    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
+};
 
 /// The `#[workflow]` attribute macro — the Rust analog of `@DBOS.workflow()`.
 /// Annotate an `async fn(DurableContext, Input) -> Result<Output>` to have it

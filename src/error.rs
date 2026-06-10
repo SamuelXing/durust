@@ -15,6 +15,15 @@ pub enum Error {
     #[error("no workflow registered under name `{0}`")]
     UnknownWorkflow(String),
 
+    /// The workflow was cancelled by an operator; execution was refused.
+    #[error("workflow `{0}` was cancelled")]
+    Cancelled(String),
+
+    /// A blocking operation (recv/get_event/get_result) or a workflow deadline
+    /// elapsed before completion.
+    #[error("operation timed out")]
+    Timeout,
+
     /// An error raised by user code inside a step or workflow.
     #[error("{0}")]
     App(String),
