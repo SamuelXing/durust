@@ -81,7 +81,9 @@ fn row_to_status(row: &sqlx::sqlite::SqliteRow) -> WorkflowStatus {
 #[async_trait]
 impl StateProvider for SqliteProvider {
     async fn init(&self) -> Result<()> {
-        sqlx::migrate!("./migrations/sqlite").run(&self.pool).await?;
+        sqlx::migrate!("./migrations/sqlite")
+            .run(&self.pool)
+            .await?;
         Ok(())
     }
 

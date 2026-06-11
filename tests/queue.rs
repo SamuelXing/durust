@@ -105,17 +105,15 @@ async fn priority_orders_execution() -> Result<()> {
             Ok::<_, Error>(n)
         }
     });
-    engine.register_queue(
-        test_queue("prio")
-            .worker_concurrency(1)
-            .priority_enabled(),
-    );
+    engine.register_queue(test_queue("prio").worker_concurrency(1).priority_enabled());
 
     // Enqueue before launch so all three are pending when dispatch begins.
     for (i, prio) in [(0, 3), (1, 1), (2, 2)] {
         let mut opts = WorkflowOptions::with_id(format!("wf-prio-{i}"));
         opts.priority = prio;
-        let _ = engine.enqueue::<_, i64>("prio", "record", prio as i64, opts).await?;
+        let _ = engine
+            .enqueue::<_, i64>("prio", "record", prio as i64, opts)
+            .await?;
     }
     engine.launch().await?;
 
@@ -144,7 +142,9 @@ async fn delayed_enqueue_waits_then_runs() -> Result<()> {
     let started = Instant::now();
     let mut opts = WorkflowOptions::with_id("wf-delayed");
     opts.delay = Some(Duration::from_millis(150));
-    let mut handle = engine.enqueue::<_, i64>("later", "echo", 7_i64, opts).await?;
+    let mut handle = engine
+        .enqueue::<_, i64>("later", "echo", 7_i64, opts)
+        .await?;
 
     assert_eq!(handle.get_status().await?.status, STATUS_DELAYED);
     assert_eq!(handle.get_result().await?, 7);
@@ -183,14 +183,15 @@ async fn dedup_id_rejects_duplicates() -> Result<()> {
 
     let mut opts = WorkflowOptions::with_id("wf-dedup-1");
     opts.dedup_id = Some("once".to_string());
-    let _first = engine
-        .enqueue::<_, ()>("dedup", "noop", (), opts)
-        .await?;
+    let _first = engine.enqueue::<_, ()>("dedup", "noop", (), opts).await?;
 
     let mut opts = WorkflowOptions::with_id("wf-dedup-2");
     opts.dedup_id = Some("once".to_string());
     let second = engine.enqueue::<_, ()>("dedup", "noop", (), opts).await;
-    assert!(second.is_err(), "same dedup id on the same queue must be rejected");
+    assert!(
+        second.is_err(),
+        "same dedup id on the same queue must be rejected"
+    );
     Ok(())
 }
 

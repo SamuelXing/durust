@@ -144,7 +144,11 @@ impl DurableContext {
     /// refuse to start fresh work on a `CANCELLED` workflow. `Ok(Some(v))` means
     /// "return `v`"; `Ok(None)` means "proceed to run the closure".
     async fn replay_or_guard<T: DeserializeOwned>(&self, seq: i32) -> Result<Option<T>> {
-        if let Some(stored) = self.provider.get_step_result(&self.workflow_id, seq).await? {
+        if let Some(stored) = self
+            .provider
+            .get_step_result(&self.workflow_id, seq)
+            .await?
+        {
             return Ok(Some(serde_json::from_value(stored)?));
         }
         if let Some(status) = self.provider.get_workflow_status(&self.workflow_id).await? {
@@ -186,8 +190,8 @@ impl DurableContext {
                     if attempt >= opts.max_retries {
                         return Err(e);
                     }
-                    let backoff = opts.base_interval.as_secs_f64()
-                        * opts.backoff_factor.powi(attempt as i32);
+                    let backoff =
+                        opts.base_interval.as_secs_f64() * opts.backoff_factor.powi(attempt as i32);
                     let delay = Duration::from_secs_f64(backoff).min(opts.max_interval);
                     tracing::warn!(
                         step = %opts.name,
@@ -213,24 +217,27 @@ impl DurableContext {
         let seq = self.next_seq();
 
         // First call fixes the wake instant; replays read the stored one.
-        let wake_at: chrono::DateTime<chrono::Utc> =
-            match self.provider.get_step_result(&self.workflow_id, seq).await? {
-                Some(stored) => serde_json::from_value(stored)?,
-                None => {
-                    let proposed = chrono::Utc::now()
-                        + chrono::Duration::from_std(dur).unwrap_or_else(|_| chrono::Duration::zero());
-                    let canonical = self
-                        .provider
-                        .record_step_result(
-                            &self.workflow_id,
-                            seq,
-                            "DBOS.sleep",
-                            serde_json::to_value(proposed)?,
-                        )
-                        .await?;
-                    serde_json::from_value(canonical)?
-                }
-            };
+        let wake_at: chrono::DateTime<chrono::Utc> = match self
+            .provider
+            .get_step_result(&self.workflow_id, seq)
+            .await?
+        {
+            Some(stored) => serde_json::from_value(stored)?,
+            None => {
+                let proposed = chrono::Utc::now()
+                    + chrono::Duration::from_std(dur).unwrap_or_else(|_| chrono::Duration::zero());
+                let canonical = self
+                    .provider
+                    .record_step_result(
+                        &self.workflow_id,
+                        seq,
+                        "DBOS.sleep",
+                        serde_json::to_value(proposed)?,
+                    )
+                    .await?;
+                serde_json::from_value(canonical)?
+            }
+        };
 
         let now = chrono::Utc::now();
         if wake_at > now {

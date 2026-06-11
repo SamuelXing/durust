@@ -203,7 +203,12 @@ impl DurableEngine {
         // Stop claiming new work first, then drain what is already running. An
         // aborted dispatcher can leave a freshly claimed workflow PENDING; the
         // next launch's recover() re-runs it from its checkpoints.
-        for d in self.dispatchers.lock().expect("dispatcher lock poisoned").drain(..) {
+        for d in self
+            .dispatchers
+            .lock()
+            .expect("dispatcher lock poisoned")
+            .drain(..)
+        {
             d.abort();
         }
         let deadline = std::time::Instant::now() + timeout;
@@ -266,9 +271,14 @@ impl DurableEngine {
             (true, Some(_)) => STATUS_DELAYED,
         };
         // A queued row is unowned until a dispatcher claims it.
-        let executor = if queued { "" } else { self.executor_id.as_str() };
+        let executor = if queued {
+            ""
+        } else {
+            self.executor_id.as_str()
+        };
 
-        let mut row = WorkflowStatus::new(&id, name, input_json, status, executor, &self.app_version);
+        let mut row =
+            WorkflowStatus::new(&id, name, input_json, status, executor, &self.app_version);
         row.queue_name = opts.queue.clone();
         row.priority = opts.priority;
         row.dedup_id = opts.dedup_id.clone();

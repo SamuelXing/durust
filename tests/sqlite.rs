@@ -45,8 +45,7 @@ async fn sqlite_recovers_across_restart() -> Result<()> {
 
     // "Process 1": run the workflow to completion, charging once.
     {
-        let mut engine =
-            DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         engine.register("charge", |ctx: DurableContext, _: ()| async move {
             let amt = ctx
                 .step("charge_card", || async {
@@ -63,8 +62,7 @@ async fn sqlite_recovers_across_restart() -> Result<()> {
     // "Process 2": a brand-new engine/provider over the same file. Re-running
     // the same id replays the checkpoint — the card is NOT charged again.
     {
-        let mut engine =
-            DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         engine.register("charge", |ctx: DurableContext, _: ()| async move {
             let amt = ctx
                 .step("charge_card", || async {
@@ -98,14 +96,14 @@ async fn sqlite_queue_dispatch_and_dedup() -> Result<()> {
     engine.register("double", |_ctx: DurableContext, n: i64| async move {
         Ok::<_, Error>(n * 2)
     });
-    engine.register_queue(
-        WorkflowQueue::new("q").base_polling_interval(Duration::from_millis(10)),
-    );
+    engine.register_queue(WorkflowQueue::new("q").base_polling_interval(Duration::from_millis(10)));
     engine.launch().await?;
 
     let mut opts = WorkflowOptions::with_id("wf-q-1");
     opts.dedup_id = Some("only-once".to_string());
-    let mut handle = engine.enqueue::<_, i64>("q", "double", 21_i64, opts).await?;
+    let mut handle = engine
+        .enqueue::<_, i64>("q", "double", 21_i64, opts)
+        .await?;
     assert_eq!(handle.get_result().await?, 42);
 
     // Different workflow id, same dedup id on the same queue → unique index
@@ -113,7 +111,10 @@ async fn sqlite_queue_dispatch_and_dedup() -> Result<()> {
     let mut opts = WorkflowOptions::with_id("wf-q-2");
     opts.dedup_id = Some("only-once".to_string());
     let dup = engine.enqueue::<_, i64>("q", "double", 1_i64, opts).await;
-    assert!(dup.is_err(), "dedup id reuse on the same queue must be rejected");
+    assert!(
+        dup.is_err(),
+        "dedup id reuse on the same queue must be rejected"
+    );
 
     engine.shutdown(Duration::from_secs(1)).await?;
     let _ = std::fs::remove_file(path);

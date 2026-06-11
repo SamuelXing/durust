@@ -104,7 +104,9 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
         match status.status.as_str() {
             STATUS_CANCELLED => Err(Error::Cancelled(self.id.clone())),
             STATUS_ERROR => Err(Error::app(
-                status.error.unwrap_or_else(|| "workflow failed".to_string()),
+                status
+                    .error
+                    .unwrap_or_else(|| "workflow failed".to_string()),
             )),
             _ => {
                 let output = status.output.unwrap_or(Value::Null);
