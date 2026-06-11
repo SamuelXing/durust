@@ -18,6 +18,9 @@ pub enum Error {
     #[error("no workflow registered under name `{0}`")]
     UnknownWorkflow(String),
 
+    #[error("no queue registered under name `{0}`")]
+    UnknownQueue(String),
+
     /// The workflow was cancelled by an operator; execution was refused.
     #[error("workflow `{0}` was cancelled")]
     Cancelled(String),

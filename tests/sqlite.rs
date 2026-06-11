@@ -2,10 +2,12 @@
 //! (separate engine + provider instances over the same database file).
 
 use durust::{
-    DurableContext, DurableEngine, Error, Result, SqliteProvider, WorkflowOptions, STATUS_SUCCESS,
+    DurableContext, DurableEngine, Error, Result, SqliteProvider, WorkflowOptions, WorkflowQueue,
+    STATUS_SUCCESS,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// A unique temp file path for an isolated SQLite database per test.
 fn temp_db_url(tag: &str) -> (String, std::path::PathBuf) {
@@ -82,6 +84,38 @@ async fn sqlite_recovers_across_restart() -> Result<()> {
         "charge side effect must run exactly once across a restart"
     );
 
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// The SQL dequeue path end to end: enqueue → dispatcher claims → result; and
+/// the (queue_name, deduplication_id) unique index rejects a duplicate.
+#[tokio::test]
+async fn sqlite_queue_dispatch_and_dedup() -> Result<()> {
+    let (url, path) = temp_db_url("queue");
+
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("double", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n * 2)
+    });
+    engine.register_queue(
+        WorkflowQueue::new("q").base_polling_interval(Duration::from_millis(10)),
+    );
+    engine.launch().await?;
+
+    let mut opts = WorkflowOptions::with_id("wf-q-1");
+    opts.dedup_id = Some("only-once".to_string());
+    let mut handle = engine.enqueue::<_, i64>("q", "double", 21_i64, opts).await?;
+    assert_eq!(handle.get_result().await?, 42);
+
+    // Different workflow id, same dedup id on the same queue → unique index
+    // violation from the INSERT.
+    let mut opts = WorkflowOptions::with_id("wf-q-2");
+    opts.dedup_id = Some("only-once".to_string());
+    let dup = engine.enqueue::<_, i64>("q", "double", 1_i64, opts).await;
+    assert!(dup.is_err(), "dedup id reuse on the same queue must be rejected");
+
+    engine.shutdown(Duration::from_secs(1)).await?;
     let _ = std::fs::remove_file(path);
     Ok(())
 }

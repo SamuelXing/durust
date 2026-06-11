@@ -1,0 +1,93 @@
+use std::time::Duration;
+
+/// Rate limit for workflow starts on a queue — the Go SDK's `RateLimiter`.
+/// At most `limit` workflows may start within any trailing `period` window.
+#[derive(Clone, Debug)]
+pub struct RateLimiter {
+    pub limit: i64,
+    pub period: Duration,
+}
+
+/// A named durable queue — the Rust analog of Go's `NewWorkflowQueue`.
+///
+/// Workflows are enqueued with [`crate::DurableEngine::enqueue`] (or
+/// `run_workflow` with `WorkflowOptions.queue`) and claimed by a per-queue
+/// dispatcher task started by [`crate::DurableEngine::launch`]. The dispatcher
+/// honors, in order: worker concurrency (this process), global concurrency
+/// (across all executors, via a DB count), and the rate limiter.
+///
+/// Built with chained setters:
+///
+/// ```ignore
+/// let q = WorkflowQueue::new("emails")
+///     .worker_concurrency(4)
+///     .rate_limiter(RateLimiter { limit: 50, period: Duration::from_secs(60) });
+/// engine.register_queue(q);
+/// ```
+#[derive(Clone, Debug)]
+pub struct WorkflowQueue {
+    pub name: String,
+    /// Max workflows this executor runs concurrently from the queue.
+    pub worker_concurrency: Option<usize>,
+    /// Max workflows running concurrently across all executors.
+    pub global_concurrency: Option<i64>,
+    /// When `true`, lower `priority` values are dispatched first.
+    pub priority_enabled: bool,
+    pub rate_limit: Option<RateLimiter>,
+    /// Max workflows claimed per polling iteration (default 100).
+    pub max_tasks_per_iteration: usize,
+    /// Starting (and minimum) polling interval (default 1s).
+    pub base_polling_interval: Duration,
+    /// Ceiling the interval backs off to on dequeue errors (default 120s).
+    pub max_polling_interval: Duration,
+}
+
+impl WorkflowQueue {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            worker_concurrency: None,
+            global_concurrency: None,
+            priority_enabled: false,
+            rate_limit: None,
+            max_tasks_per_iteration: 100,
+            base_polling_interval: Duration::from_secs(1),
+            max_polling_interval: Duration::from_secs(120),
+        }
+    }
+
+    pub fn worker_concurrency(mut self, n: usize) -> Self {
+        self.worker_concurrency = Some(n);
+        self
+    }
+
+    pub fn global_concurrency(mut self, n: i64) -> Self {
+        self.global_concurrency = Some(n);
+        self
+    }
+
+    pub fn priority_enabled(mut self) -> Self {
+        self.priority_enabled = true;
+        self
+    }
+
+    pub fn rate_limiter(mut self, r: RateLimiter) -> Self {
+        self.rate_limit = Some(r);
+        self
+    }
+
+    pub fn max_tasks_per_iteration(mut self, n: usize) -> Self {
+        self.max_tasks_per_iteration = n;
+        self
+    }
+
+    pub fn base_polling_interval(mut self, d: Duration) -> Self {
+        self.base_polling_interval = d;
+        self
+    }
+
+    pub fn max_polling_interval(mut self, d: Duration) -> Self {
+        self.max_polling_interval = d;
+        self
+    }
+}

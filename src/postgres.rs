@@ -1,5 +1,7 @@
 use crate::error::Result;
-use crate::provider::{StateProvider, WorkflowStatus, STATUS_PENDING};
+use crate::provider::{
+    DequeueRequest, StateProvider, WorkflowStatus, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_PENDING,
+};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -9,7 +11,8 @@ use sqlx::Row;
 /// Columns selected when materializing a [`WorkflowStatus`] from `workflow_status`.
 const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, executor_id, \
      application_version, queue_name, priority, deduplication_id, recovery_attempts, \
-     parent_workflow_id, workflow_deadline_epoch_ms, created_at, updated_at";
+     parent_workflow_id, workflow_timeout_ms, workflow_deadline_epoch_ms, \
+     started_at_epoch_ms, rate_limited, delay_until_epoch_ms, created_at, updated_at";
 
 /// Postgres-backed [`StateProvider`], built on sqlx and the canonical DBOS
 /// schema (`workflow_status` / `operation_outputs`).
@@ -61,7 +64,11 @@ fn row_to_status(row: &sqlx::postgres::PgRow) -> WorkflowStatus {
         dedup_id: row.try_get("deduplication_id").ok().flatten(),
         recovery_attempts: row.get::<i64, _>("recovery_attempts") as i32,
         parent_workflow_id: row.try_get("parent_workflow_id").ok().flatten(),
+        timeout_ms: row.try_get("workflow_timeout_ms").ok().flatten(),
         deadline_ms: row.try_get("workflow_deadline_epoch_ms").ok().flatten(),
+        started_at_ms: row.try_get("started_at_epoch_ms").ok().flatten(),
+        rate_limited: row.get("rate_limited"),
+        delay_until_ms: row.try_get("delay_until_epoch_ms").ok().flatten(),
         created_at: ms_to_dt(row.get("created_at")),
         updated_at: ms_to_dt(row.get("updated_at")),
     }
@@ -85,8 +92,9 @@ impl StateProvider for PostgresProvider {
             "INSERT INTO workflow_status
                  (workflow_uuid, name, inputs, status, executor_id, application_version,
                   queue_name, priority, deduplication_id, parent_workflow_id,
-                  workflow_deadline_epoch_ms, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                  workflow_timeout_ms, workflow_deadline_epoch_ms, delay_until_epoch_ms,
+                  created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
              ON CONFLICT (workflow_uuid) DO NOTHING",
         )
         .bind(&s.id)
@@ -99,7 +107,9 @@ impl StateProvider for PostgresProvider {
         .bind(s.priority)
         .bind(&s.dedup_id)
         .bind(&s.parent_workflow_id)
+        .bind(s.timeout_ms)
         .bind(s.deadline_ms)
+        .bind(s.delay_until_ms)
         .bind(s.created_at.timestamp_millis())
         .bind(s.updated_at.timestamp_millis())
         .execute(&self.pool)
@@ -199,5 +209,107 @@ impl StateProvider for PostgresProvider {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.iter().map(row_to_status).collect())
+    }
+
+    async fn dequeue_workflows(&self, req: &DequeueRequest) -> Result<Vec<WorkflowStatus>> {
+        let now_ms = Utc::now().timestamp_millis();
+        let mut tx = self.pool.begin().await?;
+
+        let mut max_tasks = req.max_tasks;
+
+        if let (Some(limit), Some(period_ms)) = (req.rate_limit_max, req.rate_limit_period_ms) {
+            let recent: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM workflow_status
+                 WHERE queue_name = $1 AND rate_limited = TRUE
+                   AND status NOT IN ($2, $3) AND started_at_epoch_ms > $4",
+            )
+            .bind(&req.queue_name)
+            .bind(STATUS_ENQUEUED)
+            .bind(STATUS_DELAYED)
+            .bind(now_ms - period_ms)
+            .fetch_one(&mut *tx)
+            .await?;
+            max_tasks = max_tasks.min((limit - recent).max(0));
+        }
+
+        if let Some(global) = req.global_concurrency {
+            let pending: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM workflow_status WHERE queue_name = $1 AND status = $2",
+            )
+            .bind(&req.queue_name)
+            .bind(STATUS_PENDING)
+            .fetch_one(&mut *tx)
+            .await?;
+            max_tasks = max_tasks.min((global - pending).max(0));
+        }
+
+        if max_tasks <= 0 {
+            return Ok(Vec::new());
+        }
+
+        // SKIP LOCKED lets concurrent dispatchers claim disjoint sets without
+        // blocking; with a global concurrency cap, NOWAIT instead surfaces
+        // contention so the counts above stay consistent (matches Go).
+        let lock = if req.global_concurrency.is_none() {
+            "FOR UPDATE SKIP LOCKED"
+        } else {
+            "FOR UPDATE NOWAIT"
+        };
+        let ids: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT workflow_uuid FROM workflow_status
+             WHERE queue_name = $1 AND status = $2
+               AND (application_version = $3 OR application_version = '')
+             ORDER BY priority ASC, created_at ASC
+             {lock} LIMIT $4"
+        ))
+        .bind(&req.queue_name)
+        .bind(STATUS_ENQUEUED)
+        .bind(&req.app_version)
+        .bind(max_tasks)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = sqlx::query(&format!(
+            "UPDATE workflow_status
+             SET status = $1, executor_id = $2, application_version = $3,
+                 started_at_epoch_ms = $4, rate_limited = $5, updated_at = $4,
+                 workflow_deadline_epoch_ms = CASE
+                     WHEN workflow_timeout_ms IS NOT NULL AND workflow_deadline_epoch_ms IS NULL
+                     THEN $4 + workflow_timeout_ms
+                     ELSE workflow_deadline_epoch_ms
+                 END
+             WHERE workflow_uuid = ANY($6) AND status = $7
+             RETURNING {SELECT_COLS}"
+        ))
+        .bind(STATUS_PENDING)
+        .bind(&req.executor_id)
+        .bind(&req.app_version)
+        .bind(now_ms)
+        .bind(req.rate_limit_max.is_some())
+        .bind(&ids)
+        .bind(STATUS_ENQUEUED)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(rows.iter().map(row_to_status).collect())
+    }
+
+    async fn transition_delayed_workflows(&self, now_ms: i64) -> Result<u64> {
+        let res = sqlx::query(
+            "UPDATE workflow_status
+             SET status = $1, delay_until_epoch_ms = NULL, updated_at = $2
+             WHERE status = $3 AND delay_until_epoch_ms <= $2",
+        )
+        .bind(STATUS_ENQUEUED)
+        .bind(now_ms)
+        .bind(STATUS_DELAYED)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
     }
 }

@@ -33,10 +33,10 @@ CREATE TABLE workflow_status (
 CREATE INDEX workflow_status_created_at_index ON workflow_status (created_at);
 CREATE INDEX workflow_status_executor_id_index ON workflow_status (executor_id);
 CREATE INDEX workflow_status_status_index ON workflow_status (status);
--- Dispatcher lookup: enqueued rows of a queue ordered by priority (Phase 2).
+-- Dispatcher lookup: enqueued rows of a queue ordered by priority.
 CREATE INDEX workflow_status_queue_index ON workflow_status (queue_name, status, priority);
--- Queue-scoped deduplication (Phase 2): NULLs are distinct, so non-queued rows
--- are unconstrained.
+-- Queue-scoped deduplication: NULLs are distinct, so non-queued rows are
+-- unconstrained.
 CREATE UNIQUE INDEX uq_workflow_status_queue_name_dedup_id
     ON workflow_status (queue_name, deduplication_id);
 
