@@ -1,0 +1,251 @@
+//! Queue & dispatch tests, backend-free via the in-memory provider:
+//! basic enqueue→dispatch, worker concurrency, priority ordering, delayed
+//! enqueue, deduplication, and rate limiting.
+
+use durust::{
+    DurableContext, DurableEngine, Error, InMemoryProvider, RateLimiter, Result, WorkflowOptions,
+    WorkflowQueue, STATUS_DELAYED, STATUS_ENQUEUED,
+};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// A queue that polls fast enough for tests.
+fn test_queue(name: &str) -> WorkflowQueue {
+    WorkflowQueue::new(name).base_polling_interval(Duration::from_millis(10))
+}
+
+#[tokio::test]
+async fn enqueue_dispatches_and_completes() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("add_one", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n + 1)
+    });
+    engine.register_queue(test_queue("q"));
+    engine.launch().await?;
+
+    let mut handle = engine
+        .enqueue::<_, i64>("q", "add_one", 41_i64, WorkflowOptions::default())
+        .await?;
+    assert_eq!(handle.get_result().await?, 42);
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn enqueue_to_unregistered_queue_errors() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(())
+    });
+    let res = engine
+        .enqueue::<_, ()>("nope", "noop", (), WorkflowOptions::default())
+        .await;
+    assert!(matches!(res, Err(Error::UnknownQueue(ref q)) if q == "nope"));
+    Ok(())
+}
+
+/// With worker_concurrency(1), at most one workflow from the queue runs at a
+/// time on this executor.
+#[tokio::test]
+async fn worker_concurrency_is_enforced() -> Result<()> {
+    static RUNNING: AtomicUsize = AtomicUsize::new(0);
+    static MAX_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("tracked", |_ctx: DurableContext, _: ()| async move {
+        let now = RUNNING.fetch_add(1, Ordering::SeqCst) + 1;
+        MAX_SEEN.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        RUNNING.fetch_sub(1, Ordering::SeqCst);
+        Ok::<_, Error>(())
+    });
+    engine.register_queue(test_queue("serial").worker_concurrency(1));
+    engine.launch().await?;
+
+    let mut handles = Vec::new();
+    for i in 0..3 {
+        handles.push(
+            engine
+                .enqueue::<_, ()>(
+                    "serial",
+                    "tracked",
+                    (),
+                    WorkflowOptions::with_id(format!("wf-conc-{i}")),
+                )
+                .await?,
+        );
+    }
+    for h in &mut handles {
+        h.get_result().await?;
+    }
+
+    assert_eq!(
+        MAX_SEEN.load(Ordering::SeqCst),
+        1,
+        "worker_concurrency(1) must serialize queue workflows"
+    );
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// On a priority-enabled serialized queue, lower priority values run first
+/// regardless of enqueue order.
+#[tokio::test]
+async fn priority_orders_execution() -> Result<()> {
+    let order: Arc<tokio::sync::Mutex<Vec<i64>>> = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    let order_wf = order.clone();
+    engine.register("record", move |_ctx: DurableContext, n: i64| {
+        let order = order_wf.clone();
+        async move {
+            order.lock().await.push(n);
+            Ok::<_, Error>(n)
+        }
+    });
+    engine.register_queue(test_queue("prio").worker_concurrency(1).priority_enabled());
+
+    // Enqueue before launch so all three are pending when dispatch begins.
+    for (i, prio) in [(0, 3), (1, 1), (2, 2)] {
+        let mut opts = WorkflowOptions::with_id(format!("wf-prio-{i}"));
+        opts.priority = prio;
+        let _ = engine
+            .enqueue::<_, i64>("prio", "record", prio as i64, opts)
+            .await?;
+    }
+    engine.launch().await?;
+
+    // Wait until all three have run.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while order.lock().await.len() < 3 {
+        assert!(Instant::now() < deadline, "queue did not drain in time");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(*order.lock().await, vec![1, 2, 3]);
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// A delayed enqueue parks in DELAYED, then runs once the delay expires.
+#[tokio::test]
+async fn delayed_enqueue_waits_then_runs() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("echo", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n)
+    });
+    engine.register_queue(test_queue("later"));
+    engine.launch().await?;
+
+    let started = Instant::now();
+    let mut opts = WorkflowOptions::with_id("wf-delayed");
+    opts.delay = Some(Duration::from_millis(150));
+    let mut handle = engine
+        .enqueue::<_, i64>("later", "echo", 7_i64, opts)
+        .await?;
+
+    assert_eq!(handle.get_status().await?.status, STATUS_DELAYED);
+    assert_eq!(handle.get_result().await?, 7);
+    assert!(
+        started.elapsed() >= Duration::from_millis(120),
+        "workflow must not run before its delay expires"
+    );
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// Delay without a queue is rejected.
+#[tokio::test]
+async fn delay_requires_queue() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(())
+    });
+    let mut opts = WorkflowOptions::default();
+    opts.delay = Some(Duration::from_millis(10));
+    let res = engine.run_workflow::<_, ()>("noop", (), opts).await;
+    assert!(res.is_err());
+    Ok(())
+}
+
+/// Two different workflow ids with the same deduplication id on one queue:
+/// the second enqueue is rejected.
+#[tokio::test]
+async fn dedup_id_rejects_duplicates() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(())
+    });
+    engine.register_queue(test_queue("dedup"));
+
+    let mut opts = WorkflowOptions::with_id("wf-dedup-1");
+    opts.dedup_id = Some("once".to_string());
+    let _first = engine.enqueue::<_, ()>("dedup", "noop", (), opts).await?;
+
+    let mut opts = WorkflowOptions::with_id("wf-dedup-2");
+    opts.dedup_id = Some("once".to_string());
+    let second = engine.enqueue::<_, ()>("dedup", "noop", (), opts).await;
+    assert!(
+        second.is_err(),
+        "same dedup id on the same queue must be rejected"
+    );
+    Ok(())
+}
+
+/// With a rate limit of 2 per long period, only 2 of 4 enqueued workflows
+/// start; the rest stay ENQUEUED.
+#[tokio::test]
+async fn rate_limit_caps_starts() -> Result<()> {
+    static STARTED: AtomicUsize = AtomicUsize::new(0);
+
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("counted", |_ctx: DurableContext, _: ()| async move {
+        STARTED.fetch_add(1, Ordering::SeqCst);
+        Ok::<_, Error>(())
+    });
+    engine.register_queue(test_queue("limited").rate_limiter(RateLimiter {
+        limit: 2,
+        period: Duration::from_secs(60),
+    }));
+
+    let mut handles = Vec::new();
+    for i in 0..4 {
+        handles.push(
+            engine
+                .enqueue::<_, ()>(
+                    "limited",
+                    "counted",
+                    (),
+                    WorkflowOptions::with_id(format!("wf-rate-{i}")),
+                )
+                .await?,
+        );
+    }
+    engine.launch().await?;
+
+    // Give the dispatcher several iterations to (not) over-dispatch.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        STARTED.load(Ordering::SeqCst),
+        2,
+        "only `limit` workflows may start within the rate period"
+    );
+    let enqueued = futures_count_enqueued(&mut handles).await?;
+    assert_eq!(enqueued, 2, "the overflow workflows must remain ENQUEUED");
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+async fn futures_count_enqueued(handles: &mut [durust::WorkflowHandle<()>]) -> Result<usize> {
+    let mut n = 0;
+    for h in handles {
+        if h.get_status().await?.status == STATUS_ENQUEUED {
+            n += 1;
+        }
+    }
+    Ok(n)
+}

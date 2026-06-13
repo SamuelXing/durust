@@ -17,7 +17,9 @@
 //! Without DATABASE_URL it uses the in-memory backend (no crash-across-restart,
 //! but you can still see the workflow run end to end).
 
-use durust::{DurableContext, DurableEngine, Error, InMemoryProvider, PostgresProvider, Result, StateProvider};
+use durust::{
+    DurableContext, DurableEngine, Error, InMemoryProvider, PostgresProvider, Result, StateProvider,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -39,7 +41,10 @@ async fn process_order(ctx: DurableContext, order: Order) -> Result<Receipt> {
     // STEP 1 — the side effect we must never repeat.
     let charge_id = ctx
         .step("charge_card", || async {
-            println!("  >> CHARGING card for {} cents  (real side effect!)", order.amount_cents);
+            println!(
+                "  >> CHARGING card for {} cents  (real side effect!)",
+                order.amount_cents
+            );
             Ok::<_, Error>(format!("ch_{}", order.id))
         })
         .await?;
@@ -67,7 +72,10 @@ async fn process_order(ctx: DurableContext, order: Order) -> Result<Receipt> {
     })
     .await?;
 
-    Ok(Receipt { charge_id, shipment_id })
+    Ok(Receipt {
+        charge_id,
+        shipment_id,
+    })
 }
 
 #[tokio::main]

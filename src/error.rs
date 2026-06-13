@@ -9,11 +9,26 @@ pub enum Error {
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 
+    #[error("migration error: {0}")]
+    Migrate(#[from] sqlx::migrate::MigrateError),
+
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
 
     #[error("no workflow registered under name `{0}`")]
     UnknownWorkflow(String),
+
+    #[error("no queue registered under name `{0}`")]
+    UnknownQueue(String),
+
+    /// The workflow was cancelled by an operator; execution was refused.
+    #[error("workflow `{0}` was cancelled")]
+    Cancelled(String),
+
+    /// A blocking operation (recv/get_event/get_result) or a workflow deadline
+    /// elapsed before completion.
+    #[error("operation timed out")]
+    Timeout,
 
     /// An error raised by user code inside a step or workflow.
     #[error("{0}")]

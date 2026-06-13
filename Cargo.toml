@@ -14,12 +14,13 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1"
 tracing = "0.1"
 inventory = "0.3"
+uuid = { version = "1", features = ["v4"] }
+cron = "0.12"
 durust-macros = { path = "durust-macros", version = "0.1" }
 # Postgres backend. If your sqlx version complains about features, see README.
-sqlx = { version = "0.7", features = ["runtime-tokio", "tls-rustls", "postgres", "json", "chrono"] }
+sqlx = { version = "0.7", features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "json", "chrono", "migrate"] }
 
 [dev-dependencies]
-uuid = { version = "1", features = ["v4"] }
 tracing-subscriber = "0.3"
 
 [[example]]
