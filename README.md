@@ -131,8 +131,10 @@ cargo run --example order      # in-memory backend, or set DATABASE_URL for Post
 createdb durust
 export DATABASE_URL=postgres://localhost:5432/durust
 
-CRASH_AFTER_CHARGE=1 cargo run --example order   # crashes right after charging
-cargo run --example order                        # recover() resumes; card NOT re-charged
+# Run 1: a fail-rs failpoint crashes the process right after charging.
+FAILPOINTS=after_charge=return cargo run --example order
+# Run 2: recover() resumes; the card is NOT re-charged (charge step is replayed).
+cargo run --example order
 ```
 
 ## Backends & schema
