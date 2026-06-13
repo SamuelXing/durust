@@ -45,7 +45,7 @@ mod queue;
 mod serialize;
 mod sqlite;
 
-pub use context::{DurableContext, StepOptions};
+pub use context::{AuthContext, DurableContext, StepOptions};
 pub use engine::{erase, DurableEngine, WorkflowFn, WorkflowOptions, WorkflowRegistration};
 pub use error::{Error, ErrorCode, Result};
 pub use handle::WorkflowHandle;

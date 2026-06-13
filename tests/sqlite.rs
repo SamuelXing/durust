@@ -167,6 +167,60 @@ async fn sqlite_messaging_and_events() -> Result<()> {
     Ok(())
 }
 
+/// The run identity (authenticated user / assumed role / roles) is persisted on
+/// the workflow row, readable from inside the workflow via the context, and
+/// copied onto a fork.
+#[tokio::test]
+async fn sqlite_auth_context_persists_and_propagates() -> Result<()> {
+    let (url, path) = temp_db_url("auth");
+
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    // The workflow observes its own identity through the context and returns it,
+    // proving the persisted fields are threaded into `DurableContext`.
+    engine.register("whoami", |ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(format!(
+            "{}/{}/{}",
+            ctx.authenticated_user().unwrap_or("-"),
+            ctx.assumed_role().unwrap_or("-"),
+            ctx.authenticated_roles().join(","),
+        ))
+    });
+
+    let opts = WorkflowOptions::with_id("wf-auth")
+        .authenticated_user("alice")
+        .assumed_role("admin")
+        .authenticated_roles(["admin", "user"]);
+    let mut handle = engine.run_workflow::<_, String>("whoami", (), opts).await?;
+    assert_eq!(handle.get_result().await?, "alice/admin/admin,user");
+
+    // The identity is durable on the row.
+    let status = handle.get_status().await?;
+    assert_eq!(status.authenticated_user.as_deref(), Some("alice"));
+    assert_eq!(status.assumed_role.as_deref(), Some("admin"));
+    assert_eq!(status.authenticated_roles, vec!["admin", "user"]);
+
+    // A fork inherits the originating identity.
+    let forked = engine
+        .fork_workflow::<String>("wf-auth", 0, WorkflowOptions::with_id("wf-auth-fork"))
+        .await?;
+    let fstatus = forked.get_status().await?;
+    assert_eq!(fstatus.authenticated_user.as_deref(), Some("alice"));
+    assert_eq!(fstatus.assumed_role.as_deref(), Some("admin"));
+    assert_eq!(fstatus.authenticated_roles, vec!["admin", "user"]);
+
+    // A workflow started without an identity carries empty auth.
+    let mut bare = engine
+        .run_workflow::<_, String>("whoami", (), WorkflowOptions::with_id("wf-bare"))
+        .await?;
+    assert_eq!(bare.get_result().await?, "-/-/");
+    let bstatus = bare.get_status().await?;
+    assert_eq!(bstatus.authenticated_user, None);
+    assert!(bstatus.authenticated_roles.is_empty());
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 /// Management on the SQL backend: list filters (QueryBuilder), cancel/resume,
 /// and fork copying step checkpoints.
 #[tokio::test]

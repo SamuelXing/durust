@@ -1,7 +1,7 @@
 use crate::error::Result;
 use crate::provider::{
-    dedup_or, is_terminal, nonexistent_or, DequeueRequest, ListFilter, StateProvider,
-    WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
+    decode_roles, dedup_or, encode_roles, is_terminal, nonexistent_or, DequeueRequest, ListFilter,
+    StateProvider, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
     STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
 };
 use crate::serialize::{self, Serializer};
@@ -16,6 +16,7 @@ const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, e
      application_version, queue_name, priority, deduplication_id, recovery_attempts, \
      parent_workflow_id, workflow_timeout_ms, workflow_deadline_epoch_ms, \
      started_at_epoch_ms, rate_limited, delay_until_epoch_ms, completed_at, forked_from, \
+     authenticated_user, assumed_role, authenticated_roles, \
      serialization, created_at, updated_at";
 
 /// SQLite-backed [`StateProvider`].
@@ -94,6 +95,14 @@ fn row_to_status(row: &sqlx::sqlite::SqliteRow) -> WorkflowStatus {
         delay_until_ms: row.try_get("delay_until_epoch_ms").ok().flatten(),
         completed_at_ms: row.try_get("completed_at").ok().flatten(),
         forked_from: row.try_get("forked_from").ok().flatten(),
+        authenticated_user: row.try_get("authenticated_user").ok().flatten(),
+        assumed_role: row.try_get("assumed_role").ok().flatten(),
+        authenticated_roles: decode_roles(
+            row.try_get::<Option<String>, _>("authenticated_roles")
+                .ok()
+                .flatten()
+                .as_deref(),
+        ),
         created_at: ms_to_dt(row.get("created_at")),
         updated_at: ms_to_dt(row.get("updated_at")),
     }
@@ -114,8 +123,9 @@ impl StateProvider for SqliteProvider {
                  (workflow_uuid, name, inputs, status, executor_id, application_version,
                   queue_name, priority, deduplication_id, parent_workflow_id,
                   workflow_timeout_ms, workflow_deadline_epoch_ms, delay_until_epoch_ms,
+                  authenticated_user, assumed_role, authenticated_roles,
                   serialization, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (workflow_uuid) DO NOTHING",
         )
         .bind(&s.id)
@@ -131,6 +141,9 @@ impl StateProvider for SqliteProvider {
         .bind(s.timeout_ms)
         .bind(s.deadline_ms)
         .bind(s.delay_until_ms)
+        .bind(&s.authenticated_user)
+        .bind(&s.assumed_role)
+        .bind(encode_roles(&s.authenticated_roles))
         .bind(self.serializer.name())
         .bind(s.created_at.timestamp_millis())
         .bind(s.updated_at.timestamp_millis())
@@ -518,8 +531,10 @@ impl StateProvider for SqliteProvider {
         let inserted = sqlx::query(
             "INSERT INTO workflow_status
                  (workflow_uuid, status, name, inputs, serialization, executor_id,
-                  application_version, forked_from, recovery_attempts, created_at, updated_at)
-             SELECT ?, ?, name, inputs, serialization, '', ?, ?, 0, ?, ?
+                  application_version, forked_from, recovery_attempts,
+                  authenticated_user, assumed_role, authenticated_roles, created_at, updated_at)
+             SELECT ?, ?, name, inputs, serialization, '', ?, ?, 0,
+                    authenticated_user, assumed_role, authenticated_roles, ?, ?
              FROM workflow_status WHERE workflow_uuid = ?",
         )
         .bind(new_id)
