@@ -120,3 +120,42 @@ async fn sqlite_queue_dispatch_and_dedup() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// Messaging on the SQL backend: send/recv FIFO via the atomic consume,
+/// set_event/get_event, and the FK rejecting sends to missing workflows.
+#[tokio::test]
+async fn sqlite_messaging_and_events() -> Result<()> {
+    let (url, path) = temp_db_url("comm");
+
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("exchange", |ctx: DurableContext, _: ()| async move {
+        ctx.set_event("phase", "waiting").await?;
+        let a: Option<String> = ctx.recv("t", Duration::from_secs(5)).await?;
+        let b: Option<String> = ctx.recv("t", Duration::from_secs(5)).await?;
+        Ok::<_, Error>(format!(
+            "{},{}",
+            a.unwrap_or_default(),
+            b.unwrap_or_default()
+        ))
+    });
+
+    let mut handle = engine
+        .run_workflow::<_, String>("exchange", (), WorkflowOptions::with_id("wf-comm"))
+        .await?;
+
+    // The event is readable while the workflow is still waiting in recv.
+    let phase: Option<String> = engine
+        .get_event("wf-comm", "phase", Duration::from_secs(2))
+        .await?;
+    assert_eq!(phase.as_deref(), Some("waiting"));
+
+    engine.send("wf-comm", "m1".to_string(), "t").await?;
+    engine.send("wf-comm", "m2".to_string(), "t").await?;
+    assert_eq!(handle.get_result().await?, "m1,m2");
+
+    // FK on destination_uuid: sending to a missing workflow errors.
+    assert!(engine.send("ghost", "boo".to_string(), "t").await.is_err());
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}

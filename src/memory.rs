@@ -8,10 +8,21 @@ use serde_json::Value;
 use std::collections::HashMap;
 use tokio::sync::Mutex;
 
+struct NotificationRow {
+    destination_id: String,
+    topic: String,
+    message: Value,
+    consumed: bool,
+    created_at_ms: i64,
+}
+
 #[derive(Default)]
 struct Inner {
     workflows: HashMap<String, WorkflowStatus>,
     steps: HashMap<(String, i32), Value>,
+    notifications: Vec<NotificationRow>,
+    /// Workflow events keyed by `(workflow_id, key)`.
+    events: HashMap<(String, String), Value>,
 }
 
 /// In-memory [`StateProvider`] for tests and quick starts (no database needed).
@@ -200,5 +211,70 @@ impl StateProvider for InMemoryProvider {
             }
         }
         Ok(n)
+    }
+
+    async fn insert_notification(
+        &self,
+        destination_id: &str,
+        topic: &str,
+        message: Value,
+    ) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        // Mirror the SQL backends' FK on destination_uuid → workflow_status.
+        if !g.workflows.contains_key(destination_id) {
+            return Err(Error::app(format!(
+                "cannot send to nonexistent workflow `{destination_id}`"
+            )));
+        }
+        g.notifications.push(NotificationRow {
+            destination_id: destination_id.to_string(),
+            topic: topic.to_string(),
+            message,
+            consumed: false,
+            created_at_ms: Utc::now().timestamp_millis(),
+        });
+        Ok(())
+    }
+
+    async fn consume_notification(
+        &self,
+        workflow_id: &str,
+        topic: &str,
+        seq: i32,
+        _step_name: &str,
+    ) -> Result<Option<Value>> {
+        // Single mutex covers both the claim and the checkpoint, giving the
+        // same atomicity the SQL backends get from a transaction.
+        let mut g = self.inner.lock().await;
+        let oldest = g
+            .notifications
+            .iter_mut()
+            .filter(|n| !n.consumed && n.destination_id == workflow_id && n.topic == topic)
+            .min_by_key(|n| n.created_at_ms);
+        let Some(row) = oldest else {
+            return Ok(None);
+        };
+        row.consumed = true;
+        let message = row.message.clone();
+        let canonical = g
+            .steps
+            .entry((workflow_id.to_string(), seq))
+            .or_insert(message)
+            .clone();
+        Ok(Some(canonical))
+    }
+
+    async fn upsert_event(&self, workflow_id: &str, key: &str, value: Value) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        g.events
+            .insert((workflow_id.to_string(), key.to_string()), value);
+        Ok(())
+    }
+
+    async fn get_event_value(&self, workflow_id: &str, key: &str) -> Result<Option<Value>> {
+        let g = self.inner.lock().await;
+        Ok(g.events
+            .get(&(workflow_id.to_string(), key.to_string()))
+            .cloned())
     }
 }

@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use crate::provider::{StateProvider, STATUS_CANCELLED};
 use serde::{de::DeserializeOwned, Serialize};
+use serde_json::Value;
 use std::future::Future;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
@@ -215,14 +216,30 @@ impl DurableContext {
     /// *remaining* time.
     pub async fn sleep(&self, dur: Duration) -> Result<()> {
         let seq = self.next_seq();
+        let wake_at = self.durable_wake_at(seq, dur).await?;
+        let now = chrono::Utc::now();
+        if wake_at > now {
+            let remaining = (wake_at - now).to_std().unwrap_or(Duration::ZERO);
+            tokio::time::sleep(remaining).await;
+        }
+        Ok(())
+    }
 
-        // First call fixes the wake instant; replays read the stored one.
-        let wake_at: chrono::DateTime<chrono::Utc> = match self
+    /// Resolve the absolute wake instant for a durable timer at `seq`: the
+    /// first call records `now + dur` as a `DBOS.sleep` step; replays read the
+    /// stored instant back, so timers (and recv/get_event timeouts built on
+    /// them) never extend across crashes.
+    async fn durable_wake_at(
+        &self,
+        seq: i32,
+        dur: Duration,
+    ) -> Result<chrono::DateTime<chrono::Utc>> {
+        match self
             .provider
             .get_step_result(&self.workflow_id, seq)
             .await?
         {
-            Some(stored) => serde_json::from_value(stored)?,
+            Some(stored) => Ok(serde_json::from_value(stored)?),
             None => {
                 let proposed = chrono::Utc::now()
                     + chrono::Duration::from_std(dur).unwrap_or_else(|_| chrono::Duration::zero());
@@ -235,16 +252,145 @@ impl DurableContext {
                         serde_json::to_value(proposed)?,
                     )
                     .await?;
-                serde_json::from_value(canonical)?
+                Ok(serde_json::from_value(canonical)?)
             }
-        };
-
-        let now = chrono::Utc::now();
-        if wake_at > now {
-            let remaining = (wake_at - now).to_std().unwrap_or(Duration::ZERO);
-            tokio::time::sleep(remaining).await;
         }
+    }
+
+    /// Durably send a message to another workflow on `topic` — the Rust analog
+    /// of Go's `Send`. Recorded as a `DBOS.send` step, so a replay does not
+    /// re-send. Errors if the destination workflow does not exist.
+    ///
+    /// Like any step side effect, the send commits before its checkpoint: a
+    /// crash in that window re-sends on replay (at-least-once).
+    pub async fn send<T: Serialize>(
+        &self,
+        destination_id: &str,
+        message: T,
+        topic: &str,
+    ) -> Result<()> {
+        let seq = self.next_seq();
+        if let Some(_done) = self.replay_or_guard::<Value>(seq).await? {
+            return Ok(());
+        }
+        self.provider
+            .insert_notification(destination_id, topic, serde_json::to_value(message)?)
+            .await?;
+        self.provider
+            .record_step_result(&self.workflow_id, seq, "DBOS.send", Value::Null)
+            .await?;
         Ok(())
+    }
+
+    /// Receive the oldest unconsumed message sent to this workflow on `topic`,
+    /// waiting up to `timeout` — the Rust analog of Go's `Recv`. Messages are
+    /// consumed FIFO, exactly once: the claim and the step checkpoint commit
+    /// atomically, and a replay returns the recorded message without consuming
+    /// another. Returns `None` on timeout (also recorded, so a replay does not
+    /// wait again). The timeout deadline itself is durable: a crash mid-wait
+    /// resumes with the *remaining* time, not a fresh timeout.
+    pub async fn recv<T: DeserializeOwned>(
+        &self,
+        topic: &str,
+        timeout: Duration,
+    ) -> Result<Option<T>> {
+        let seq = self.next_seq();
+        let deadline_seq = self.next_seq();
+
+        if let Some(stored) = self.replay_or_guard::<Option<T>>(seq).await? {
+            return Ok(stored);
+        }
+
+        let mut deadline: Option<chrono::DateTime<chrono::Utc>> = None;
+        loop {
+            if let Some(msg) = self
+                .provider
+                .consume_notification(&self.workflow_id, topic, seq, "DBOS.recv")
+                .await?
+            {
+                return Ok(Some(serde_json::from_value(msg)?));
+            }
+
+            // Mailbox empty: fix the durable deadline (first miss only), then
+            // poll until a message arrives or the deadline passes.
+            let deadline = match deadline {
+                Some(d) => d,
+                None => *deadline.insert(self.durable_wake_at(deadline_seq, timeout).await?),
+            };
+            let now = chrono::Utc::now();
+            if now >= deadline {
+                self.provider
+                    .record_step_result(&self.workflow_id, seq, "DBOS.recv", Value::Null)
+                    .await?;
+                return Ok(None);
+            }
+            let remaining = (deadline - now).to_std().unwrap_or(Duration::ZERO);
+            tokio::time::sleep(remaining.min(NOTIFICATION_POLL_INTERVAL)).await;
+        }
+    }
+
+    /// Publish (or overwrite) the value of event `key` on this workflow — the
+    /// Rust analog of Go's `SetEvent`. Recorded as a `DBOS.setEvent` step;
+    /// other workflows and external code read it with `get_event`.
+    pub async fn set_event<T: Serialize>(&self, key: &str, value: T) -> Result<()> {
+        let seq = self.next_seq();
+        if let Some(_done) = self.replay_or_guard::<Value>(seq).await? {
+            return Ok(());
+        }
+        self.provider
+            .upsert_event(&self.workflow_id, key, serde_json::to_value(value)?)
+            .await?;
+        self.provider
+            .record_step_result(&self.workflow_id, seq, "DBOS.setEvent", Value::Null)
+            .await?;
+        Ok(())
+    }
+
+    /// Read event `key` of another workflow, waiting up to `timeout` for it to
+    /// be set — the Rust analog of Go's `GetEvent` inside a workflow. The value
+    /// observed is recorded as a `DBOS.getEvent` step, so replays see the same
+    /// value even if the event is overwritten later. Returns `None` on timeout.
+    pub async fn get_event<T: DeserializeOwned>(
+        &self,
+        target_workflow_id: &str,
+        key: &str,
+        timeout: Duration,
+    ) -> Result<Option<T>> {
+        let seq = self.next_seq();
+        let deadline_seq = self.next_seq();
+
+        if let Some(stored) = self.replay_or_guard::<Option<T>>(seq).await? {
+            return Ok(stored);
+        }
+
+        let mut deadline: Option<chrono::DateTime<chrono::Utc>> = None;
+        loop {
+            if let Some(value) = self
+                .provider
+                .get_event_value(target_workflow_id, key)
+                .await?
+            {
+                let canonical = self
+                    .provider
+                    .record_step_result(&self.workflow_id, seq, "DBOS.getEvent", value)
+                    .await?;
+                return Ok(Some(serde_json::from_value(canonical)?));
+            }
+
+            let deadline = match deadline {
+                Some(d) => d,
+                None => *deadline.insert(self.durable_wake_at(deadline_seq, timeout).await?),
+            };
+            let now = chrono::Utc::now();
+            if now >= deadline {
+                self.provider
+                    .record_step_result(&self.workflow_id, seq, "DBOS.getEvent", Value::Null)
+                    .await?;
+                return Ok(None);
+            }
+            let remaining = (deadline - now).to_std().unwrap_or(Duration::ZERO);
+            tokio::time::sleep(remaining.min(NOTIFICATION_POLL_INTERVAL)).await;
+        }
     }
 
     /// Escape hatch for building application errors inside steps.
@@ -252,3 +398,8 @@ impl DurableContext {
         Error::app(msg)
     }
 }
+
+/// How often blocked `recv`/`get_event` calls re-check the database. (The Go
+/// SDK avoids polling with Postgres LISTEN/NOTIFY; polling keeps this portable
+/// across backends and is a future optimization point.)
+const NOTIFICATION_POLL_INTERVAL: Duration = Duration::from_millis(25);

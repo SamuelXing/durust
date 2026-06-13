@@ -203,4 +203,33 @@ pub trait StateProvider: Send + Sync {
     /// `ENQUEUED`. Returns how many were transitioned. Called by the dispatcher
     /// at the top of each polling iteration.
     async fn transition_delayed_workflows(&self, now_ms: i64) -> Result<u64>;
+
+    /// Append a message for `destination_id` on `topic`. Errors if the
+    /// destination workflow does not exist (FK violation in the SQL backends).
+    async fn insert_notification(
+        &self,
+        destination_id: &str,
+        topic: &str,
+        message: Value,
+    ) -> Result<()>;
+
+    /// Atomically claim the **oldest unconsumed** message for
+    /// `(workflow_id, topic)` and record it as the step checkpoint
+    /// `(workflow_id, seq)` in the same transaction — if claiming and
+    /// checkpointing were separate, a crash between them would lose the
+    /// message. Returns the message, or `None` when the mailbox is empty
+    /// (nothing is recorded in that case).
+    async fn consume_notification(
+        &self,
+        workflow_id: &str,
+        topic: &str,
+        seq: i32,
+        step_name: &str,
+    ) -> Result<Option<Value>>;
+
+    /// Set (or overwrite) the value of event `key` on `workflow_id`.
+    async fn upsert_event(&self, workflow_id: &str, key: &str, value: Value) -> Result<()>;
+
+    /// Read the current value of event `key` on `workflow_id`, if set.
+    async fn get_event_value(&self, workflow_id: &str, key: &str) -> Result<Option<Value>>;
 }

@@ -312,4 +312,98 @@ impl StateProvider for PostgresProvider {
         .await?;
         Ok(res.rows_affected())
     }
+
+    async fn insert_notification(
+        &self,
+        destination_id: &str,
+        topic: &str,
+        message: Value,
+    ) -> Result<()> {
+        // The FK on destination_uuid rejects sends to nonexistent workflows.
+        sqlx::query(
+            "INSERT INTO notifications
+                 (message_uuid, destination_uuid, topic, message, created_at_epoch_ms)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(destination_id)
+        .bind(topic)
+        .bind(serde_json::to_string(&message)?)
+        .bind(Utc::now().timestamp_millis())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn consume_notification(
+        &self,
+        workflow_id: &str,
+        topic: &str,
+        seq: i32,
+        step_name: &str,
+    ) -> Result<Option<Value>> {
+        // Claim and checkpoint in one transaction: a crash between them would
+        // otherwise lose the message. message_uuid pins exactly one row even
+        // when several messages share a created_at millisecond.
+        let mut tx = self.pool.begin().await?;
+
+        let claimed: Option<String> = sqlx::query_scalar(
+            "WITH oldest_entry AS (
+                 SELECT message_uuid FROM notifications
+                 WHERE destination_uuid = $1 AND topic = $2 AND consumed = FALSE
+                 ORDER BY created_at_epoch_ms ASC
+                 LIMIT 1
+             )
+             UPDATE notifications SET consumed = TRUE
+             WHERE message_uuid = (SELECT message_uuid FROM oldest_entry)
+             RETURNING message",
+        )
+        .bind(workflow_id)
+        .bind(topic)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(message) = claimed else {
+            return Ok(None);
+        };
+
+        sqlx::query(
+            "INSERT INTO operation_outputs (workflow_uuid, function_id, function_name, output)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
+        )
+        .bind(workflow_id)
+        .bind(seq)
+        .bind(step_name)
+        .bind(&message)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(serde_json::from_str(&message).ok())
+    }
+
+    async fn upsert_event(&self, workflow_id: &str, key: &str, value: Value) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO workflow_events (workflow_uuid, key, value) VALUES ($1, $2, $3)
+             ON CONFLICT (workflow_uuid, key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(workflow_id)
+        .bind(key)
+        .bind(serde_json::to_string(&value)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_event_value(&self, workflow_id: &str, key: &str) -> Result<Option<Value>> {
+        let row: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM workflow_events WHERE workflow_uuid = $1 AND key = $2",
+        )
+        .bind(workflow_id)
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|v| serde_json::from_str(&v).ok()))
+    }
 }

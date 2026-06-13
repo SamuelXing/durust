@@ -330,6 +330,47 @@ impl DurableEngine {
         self.run_workflow(workflow_name, input, opts).await
     }
 
+    /// Send a message to a workflow from **outside** any workflow (e.g. an API
+    /// handler nudging a waiting workflow). Not durable — there is no calling
+    /// workflow to checkpoint into; from workflow code use
+    /// [`DurableContext::send`] instead.
+    pub async fn send<T: Serialize>(
+        &self,
+        destination_id: &str,
+        message: T,
+        topic: &str,
+    ) -> Result<()> {
+        self.provider
+            .insert_notification(destination_id, topic, serde_json::to_value(message)?)
+            .await
+    }
+
+    /// Read event `key` of a workflow from **outside** any workflow, waiting up
+    /// to `timeout` for it to be set. Returns `None` on timeout. From workflow
+    /// code use [`DurableContext::get_event`], which is durable.
+    pub async fn get_event<T: DeserializeOwned>(
+        &self,
+        target_workflow_id: &str,
+        key: &str,
+        timeout: Duration,
+    ) -> Result<Option<T>> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(value) = self
+                .provider
+                .get_event_value(target_workflow_id, key)
+                .await?
+            {
+                return Ok(Some(serde_json::from_value(value)?));
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep((deadline - now).min(Duration::from_millis(25))).await;
+        }
+    }
+
     /// Start a workflow under `id` and **block** until it returns its JSON
     /// output. Back-compat shim over [`run_workflow`](Self::run_workflow).
     pub async fn start<I>(&self, name: &str, id: &str, input: I) -> Result<Value>
