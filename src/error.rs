@@ -15,8 +15,8 @@ pub enum Error {
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
 
-    /// A stored value could not be decoded: an unknown/foreign serialization
-    /// format (e.g. Go's `DBOS_GOB`), or corrupt base64.
+    /// A stored value could not be decoded: an unrecognized serialization
+    /// format, or corrupt base64.
     #[error("serialization format error: {0}")]
     Serialization(String),
 

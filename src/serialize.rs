@@ -1,42 +1,37 @@
-//! Workflow-data serialization formats, mirroring the Go SDK's `Serializer`.
+//! Workflow-data serialization formats.
 //!
 //! Every serialized value (workflow inputs/outputs, step outputs, messages,
 //! event values) is stored as TEXT alongside a **format name** in the row's
-//! `serialization` column. Recording the format lets any DBOS SDK decode a value
-//! another wrote — the basis for cross-language interop via [`Serializer::Portable`].
+//! `serialization` column. Recording the format lets a reader decode a value
+//! regardless of who wrote it — the basis for cross-language interop on a shared
+//! database via [`Serializer::Portable`].
 //!
-//! Formats (matching `dbos-transact-golang/dbos/serialization.go`):
-//!
-//! | Rust                  | Go name        | Wire form                | nil      |
-//! |-----------------------|----------------|--------------------------|----------|
-//! | [`Serializer::Json`]  | `DBOS_JSON`    | base64(JSON) — default   | `__DBOS_NIL` |
-//! | [`Serializer::Portable`] | `portable_json` | plain JSON (cross-lang) | `null` |
-//! | (read-only)           | `DBOS_GOB`     | Go gob — unsupported here | — |
+//! | Variant                  | Format name     | Wire form              | nil          |
+//! |--------------------------|-----------------|------------------------|--------------|
+//! | [`Serializer::Json`]     | `DBOS_JSON`     | base64(JSON) — default | `__DBOS_NIL` |
+//! | [`Serializer::Portable`] | `portable_json` | plain JSON             | `null`       |
 //!
 //! Encoding uses the provider's configured serializer; **decoding always
-//! dispatches on the stored format name** (Go's `resolveDecoder`), so a Rust
-//! worker can read rows written by a default-config Go worker (`DBOS_JSON`) or by
-//! any SDK using `portable_json`. A `DBOS_GOB` value yields a clear error rather
+//! dispatches on the stored format name**, so a value written under any known
+//! format is read correctly. An unrecognized format yields a clear error rather
 //! than silent corruption.
 
 use crate::error::{Error, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::Value;
 
-/// Go's `PortableSerializerName` — the cross-language format.
+/// Cross-language wire format: plain JSON, readable by any DBOS SDK.
 pub const PORTABLE: &str = "portable_json";
-/// Go's default serializer name.
+/// Default wire format: base64-encoded JSON.
 pub const DBOS_JSON: &str = "DBOS_JSON";
-/// Go's gob serializer name (Rust can encode/decode neither).
-pub const DBOS_GOB: &str = "DBOS_GOB";
-/// Sentinel Go's `DBOS_JSON` writes for a nil value.
+/// Sentinel the default format writes for a nil value.
 const NIL_MARKER: &str = "__DBOS_NIL";
 
 /// A serialization format for workflow data. Cheap to copy; held by each
 /// provider as the format it *encodes* with (decoding is format-directed).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Serializer {
-    /// `DBOS_JSON`: base64-encoded JSON. The default, matching the Go SDK.
+    /// `DBOS_JSON`: base64-encoded JSON. The default.
     #[default]
     Json,
     /// `portable_json`: plain JSON, readable across DBOS languages.
@@ -73,7 +68,7 @@ impl Serializer {
 
 /// Decode a stored TEXT value using the format recorded in its `serialization`
 /// column. `None`, `""`, and `DBOS_JSON` all select the default (base64 JSON);
-/// `portable_json` selects plain JSON. `DBOS_GOB` and unknown names error.
+/// `portable_json` selects plain JSON. Any other name errors.
 pub fn decode(format: Option<&str>, stored: &str) -> Result<Value> {
     match format.unwrap_or("") {
         PORTABLE => {
@@ -87,17 +82,13 @@ pub fn decode(format: Option<&str>, stored: &str) -> Result<Value> {
                 return Ok(Value::Null);
             }
             let bytes = STANDARD.decode(stored).map_err(|e| {
-                Error::Serialization(format!("invalid base64 in DBOS_JSON value: {e}"))
+                Error::Serialization(format!("invalid base64 in {DBOS_JSON} value: {e}"))
             })?;
             Ok(serde_json::from_slice(&bytes)?)
         }
-        DBOS_GOB => Err(Error::Serialization(
-            "value was serialized with Go's DBOS_GOB format, which the Rust SDK cannot decode; \
-             configure the producing app to use portable_json for cross-language interop"
-                .to_string(),
-        )),
         other => Err(Error::Serialization(format!(
-            "unknown serialization format {other:?}"
+            "value uses serialization format {other:?}, which this SDK cannot decode; \
+             use {PORTABLE} for cross-language interop"
         ))),
     }
 }
@@ -136,7 +127,7 @@ mod tests {
     }
 
     #[test]
-    fn nil_markers_match_go() {
+    fn nil_markers_roundtrip() {
         assert_eq!(Serializer::Json.encode(&Value::Null).unwrap(), NIL_MARKER);
         assert_eq!(Serializer::Portable.encode(&Value::Null).unwrap(), "null");
         assert_eq!(decode(Some(DBOS_JSON), NIL_MARKER).unwrap(), Value::Null);
@@ -144,8 +135,8 @@ mod tests {
     }
 
     #[test]
-    fn gob_and_unknown_error() {
-        assert!(decode(Some(DBOS_GOB), "abc").is_err());
+    fn unknown_format_errors() {
         assert!(decode(Some("DBOS_PICKLE"), "abc").is_err());
+        assert!(decode(Some("some_other_format"), "abc").is_err());
     }
 }
