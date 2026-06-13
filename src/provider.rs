@@ -1,7 +1,31 @@
-use crate::error::Result;
+use crate::error::{Error, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+
+/// Map a `workflow_status` insert failure to a typed deduplication error when it
+/// is a unique-constraint violation — the queue-scoped dedup index. A primary
+/// key conflict never reaches here; the inserts use `ON CONFLICT DO NOTHING`.
+pub(crate) fn dedup_or(e: sqlx::Error, s: &WorkflowStatus) -> Error {
+    let err = Error::from(e);
+    if err.is_unique_violation() {
+        return Error::queue_deduplicated(
+            s.queue_name.clone().unwrap_or_default(),
+            s.dedup_id.clone().unwrap_or_default(),
+        );
+    }
+    err
+}
+
+/// Map a notification insert failure to a typed "no such workflow" error when
+/// the destination foreign key is violated.
+pub(crate) fn nonexistent_or(e: sqlx::Error, destination_id: &str) -> Error {
+    let err = Error::from(e);
+    if err.is_foreign_key_violation() {
+        return Error::nonexistent_workflow(destination_id);
+    }
+    err
+}
 
 /// Workflow lifecycle states, aligned with the DBOS Go SDK.
 ///

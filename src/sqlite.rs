@@ -1,7 +1,8 @@
 use crate::error::Result;
 use crate::provider::{
-    is_terminal, DequeueRequest, ListFilter, StateProvider, WorkflowStatus, STATUS_CANCELLED,
-    STATUS_DELAYED, STATUS_ENQUEUED, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
+    dedup_or, is_terminal, nonexistent_or, DequeueRequest, ListFilter, StateProvider,
+    WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
+    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
 };
 use crate::serialize::{self, Serializer};
 use async_trait::async_trait;
@@ -134,7 +135,8 @@ impl StateProvider for SqliteProvider {
         .bind(s.created_at.timestamp_millis())
         .bind(s.updated_at.timestamp_millis())
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| dedup_or(e, &s))?;
 
         let row = sqlx::query(&format!(
             "SELECT {SELECT_COLS} FROM workflow_status WHERE workflow_uuid = ?"
@@ -360,7 +362,8 @@ impl StateProvider for SqliteProvider {
         .bind(self.serializer.name())
         .bind(Utc::now().timestamp_millis())
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| nonexistent_or(e, destination_id))?;
         Ok(())
     }
 

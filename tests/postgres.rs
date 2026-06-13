@@ -4,9 +4,11 @@
 //!   createdb durust_test && DATABASE_URL=postgres://localhost/durust_test cargo test --test postgres
 
 use durust::{
-    DurableContext, DurableEngine, Error, PostgresProvider, Result, Serializer, WorkflowOptions,
+    DurableContext, DurableEngine, Error, ErrorCode, PostgresProvider, Result, Serializer,
+    WorkflowOptions, WorkflowQueue,
 };
 use std::sync::Arc;
+use std::time::Duration;
 
 fn database_url() -> Option<String> {
     std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty())
@@ -51,5 +53,49 @@ async fn pg_serialization_cross_format() -> Result<()> {
         assert_eq!(status.output, Some(serde_json::json!("hi ada")));
         assert_eq!(handle.get_result().await?, "hi ada");
     }
+    Ok(())
+}
+
+/// Postgres surfaces the dedup unique-violation and the destination FK violation
+/// as typed, classifiable errors (verifies the sqlx Postgres driver mapping).
+#[tokio::test]
+async fn pg_typed_db_errors() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_typed_db_errors: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let provider = PostgresProvider::connect(&url).await?;
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(())
+    });
+    engine.register_queue(WorkflowQueue::new(format!("q-{tag}")));
+
+    let dedup = format!("once-{tag}");
+    let mut opts = WorkflowOptions::with_id(format!("wf-a-{tag}"));
+    opts.dedup_id = Some(dedup.clone());
+    engine
+        .enqueue::<_, ()>(&format!("q-{tag}"), "noop", (), opts)
+        .await?;
+
+    let mut opts = WorkflowOptions::with_id(format!("wf-b-{tag}"));
+    opts.dedup_id = Some(dedup);
+    let err = match engine
+        .enqueue::<_, ()>(&format!("q-{tag}"), "noop", (), opts)
+        .await
+    {
+        Ok(_) => panic!("dedup reuse must be rejected"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code(), ErrorCode::QueueDeduplicated);
+
+    let err = engine
+        .send(&format!("ghost-{tag}"), 1_i64, "topic")
+        .await
+        .expect_err("send to nonexistent workflow must fail");
+    assert_eq!(err.code(), ErrorCode::NonExistentWorkflow);
+
+    engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }

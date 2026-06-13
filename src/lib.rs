@@ -47,7 +47,7 @@ mod sqlite;
 
 pub use context::{DurableContext, StepOptions};
 pub use engine::{erase, DurableEngine, WorkflowFn, WorkflowOptions, WorkflowRegistration};
-pub use error::{Error, Result};
+pub use error::{Error, ErrorCode, Result};
 pub use handle::WorkflowHandle;
 pub use memory::InMemoryProvider;
 pub use postgres::PostgresProvider;
