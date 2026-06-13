@@ -70,6 +70,10 @@ pub struct WorkflowStatus {
     pub rate_limited: bool,
     /// For `DELAYED` workflows: when to transition to `ENQUEUED`, epoch ms.
     pub delay_until_ms: Option<i64>,
+    /// When the workflow reached a terminal state, epoch ms.
+    pub completed_at_ms: Option<i64>,
+    /// On a forked workflow, the id it was forked from.
+    pub forked_from: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -106,10 +110,34 @@ impl WorkflowStatus {
             started_at_ms: None,
             rate_limited: false,
             delay_until_ms: None,
+            completed_at_ms: None,
+            forked_from: None,
             created_at: now,
             updated_at: now,
         }
     }
+}
+
+/// Filter for [`StateProvider::list_workflows`] — the Rust analog of Go's
+/// `ListWorkflows` options. All fields are ANDed; empty/`None` fields are
+/// ignored. Times are epoch milliseconds, matched against `created_at`.
+#[derive(Clone, Default)]
+pub struct ListFilter {
+    pub workflow_ids: Vec<String>,
+    pub workflow_id_prefix: Option<String>,
+    pub name: Option<String>,
+    /// Match any of these statuses.
+    pub status: Vec<String>,
+    pub queue_name: Option<String>,
+    pub app_version: Option<String>,
+    pub executor_ids: Vec<String>,
+    pub forked_from: Option<String>,
+    pub start_time_ms: Option<i64>,
+    pub end_time_ms: Option<i64>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    /// Sort by `created_at` descending instead of ascending.
+    pub sort_desc: bool,
 }
 
 /// Parameters for one dequeue iteration, computed by the engine's dispatcher
@@ -185,9 +213,6 @@ pub trait StateProvider: Send + Sync {
         value: Value,
     ) -> Result<Value>;
 
-    /// All workflows that are not in a terminal state — the recovery set.
-    async fn list_incomplete_workflows(&self) -> Result<Vec<WorkflowStatus>>;
-
     /// Atomically claim up to `req.max_tasks` `ENQUEUED` workflows from a queue,
     /// transitioning them to `PENDING` stamped with the claiming executor, the
     /// app version, and `started_at`. Candidates are ordered by
@@ -232,4 +257,38 @@ pub trait StateProvider: Send + Sync {
 
     /// Read the current value of event `key` on `workflow_id`, if set.
     async fn get_event_value(&self, workflow_id: &str, key: &str) -> Result<Option<Value>>;
+
+    /// List workflows matching `filter`, newest- or oldest-first per
+    /// `filter.sort_desc`.
+    async fn list_workflows(&self, filter: &ListFilter) -> Result<Vec<WorkflowStatus>>;
+
+    /// Cancel a workflow: if it is not already terminal, set it `CANCELLED`,
+    /// stamp `completed_at`, and clear queue assignment / dedup so it leaves any
+    /// queue. A running workflow stops cooperatively at its next step.
+    async fn cancel_workflow(&self, id: &str) -> Result<()>;
+
+    /// Resume a `CANCELLED` (or otherwise non-terminal) workflow by returning it
+    /// to `PENDING`, resetting `recovery_attempts` and clearing deadline / dedup
+    /// / started / completed. Returns `true` if a row was actually transitioned
+    /// (i.e. it existed and was not already `SUCCESS`/`ERROR`). The caller
+    /// re-dispatches it.
+    async fn resume_workflow(&self, id: &str) -> Result<bool>;
+
+    /// Create `new_id` as a fork of `original_id`: a fresh `PENDING` workflow
+    /// with the same name/input, `forked_from = original_id`, and the original's
+    /// step checkpoints with `seq < start_step` copied in so execution resumes
+    /// from that step. Marks the original `was_forked_from`. Errors if the
+    /// original does not exist.
+    async fn fork_workflow(
+        &self,
+        original_id: &str,
+        new_id: &str,
+        start_step: i32,
+        app_version: &str,
+    ) -> Result<()>;
+
+    /// Atomically increment a workflow's `recovery_attempts` and return the new
+    /// value. If it exceeds `max`, the workflow is parked in
+    /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED` instead of being recovered again.
+    async fn bump_recovery_attempts(&self, id: &str, max: i32) -> Result<i32>;
 }

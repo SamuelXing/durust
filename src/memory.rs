@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use crate::provider::{
-    DequeueRequest, StateProvider, WorkflowStatus, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_PENDING,
+    is_terminal, DequeueRequest, ListFilter, StateProvider, WorkflowStatus, STATUS_CANCELLED,
+    STATUS_DELAYED, STATUS_ENQUEUED, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -92,7 +93,11 @@ impl StateProvider for InMemoryProvider {
             if let Some(e) = error {
                 row.error = Some(e.to_string());
             }
-            row.updated_at = Utc::now();
+            let now = Utc::now();
+            if is_terminal(status) {
+                row.completed_at_ms = Some(now.timestamp_millis());
+            }
+            row.updated_at = now;
         }
         Ok(())
     }
@@ -118,15 +123,6 @@ impl StateProvider for InMemoryProvider {
         Ok(canonical)
     }
 
-    async fn list_incomplete_workflows(&self) -> Result<Vec<WorkflowStatus>> {
-        let g = self.inner.lock().await;
-        Ok(g.workflows
-            .values()
-            .filter(|r| r.status == STATUS_PENDING)
-            .cloned()
-            .collect())
-    }
-
     async fn dequeue_workflows(&self, req: &DequeueRequest) -> Result<Vec<WorkflowStatus>> {
         let now_ms = Utc::now().timestamp_millis();
         let mut g = self.inner.lock().await;
@@ -144,7 +140,7 @@ impl StateProvider for InMemoryProvider {
                         && w.rate_limited
                         && w.status != STATUS_ENQUEUED
                         && w.status != STATUS_DELAYED
-                        && w.started_at_ms.map_or(false, |t| t > cutoff)
+                        && w.started_at_ms.is_some_and(|t| t > cutoff)
                 })
                 .count() as i64;
             max_tasks = max_tasks.min((limit - recent).max(0));
@@ -203,7 +199,7 @@ impl StateProvider for InMemoryProvider {
         let mut g = self.inner.lock().await;
         let mut n = 0;
         for w in g.workflows.values_mut() {
-            if w.status == STATUS_DELAYED && w.delay_until_ms.map_or(false, |t| t <= now_ms) {
+            if w.status == STATUS_DELAYED && w.delay_until_ms.is_some_and(|t| t <= now_ms) {
                 w.status = STATUS_ENQUEUED.to_string();
                 w.delay_until_ms = None;
                 w.updated_at = Utc::now();
@@ -276,5 +272,142 @@ impl StateProvider for InMemoryProvider {
         Ok(g.events
             .get(&(workflow_id.to_string(), key.to_string()))
             .cloned())
+    }
+
+    async fn list_workflows(&self, filter: &ListFilter) -> Result<Vec<WorkflowStatus>> {
+        let g = self.inner.lock().await;
+        let mut rows: Vec<WorkflowStatus> = g
+            .workflows
+            .values()
+            .filter(|w| {
+                (filter.workflow_ids.is_empty() || filter.workflow_ids.contains(&w.id))
+                    && filter
+                        .workflow_id_prefix
+                        .as_ref()
+                        .is_none_or(|p| w.id.starts_with(p))
+                    && filter.name.as_ref().is_none_or(|n| &w.name == n)
+                    && (filter.status.is_empty() || filter.status.contains(&w.status))
+                    && filter
+                        .queue_name
+                        .as_ref()
+                        .is_none_or(|q| w.queue_name.as_deref() == Some(q.as_str()))
+                    && filter
+                        .app_version
+                        .as_ref()
+                        .is_none_or(|v| &w.app_version == v)
+                    && (filter.executor_ids.is_empty()
+                        || filter.executor_ids.contains(&w.executor_id))
+                    && filter
+                        .forked_from
+                        .as_ref()
+                        .is_none_or(|f| w.forked_from.as_deref() == Some(f.as_str()))
+                    && filter
+                        .start_time_ms
+                        .is_none_or(|t| w.created_at.timestamp_millis() >= t)
+                    && filter
+                        .end_time_ms
+                        .is_none_or(|t| w.created_at.timestamp_millis() <= t)
+            })
+            .cloned()
+            .collect();
+
+        rows.sort_by_key(|w| w.created_at);
+        if filter.sort_desc {
+            rows.reverse();
+        }
+        if let Some(off) = filter.offset {
+            rows.drain(..(off.max(0) as usize).min(rows.len()));
+        }
+        if let Some(lim) = filter.limit {
+            rows.truncate(lim.max(0) as usize);
+        }
+        Ok(rows)
+    }
+
+    async fn cancel_workflow(&self, id: &str) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        if let Some(row) = g.workflows.get_mut(id) {
+            if !is_terminal(&row.status) {
+                let now = Utc::now();
+                row.status = STATUS_CANCELLED.to_string();
+                row.completed_at_ms = Some(now.timestamp_millis());
+                row.started_at_ms = None;
+                row.queue_name = None;
+                row.dedup_id = None;
+                row.updated_at = now;
+            }
+        }
+        Ok(())
+    }
+
+    async fn resume_workflow(&self, id: &str) -> Result<bool> {
+        let mut g = self.inner.lock().await;
+        let Some(row) = g.workflows.get_mut(id) else {
+            return Ok(false);
+        };
+        if is_terminal(&row.status) && row.status != STATUS_CANCELLED {
+            return Ok(false);
+        }
+        row.status = STATUS_PENDING.to_string();
+        row.recovery_attempts = 0;
+        row.deadline_ms = None;
+        row.dedup_id = None;
+        row.started_at_ms = None;
+        row.completed_at_ms = None;
+        row.updated_at = Utc::now();
+        Ok(true)
+    }
+
+    async fn fork_workflow(
+        &self,
+        original_id: &str,
+        new_id: &str,
+        start_step: i32,
+        app_version: &str,
+    ) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        let original = g.workflows.get(original_id).cloned().ok_or_else(|| {
+            Error::app(format!("cannot fork nonexistent workflow `{original_id}`"))
+        })?;
+
+        let mut forked = WorkflowStatus::new(
+            new_id,
+            &original.name,
+            original.input.clone(),
+            STATUS_PENDING,
+            "",
+            app_version,
+        );
+        forked.forked_from = Some(original_id.to_string());
+        g.workflows.insert(new_id.to_string(), forked);
+
+        // (`was_forked_from` is tracked only by the SQL backends, for
+        // observability; the in-memory provider has no such column.)
+
+        // Copy step checkpoints with seq < start_step into the forked workflow.
+        let copied: Vec<(i32, Value)> = g
+            .steps
+            .iter()
+            .filter(|((wid, seq), _)| wid == original_id && *seq < start_step)
+            .map(|((_, seq), v)| (*seq, v.clone()))
+            .collect();
+        for (seq, v) in copied {
+            g.steps.insert((new_id.to_string(), seq), v);
+        }
+        Ok(())
+    }
+
+    async fn bump_recovery_attempts(&self, id: &str, max: i32) -> Result<i32> {
+        let mut g = self.inner.lock().await;
+        let Some(row) = g.workflows.get_mut(id) else {
+            return Ok(0);
+        };
+        row.recovery_attempts += 1;
+        let attempts = row.recovery_attempts;
+        if attempts > max {
+            row.status = STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED.to_string();
+            row.updated_at = Utc::now();
+        }
+        Ok(attempts)
     }
 }

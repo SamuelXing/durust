@@ -2,8 +2,8 @@ use crate::context::DurableContext;
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{
-    is_terminal, DequeueRequest, StateProvider, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED,
-    STATUS_ENQUEUED, STATUS_ERROR, STATUS_PENDING, STATUS_SUCCESS,
+    is_terminal, DequeueRequest, ListFilter, StateProvider, WorkflowStatus, STATUS_CANCELLED,
+    STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_PENDING, STATUS_SUCCESS,
 };
 use crate::queue::WorkflowQueue;
 use serde::{de::DeserializeOwned, Serialize};
@@ -105,6 +105,9 @@ pub struct DurableEngine {
     queues: HashMap<String, Arc<WorkflowQueue>>,
     executor_id: String,
     app_version: String,
+    /// Recovery re-dispatches beyond this count park the workflow in
+    /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
+    max_recovery_attempts: i32,
     /// Flipped by [`shutdown`](Self::shutdown); background loops observe it.
     shutting_down: Arc<AtomicBool>,
     /// Count of workflow tasks this process is currently running, so
@@ -140,6 +143,7 @@ impl DurableEngine {
             queues: HashMap::new(),
             executor_id: uuid::Uuid::new_v4().to_string(),
             app_version: app_version.into(),
+            max_recovery_attempts: 100,
             shutting_down: Arc::new(AtomicBool::new(false)),
             inflight: Arc::new(AtomicUsize::new(0)),
             dispatchers: std::sync::Mutex::new(Vec::new()),
@@ -298,18 +302,21 @@ impl DurableEngine {
             return Ok(WorkflowHandle::polling(id, self.provider.clone()));
         }
 
-        // Spawn the run. Each task holds a drain guard so `shutdown` can wait it
-        // out.
+        Ok(self.spawn_local(id, handler, canonical.input))
+    }
+
+    /// Spawn a workflow run on a task and return a handle owning it. Each task
+    /// holds a drain guard so [`shutdown`](Self::shutdown) can wait it out.
+    fn spawn_local<O>(&self, id: String, handler: WorkflowFn, input: Value) -> WorkflowHandle<O> {
         let provider = self.provider.clone();
         let inflight = self.inflight.clone();
         inflight.fetch_add(1, Ordering::SeqCst);
         let task_id = id.clone();
         let join = tokio::spawn(async move {
             let _guard = InflightGuard(inflight);
-            run_to_completion(handler, provider, task_id, canonical.input).await
+            run_to_completion(handler, provider, task_id, input).await
         });
-
-        Ok(WorkflowHandle::local(id, self.provider.clone(), join))
+        WorkflowHandle::local(id, self.provider.clone(), join)
     }
 
     /// Enqueue a workflow on a registered queue — the Rust analog of Go's
@@ -395,15 +402,127 @@ impl DurableEngine {
         handle.get_result().await
     }
 
-    /// Re-run every workflow that is not in a terminal state. Completed steps are
-    /// served from their checkpoints, so recovery resumes exactly where the
-    /// previous run left off. Call this once on worker startup.
+    /// Get a [`WorkflowHandle`] for an existing workflow — the Rust analog of
+    /// Go's `RetrieveWorkflow`. The handle observes the workflow by polling, so
+    /// it works regardless of which executor is running it. Errors if no
+    /// workflow exists under `id`.
+    pub async fn retrieve_workflow<O>(&self, id: &str) -> Result<WorkflowHandle<O>> {
+        self.provider
+            .get_workflow_status(id)
+            .await?
+            .ok_or_else(|| Error::UnknownWorkflow(id.to_string()))?;
+        Ok(WorkflowHandle::polling(
+            id.to_string(),
+            self.provider.clone(),
+        ))
+    }
+
+    /// List workflows matching `filter` — the Rust analog of Go's
+    /// `ListWorkflows`.
+    pub async fn list_workflows(&self, filter: &ListFilter) -> Result<Vec<WorkflowStatus>> {
+        self.provider.list_workflows(filter).await
+    }
+
+    /// Cancel a workflow — the Rust analog of Go's `CancelWorkflow`. A
+    /// non-terminal workflow is set `CANCELLED` and removed from its queue; a
+    /// running workflow stops at its next step (cooperative cancellation).
+    pub async fn cancel_workflow(&self, id: &str) -> Result<()> {
+        self.provider.cancel_workflow(id).await
+    }
+
+    /// Resume a cancelled (or otherwise non-terminal) workflow — the Rust analog
+    /// of Go's `ResumeWorkflow`. The workflow is returned to `PENDING` and
+    /// re-run from its checkpoints; the returned handle tracks the new run.
+    /// Errors if the workflow does not exist or is already `SUCCESS`/`ERROR`.
+    pub async fn resume_workflow<O>(&self, id: &str) -> Result<WorkflowHandle<O>> {
+        if !self.provider.resume_workflow(id).await? {
+            return Err(Error::app(format!(
+                "workflow `{id}` cannot be resumed (missing or already completed)"
+            )));
+        }
+        let row = self
+            .provider
+            .get_workflow_status(id)
+            .await?
+            .ok_or_else(|| Error::UnknownWorkflow(id.to_string()))?;
+        let handler = self
+            .workflows
+            .get(&row.name)
+            .cloned()
+            .ok_or_else(|| Error::UnknownWorkflow(row.name.clone()))?;
+        Ok(self.spawn_local(id.to_string(), handler, row.input))
+    }
+
+    /// Fork a workflow from `start_step` — the Rust analog of Go's
+    /// `ForkWorkflow`. Creates a new workflow that reuses the original's
+    /// checkpoints for steps `< start_step` and re-executes from there. The new
+    /// id comes from `opts.workflow_id` or is generated; the returned handle
+    /// tracks the forked run.
+    pub async fn fork_workflow<O>(
+        &self,
+        original_id: &str,
+        start_step: i32,
+        opts: WorkflowOptions,
+    ) -> Result<WorkflowHandle<O>> {
+        let new_id = opts
+            .workflow_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        self.provider
+            .fork_workflow(original_id, &new_id, start_step, &self.app_version)
+            .await?;
+        let row = self
+            .provider
+            .get_workflow_status(&new_id)
+            .await?
+            .ok_or_else(|| Error::UnknownWorkflow(new_id.clone()))?;
+        let handler = self
+            .workflows
+            .get(&row.name)
+            .cloned()
+            .ok_or_else(|| Error::UnknownWorkflow(row.name.clone()))?;
+        Ok(self.spawn_local(new_id, handler, row.input))
+    }
+
+    /// Re-run every incomplete workflow of this engine's application version,
+    /// resuming each from its checkpoints. Workflows of a different version are
+    /// left alone (version-gated recovery), and a workflow recovered more than
+    /// `max_recovery_attempts` times is parked in
+    /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED`. Queued workflows are returned to their
+    /// queue for re-dispatch; the rest are re-run inline. Call once on startup.
     ///
-    /// Returns the number of workflows that were resumed.
+    /// Returns the number of workflows that were recovered.
     pub async fn recover(&self) -> Result<usize> {
-        let pending = self.provider.list_incomplete_workflows().await?;
+        let filter = ListFilter {
+            status: vec![STATUS_PENDING.to_string()],
+            app_version: Some(self.app_version.clone()),
+            ..Default::default()
+        };
+        let pending = self.provider.list_workflows(&filter).await?;
         let mut resumed = 0;
         for record in pending {
+            let attempts = self
+                .provider
+                .bump_recovery_attempts(&record.id, self.max_recovery_attempts)
+                .await?;
+            if attempts > self.max_recovery_attempts {
+                tracing::warn!(
+                    id = %record.id,
+                    attempts,
+                    "workflow parked: exceeded max recovery attempts"
+                );
+                continue;
+            }
+
+            // A workflow claimed off a queue before the crash goes back to the
+            // queue so the dispatcher (and its concurrency limits) re-runs it.
+            if record.queue_name.is_some() {
+                self.provider
+                    .set_workflow_status(&record.id, STATUS_ENQUEUED, None, None)
+                    .await?;
+                resumed += 1;
+                continue;
+            }
+
             if let Some(handler) = self.workflows.get(&record.name).cloned() {
                 // Best-effort: a workflow that fails again is marked ERROR by
                 // `run_to_completion`; we keep going with the rest.

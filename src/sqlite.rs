@@ -1,18 +1,20 @@
 use crate::error::Result;
 use crate::provider::{
-    DequeueRequest, StateProvider, WorkflowStatus, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_PENDING,
+    is_terminal, DequeueRequest, ListFilter, StateProvider, WorkflowStatus, STATUS_CANCELLED,
+    STATUS_DELAYED, STATUS_ENQUEUED, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
-use sqlx::Row;
+use sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use sqlx::{QueryBuilder, Row};
 use std::str::FromStr;
 
 const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, executor_id, \
      application_version, queue_name, priority, deduplication_id, recovery_attempts, \
      parent_workflow_id, workflow_timeout_ms, workflow_deadline_epoch_ms, \
-     started_at_epoch_ms, rate_limited, delay_until_epoch_ms, created_at, updated_at";
+     started_at_epoch_ms, rate_limited, delay_until_epoch_ms, completed_at, forked_from, \
+     created_at, updated_at";
 
 /// SQLite-backed [`StateProvider`].
 ///
@@ -73,6 +75,8 @@ fn row_to_status(row: &sqlx::sqlite::SqliteRow) -> WorkflowStatus {
         started_at_ms: row.try_get("started_at_epoch_ms").ok().flatten(),
         rate_limited: row.get("rate_limited"),
         delay_until_ms: row.try_get("delay_until_epoch_ms").ok().flatten(),
+        completed_at_ms: row.try_get("completed_at").ok().flatten(),
+        forked_from: row.try_get("forked_from").ok().flatten(),
         created_at: ms_to_dt(row.get("created_at")),
         updated_at: ms_to_dt(row.get("updated_at")),
     }
@@ -142,18 +146,22 @@ impl StateProvider for SqliteProvider {
         error: Option<&str>,
     ) -> Result<()> {
         let output_str = output.map(serde_json::to_string).transpose()?;
+        let now = Utc::now().timestamp_millis();
+        let completed = is_terminal(status).then_some(now);
         sqlx::query(
             "UPDATE workflow_status
              SET status = ?,
                  output = COALESCE(?, output),
                  error  = COALESCE(?, error),
+                 completed_at = COALESCE(?, completed_at),
                  updated_at = ?
              WHERE workflow_uuid = ?",
         )
         .bind(status)
         .bind(output_str)
         .bind(error)
-        .bind(Utc::now().timestamp_millis())
+        .bind(completed)
+        .bind(now)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -198,16 +206,6 @@ impl StateProvider for SqliteProvider {
         .fetch_one(&self.pool)
         .await?;
         Ok(parse_opt(row.get::<Option<String>, _>("output")).unwrap_or(Value::Null))
-    }
-
-    async fn list_incomplete_workflows(&self) -> Result<Vec<WorkflowStatus>> {
-        let rows = sqlx::query(&format!(
-            "SELECT {SELECT_COLS} FROM workflow_status WHERE status = ?"
-        ))
-        .bind(STATUS_PENDING)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.iter().map(row_to_status).collect())
     }
 
     async fn dequeue_workflows(&self, req: &DequeueRequest) -> Result<Vec<WorkflowStatus>> {
@@ -402,5 +400,205 @@ impl StateProvider for SqliteProvider {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.and_then(|v| serde_json::from_str(&v).ok()))
+    }
+
+    async fn list_workflows(&self, filter: &ListFilter) -> Result<Vec<WorkflowStatus>> {
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new(format!("SELECT {SELECT_COLS} FROM workflow_status"));
+        push_list_filters(&mut qb, filter);
+        qb.push(if filter.sort_desc {
+            " ORDER BY created_at DESC"
+        } else {
+            " ORDER BY created_at ASC"
+        });
+        if let Some(lim) = filter.limit {
+            qb.push(" LIMIT ").push_bind(lim);
+        }
+        if let Some(off) = filter.offset {
+            qb.push(" OFFSET ").push_bind(off);
+        }
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        Ok(rows.iter().map(row_to_status).collect())
+    }
+
+    async fn cancel_workflow(&self, id: &str) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "UPDATE workflow_status
+             SET status = ?, completed_at = ?, started_at_epoch_ms = NULL,
+                 queue_name = NULL, deduplication_id = NULL, updated_at = ?
+             WHERE workflow_uuid = ? AND status NOT IN (?, ?, ?)",
+        )
+        .bind(STATUS_CANCELLED)
+        .bind(now)
+        .bind(now)
+        .bind(id)
+        .bind(crate::provider::STATUS_SUCCESS)
+        .bind(crate::provider::STATUS_ERROR)
+        .bind(STATUS_CANCELLED)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn resume_workflow(&self, id: &str) -> Result<bool> {
+        let now = Utc::now().timestamp_millis();
+        let res = sqlx::query(
+            "UPDATE workflow_status
+             SET status = ?, recovery_attempts = 0, workflow_deadline_epoch_ms = NULL,
+                 deduplication_id = NULL, started_at_epoch_ms = NULL, completed_at = NULL,
+                 updated_at = ?
+             WHERE workflow_uuid = ? AND status NOT IN (?, ?)",
+        )
+        .bind(STATUS_PENDING)
+        .bind(now)
+        .bind(id)
+        .bind(crate::provider::STATUS_SUCCESS)
+        .bind(crate::provider::STATUS_ERROR)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn fork_workflow(
+        &self,
+        original_id: &str,
+        new_id: &str,
+        start_step: i32,
+        app_version: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let now = Utc::now().timestamp_millis();
+
+        let inserted = sqlx::query(
+            "INSERT INTO workflow_status
+                 (workflow_uuid, status, name, inputs, executor_id, application_version,
+                  forked_from, recovery_attempts, created_at, updated_at)
+             SELECT ?, ?, name, inputs, '', ?, ?, 0, ?, ?
+             FROM workflow_status WHERE workflow_uuid = ?",
+        )
+        .bind(new_id)
+        .bind(STATUS_PENDING)
+        .bind(app_version)
+        .bind(original_id)
+        .bind(now)
+        .bind(now)
+        .bind(original_id)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            return Err(crate::error::Error::app(format!(
+                "cannot fork nonexistent workflow `{original_id}`"
+            )));
+        }
+
+        sqlx::query("UPDATE workflow_status SET was_forked_from = TRUE WHERE workflow_uuid = ?")
+            .bind(original_id)
+            .execute(&mut *tx)
+            .await?;
+
+        if start_step > 0 {
+            sqlx::query(
+                "INSERT INTO operation_outputs
+                     (workflow_uuid, function_id, function_name, output, error, child_workflow_id)
+                 SELECT ?, function_id, function_name, output, error, child_workflow_id
+                 FROM operation_outputs WHERE workflow_uuid = ? AND function_id < ?",
+            )
+            .bind(new_id)
+            .bind(original_id)
+            .bind(start_step)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn bump_recovery_attempts(&self, id: &str, max: i32) -> Result<i32> {
+        let mut tx = self.pool.begin().await?;
+        let attempts: Option<i64> = sqlx::query_scalar(
+            "UPDATE workflow_status SET recovery_attempts = recovery_attempts + 1, updated_at = ?
+             WHERE workflow_uuid = ? RETURNING recovery_attempts",
+        )
+        .bind(Utc::now().timestamp_millis())
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let attempts = attempts.unwrap_or(0) as i32;
+        if attempts > max {
+            sqlx::query("UPDATE workflow_status SET status = ? WHERE workflow_uuid = ?")
+                .bind(STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(attempts)
+    }
+}
+
+/// Append the WHERE clause shared by `list_workflows` (SQLite dialect).
+fn push_list_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a ListFilter) {
+    let mut sep = " WHERE ";
+    let mut clause = |qb: &mut QueryBuilder<'a, Sqlite>| {
+        qb.push(sep);
+        sep = " AND ";
+    };
+    if !filter.workflow_ids.is_empty() {
+        clause(qb);
+        qb.push("workflow_uuid IN (");
+        let mut sebs = qb.separated(", ");
+        for id in &filter.workflow_ids {
+            sebs.push_bind(id.as_str());
+        }
+        sebs.push_unseparated(")");
+    }
+    if let Some(prefix) = &filter.workflow_id_prefix {
+        clause(qb);
+        qb.push("workflow_uuid LIKE ")
+            .push_bind(format!("{prefix}%"));
+    }
+    if let Some(name) = &filter.name {
+        clause(qb);
+        qb.push("name = ").push_bind(name.as_str());
+    }
+    if !filter.status.is_empty() {
+        clause(qb);
+        qb.push("status IN (");
+        let mut sebs = qb.separated(", ");
+        for s in &filter.status {
+            sebs.push_bind(s.as_str());
+        }
+        sebs.push_unseparated(")");
+    }
+    if let Some(q) = &filter.queue_name {
+        clause(qb);
+        qb.push("queue_name = ").push_bind(q.as_str());
+    }
+    if let Some(v) = &filter.app_version {
+        clause(qb);
+        qb.push("application_version = ").push_bind(v.as_str());
+    }
+    if !filter.executor_ids.is_empty() {
+        clause(qb);
+        qb.push("executor_id IN (");
+        let mut sebs = qb.separated(", ");
+        for e in &filter.executor_ids {
+            sebs.push_bind(e.as_str());
+        }
+        sebs.push_unseparated(")");
+    }
+    if let Some(f) = &filter.forked_from {
+        clause(qb);
+        qb.push("forked_from = ").push_bind(f.as_str());
+    }
+    if let Some(t) = filter.start_time_ms {
+        clause(qb);
+        qb.push("created_at >= ").push_bind(t);
+    }
+    if let Some(t) = filter.end_time_ms {
+        clause(qb);
+        qb.push("created_at <= ").push_bind(t);
     }
 }

@@ -2,8 +2,8 @@
 //! (separate engine + provider instances over the same database file).
 
 use durust::{
-    DurableContext, DurableEngine, Error, Result, SqliteProvider, WorkflowOptions, WorkflowQueue,
-    STATUS_SUCCESS,
+    DurableContext, DurableEngine, Error, ListFilter, Result, SqliteProvider, WorkflowOptions,
+    WorkflowQueue, STATUS_CANCELLED, STATUS_SUCCESS,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -155,6 +155,93 @@ async fn sqlite_messaging_and_events() -> Result<()> {
 
     // FK on destination_uuid: sending to a missing workflow errors.
     assert!(engine.send("ghost", "boo".to_string(), "t").await.is_err());
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// Management on the SQL backend: list filters (QueryBuilder), cancel/resume,
+/// and fork copying step checkpoints.
+#[tokio::test]
+async fn sqlite_management() -> Result<()> {
+    let (url, path) = temp_db_url("manage");
+    static SECOND_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("pipeline", |ctx: DurableContext, _: ()| async move {
+        let a = ctx
+            .step("first", || async { Ok::<_, Error>(10_i64) })
+            .await?;
+        let b = ctx
+            .step("second", || async {
+                SECOND_RUNS.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>(a + 5)
+            })
+            .await?;
+        Ok::<_, Error>(b)
+    });
+
+    engine.start_typed::<_, i64>("pipeline", "wf-1", ()).await?;
+
+    // list filters via QueryBuilder.
+    let listed = engine
+        .list_workflows(&ListFilter {
+            name: Some("pipeline".to_string()),
+            status: vec![STATUS_SUCCESS.to_string()],
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, "wf-1");
+
+    // Fork from step 1: step 0 reused, step 1 re-runs (SQL copy of operation_outputs).
+    let mut forked = engine
+        .fork_workflow::<i64>("wf-1", 1, WorkflowOptions::with_id("wf-fork"))
+        .await?;
+    assert_eq!(forked.get_result().await?, 15);
+    assert_eq!(SECOND_RUNS.load(Ordering::SeqCst), 2);
+    let frow = engine.retrieve_workflow::<i64>("wf-fork").await?;
+    assert_eq!(
+        frow.get_status().await?.forked_from.as_deref(),
+        Some("wf-1")
+    );
+
+    // Cancel a fresh pending workflow, then resume re-runs it to completion.
+    engine
+        .run_workflow::<_, i64>("pipeline", (), WorkflowOptions::with_id("wf-2"))
+        .await?
+        .get_result()
+        .await?;
+    engine.cancel_workflow("wf-2").await?;
+    // Already terminal (SUCCESS) → cancel is a no-op; resume errors.
+    assert!(engine.resume_workflow::<i64>("wf-2").await.is_err());
+
+    // A genuinely cancellable workflow.
+    use durust::{StateProvider, WorkflowStatus, STATUS_PENDING};
+    let provider = SqliteProvider::connect(&url).await?;
+    provider
+        .insert_workflow_status(WorkflowStatus::new(
+            "wf-3",
+            "pipeline",
+            serde_json::Value::Null,
+            STATUS_PENDING,
+            "",
+            "0.1.0",
+        ))
+        .await?;
+    engine.cancel_workflow("wf-3").await?;
+    assert_eq!(
+        engine
+            .retrieve_workflow::<i64>("wf-3")
+            .await?
+            .get_status()
+            .await?
+            .status,
+        STATUS_CANCELLED
+    );
+    let mut resumed = engine.resume_workflow::<i64>("wf-3").await?;
+    assert_eq!(resumed.get_result().await?, 15);
 
     let _ = std::fs::remove_file(path);
     Ok(())
