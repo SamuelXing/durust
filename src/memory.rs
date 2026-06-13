@@ -59,9 +59,7 @@ impl StateProvider for InMemoryProvider {
                     && w.dedup_id.as_deref() == Some(dedup)
             });
             if conflict {
-                return Err(Error::app(format!(
-                    "deduplication id `{dedup}` already in use on queue `{queue}`"
-                )));
+                return Err(Error::queue_deduplicated(queue, dedup));
             }
         }
         let row = g
@@ -218,9 +216,7 @@ impl StateProvider for InMemoryProvider {
         let mut g = self.inner.lock().await;
         // Mirror the SQL backends' FK on destination_uuid → workflow_status.
         if !g.workflows.contains_key(destination_id) {
-            return Err(Error::app(format!(
-                "cannot send to nonexistent workflow `{destination_id}`"
-            )));
+            return Err(Error::nonexistent_workflow(destination_id));
         }
         g.notifications.push(NotificationRow {
             destination_id: destination_id.to_string(),

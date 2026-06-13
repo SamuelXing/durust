@@ -3,8 +3,8 @@
 //! enqueue, deduplication, and rate limiting.
 
 use durust::{
-    DurableContext, DurableEngine, Error, InMemoryProvider, RateLimiter, Result, WorkflowOptions,
-    WorkflowQueue, STATUS_DELAYED, STATUS_ENQUEUED,
+    DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, RateLimiter, Result,
+    WorkflowOptions, WorkflowQueue, STATUS_DELAYED, STATUS_ENQUEUED,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -187,11 +187,23 @@ async fn dedup_id_rejects_duplicates() -> Result<()> {
 
     let mut opts = WorkflowOptions::with_id("wf-dedup-2");
     opts.dedup_id = Some("once".to_string());
-    let second = engine.enqueue::<_, ()>("dedup", "noop", (), opts).await;
-    assert!(
-        second.is_err(),
-        "same dedup id on the same queue must be rejected"
-    );
+    let err = match engine.enqueue::<_, ()>("dedup", "noop", (), opts).await {
+        Ok(_) => panic!("same dedup id on the same queue must be rejected"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code(), ErrorCode::QueueDeduplicated);
+    Ok(())
+}
+
+/// Sending to a workflow id that does not exist is a typed, classifiable error.
+#[tokio::test]
+async fn send_to_nonexistent_workflow_is_typed() -> Result<()> {
+    let engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    let err = engine
+        .send("no-such-workflow", "hi", "topic")
+        .await
+        .expect_err("sending to a nonexistent workflow must fail");
+    assert_eq!(err.code(), ErrorCode::NonExistentWorkflow);
     Ok(())
 }
 

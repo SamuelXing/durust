@@ -110,11 +110,18 @@ async fn sqlite_queue_dispatch_and_dedup() -> Result<()> {
     // violation from the INSERT.
     let mut opts = WorkflowOptions::with_id("wf-q-2");
     opts.dedup_id = Some("only-once".to_string());
-    let dup = engine.enqueue::<_, i64>("q", "double", 1_i64, opts).await;
-    assert!(
-        dup.is_err(),
-        "dedup id reuse on the same queue must be rejected"
-    );
+    let err = match engine.enqueue::<_, i64>("q", "double", 1_i64, opts).await {
+        Ok(_) => panic!("dedup id reuse on the same queue must be rejected"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code(), durust::ErrorCode::QueueDeduplicated);
+
+    // The destination FK is enforced: sending to an unknown id is typed.
+    let err = engine
+        .send("ghost", 1_i64, "topic")
+        .await
+        .expect_err("send to nonexistent workflow must fail");
+    assert_eq!(err.code(), durust::ErrorCode::NonExistentWorkflow);
 
     engine.shutdown(Duration::from_secs(1)).await?;
     let _ = std::fs::remove_file(path);
