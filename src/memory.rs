@@ -375,6 +375,9 @@ impl StateProvider for InMemoryProvider {
             app_version,
         );
         forked.forked_from = Some(original_id.to_string());
+        forked.authenticated_user = original.authenticated_user.clone();
+        forked.assumed_role = original.assumed_role.clone();
+        forked.authenticated_roles = original.authenticated_roles.clone();
         g.workflows.insert(new_id.to_string(), forked);
 
         // (`was_forked_from` is tracked only by the SQL backends, for

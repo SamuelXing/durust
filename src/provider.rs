@@ -27,6 +27,25 @@ pub(crate) fn nonexistent_or(e: sqlx::Error, destination_id: &str) -> Error {
     err
 }
 
+/// Encode the authenticated-roles list for storage in the single nullable
+/// `authenticated_roles` text column: a JSON array, or `NULL` when empty. This
+/// is the cross-SDK on-disk shape, so workers in other languages read it back.
+pub(crate) fn encode_roles(roles: &[String]) -> Option<String> {
+    if roles.is_empty() {
+        None
+    } else {
+        serde_json::to_string(roles).ok()
+    }
+}
+
+/// Decode the `authenticated_roles` column written by [`encode_roles`] (or by
+/// another SDK): a JSON array of strings, with `NULL`/unparseable → empty.
+pub(crate) fn decode_roles(stored: Option<&str>) -> Vec<String> {
+    stored
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default()
+}
+
 /// Workflow lifecycle states, aligned with the DBOS Go SDK.
 ///
 /// `ENQUEUED` — sitting in a queue, waiting to be claimed by a dispatcher.
@@ -98,6 +117,12 @@ pub struct WorkflowStatus {
     pub completed_at_ms: Option<i64>,
     /// On a forked workflow, the id it was forked from.
     pub forked_from: Option<String>,
+    /// User on whose behalf the workflow was started, if any.
+    pub authenticated_user: Option<String>,
+    /// Role the workflow assumed for this run, if any.
+    pub assumed_role: Option<String>,
+    /// Full set of roles available to the authenticated user.
+    pub authenticated_roles: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -136,6 +161,9 @@ impl WorkflowStatus {
             delay_until_ms: None,
             completed_at_ms: None,
             forked_from: None,
+            authenticated_user: None,
+            assumed_role: None,
+            authenticated_roles: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -315,4 +343,29 @@ pub trait StateProvider: Send + Sync {
     /// value. If it exceeds `max`, the workflow is parked in
     /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED` instead of being recovered again.
     async fn bump_recovery_attempts(&self, id: &str, max: i32) -> Result<i32>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_roles, encode_roles};
+
+    #[test]
+    fn roles_round_trip_as_json_array() {
+        // Empty maps to NULL (no column value) and back to an empty list.
+        assert_eq!(encode_roles(&[]), None);
+        assert!(decode_roles(None).is_empty());
+
+        // A populated list is stored as a JSON array string — the shared on-disk
+        // shape other SDKs read — and decodes back unchanged.
+        let roles = vec!["admin".to_string(), "user".to_string()];
+        let stored = encode_roles(&roles).expect("non-empty roles encode to Some");
+        assert_eq!(stored, r#"["admin","user"]"#);
+        assert_eq!(decode_roles(Some(&stored)), roles);
+    }
+
+    #[test]
+    fn decode_roles_tolerates_garbage() {
+        // A malformed column never panics; it degrades to no roles.
+        assert!(decode_roles(Some("not json")).is_empty());
+    }
 }

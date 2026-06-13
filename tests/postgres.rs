@@ -56,6 +56,52 @@ async fn pg_serialization_cross_format() -> Result<()> {
     Ok(())
 }
 
+/// The run identity round-trips through Postgres: the three auth columns are
+/// written on insert (roles as a JSON array in the text column), read back into
+/// the status, threaded into the workflow context, and copied onto a fork.
+#[tokio::test]
+async fn pg_auth_context_round_trip() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_auth_context_round_trip: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let provider = PostgresProvider::connect(&url).await?;
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    engine.register("whoami", |ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(format!(
+            "{}/{}/{}",
+            ctx.authenticated_user().unwrap_or("-"),
+            ctx.assumed_role().unwrap_or("-"),
+            ctx.authenticated_roles().join(","),
+        ))
+    });
+
+    let id = format!("wf-auth-{tag}");
+    let opts = WorkflowOptions::with_id(&id)
+        .authenticated_user("alice")
+        .assumed_role("admin")
+        .authenticated_roles(["admin", "user"]);
+    let mut handle = engine.run_workflow::<_, String>("whoami", (), opts).await?;
+    assert_eq!(handle.get_result().await?, "alice/admin/admin,user");
+
+    let status = handle.get_status().await?;
+    assert_eq!(status.authenticated_user.as_deref(), Some("alice"));
+    assert_eq!(status.assumed_role.as_deref(), Some("admin"));
+    assert_eq!(status.authenticated_roles, vec!["admin", "user"]);
+
+    let fork_id = format!("wf-auth-fork-{tag}");
+    let forked = engine
+        .fork_workflow::<String>(&id, 0, WorkflowOptions::with_id(&fork_id))
+        .await?;
+    let fstatus = forked.get_status().await?;
+    assert_eq!(fstatus.authenticated_user.as_deref(), Some("alice"));
+    assert_eq!(fstatus.authenticated_roles, vec!["admin", "user"]);
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
 /// Postgres surfaces the dedup unique-violation and the destination FK violation
 /// as typed, classifiable errors (verifies the sqlx Postgres driver mapping).
 #[tokio::test]

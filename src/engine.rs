@@ -1,4 +1,4 @@
-use crate::context::DurableContext;
+use crate::context::{AuthContext, DurableContext};
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{
@@ -84,6 +84,13 @@ pub struct WorkflowOptions {
     /// Delay before the workflow becomes eligible to run (queued workflows
     /// only): it sits in `DELAYED` until the dispatcher transitions it.
     pub delay: Option<Duration>,
+    /// User on whose behalf the workflow runs; persisted and readable from the
+    /// workflow via [`DurableContext::authenticated_user`].
+    pub authenticated_user: Option<String>,
+    /// Role assumed for this run.
+    pub assumed_role: Option<String>,
+    /// Roles available to the authenticated user.
+    pub authenticated_roles: Vec<String>,
 }
 
 impl WorkflowOptions {
@@ -93,6 +100,28 @@ impl WorkflowOptions {
             workflow_id: Some(id.into()),
             ..Default::default()
         }
+    }
+
+    /// Set the user the workflow runs on behalf of.
+    pub fn authenticated_user(mut self, user: impl Into<String>) -> Self {
+        self.authenticated_user = Some(user.into());
+        self
+    }
+
+    /// Set the role assumed for this run.
+    pub fn assumed_role(mut self, role: impl Into<String>) -> Self {
+        self.assumed_role = Some(role.into());
+        self
+    }
+
+    /// Set the roles available to the authenticated user.
+    pub fn authenticated_roles<I, S>(mut self, roles: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.authenticated_roles = roles.into_iter().map(Into::into).collect();
+        self
     }
 }
 
@@ -312,6 +341,9 @@ impl DurableEngine {
         row.queue_name = opts.queue.clone();
         row.priority = opts.priority;
         row.dedup_id = opts.dedup_id.clone();
+        row.authenticated_user = opts.authenticated_user.clone();
+        row.assumed_role = opts.assumed_role.clone();
+        row.authenticated_roles = opts.authenticated_roles.clone();
         row.timeout_ms = opts.timeout.map(|d| d.as_millis() as i64);
         row.delay_until_ms = opts.delay.map(|d| now_ms + d.as_millis() as i64);
         if !queued {
@@ -328,7 +360,8 @@ impl DurableEngine {
             return Ok(WorkflowHandle::polling(id, self.provider.clone()));
         }
 
-        Ok(self.spawn_local(id, handler, canonical.input, canonical.deadline_ms))
+        let auth = AuthContext::from_status(&canonical);
+        Ok(self.spawn_local(id, handler, canonical.input, canonical.deadline_ms, auth))
     }
 
     /// Spawn a workflow run on a task and return a handle owning it. Each task
@@ -339,6 +372,7 @@ impl DurableEngine {
         handler: WorkflowFn,
         input: Value,
         deadline_ms: Option<i64>,
+        auth: AuthContext,
     ) -> WorkflowHandle<O> {
         let provider = self.provider.clone();
         let inflight = self.inflight.clone();
@@ -346,7 +380,7 @@ impl DurableEngine {
         let task_id = id.clone();
         let join = tokio::spawn(async move {
             let _guard = InflightGuard(inflight);
-            run_to_completion(handler, provider, task_id, input, deadline_ms).await
+            run_to_completion(handler, provider, task_id, input, deadline_ms, auth).await
         });
         WorkflowHandle::local(id, self.provider.clone(), join)
     }
@@ -482,7 +516,8 @@ impl DurableEngine {
             .get(&row.name)
             .cloned()
             .ok_or_else(|| Error::UnknownWorkflow(row.name.clone()))?;
-        Ok(self.spawn_local(id.to_string(), handler, row.input, row.deadline_ms))
+        let auth = AuthContext::from_status(&row);
+        Ok(self.spawn_local(id.to_string(), handler, row.input, row.deadline_ms, auth))
     }
 
     /// Fork a workflow from `start_step` — the Rust analog of Go's
@@ -512,7 +547,8 @@ impl DurableEngine {
             .get(&row.name)
             .cloned()
             .ok_or_else(|| Error::UnknownWorkflow(row.name.clone()))?;
-        Ok(self.spawn_local(new_id, handler, row.input, row.deadline_ms))
+        let auth = AuthContext::from_status(&row);
+        Ok(self.spawn_local(new_id, handler, row.input, row.deadline_ms, auth))
     }
 
     /// Re-run every incomplete workflow of this engine's application version,
@@ -564,6 +600,7 @@ impl DurableEngine {
                     record.id.clone(),
                     record.input.clone(),
                     record.deadline_ms,
+                    AuthContext::from_status(&record),
                 )
                 .await;
                 resumed += 1;
@@ -670,6 +707,7 @@ async fn queue_dispatch_loop(
                         let provider = provider.clone();
                         let inflight_guard = InflightGuard(inflight.clone());
                         let local_guard = InflightGuard(local_running.clone());
+                        let auth = AuthContext::from_status(&wf);
                         tokio::spawn(async move {
                             let _inflight = inflight_guard;
                             let _local = local_guard;
@@ -681,6 +719,7 @@ async fn queue_dispatch_loop(
                                 wf.id,
                                 wf.input,
                                 wf.deadline_ms,
+                                auth,
                             )
                             .await;
                         });
@@ -718,8 +757,9 @@ async fn run_to_completion(
     id: String,
     input: Value,
     deadline_ms: Option<i64>,
+    auth: AuthContext,
 ) -> Result<Value> {
-    let ctx = DurableContext::new(id.clone(), provider.clone());
+    let ctx = DurableContext::new(id.clone(), provider.clone(), auth);
     let run = handler(ctx, input);
 
     // Enforce a workflow deadline if one was set: when it elapses, the run
@@ -827,6 +867,7 @@ async fn schedule_loop(name: String, spec: String, handler: WorkflowFn, bg: Back
                     let provider = provider.clone();
                     let handler = handler.clone();
                     let guard = InflightGuard(inflight.clone());
+                    let auth = AuthContext::from_status(&canonical);
                     tokio::spawn(async move {
                         let _guard = guard;
                         let _ = run_to_completion(
@@ -835,6 +876,7 @@ async fn schedule_loop(name: String, spec: String, handler: WorkflowFn, bg: Back
                             wf_id,
                             canonical.input,
                             canonical.deadline_ms,
+                            auth,
                         )
                         .await;
                     });

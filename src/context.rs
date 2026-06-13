@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::provider::{StateProvider, STATUS_CANCELLED};
+use crate::provider::{StateProvider, WorkflowStatus, STATUS_CANCELLED};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::future::Future;
@@ -62,8 +62,45 @@ impl StepOptions {
     }
 }
 
+/// The identity a workflow runs under: the user it was started on behalf of,
+/// the role assumed for this run, and the full set of roles available to that
+/// user. It is persisted with the workflow and flows into any work the workflow
+/// starts, so an audit trail and authorization decisions stay consistent across
+/// a workflow tree and across recovery.
+///
+/// All fields are optional — a workflow started without an identity carries an
+/// empty `AuthContext`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuthContext {
+    /// User on whose behalf the workflow was started.
+    pub authenticated_user: Option<String>,
+    /// Role assumed for this run.
+    pub assumed_role: Option<String>,
+    /// Roles available to the authenticated user.
+    pub authenticated_roles: Vec<String>,
+}
+
+impl AuthContext {
+    /// Lift the identity recorded on a persisted workflow row.
+    pub(crate) fn from_status(s: &WorkflowStatus) -> Self {
+        Self {
+            authenticated_user: s.authenticated_user.clone(),
+            assumed_role: s.assumed_role.clone(),
+            authenticated_roles: s.authenticated_roles.clone(),
+        }
+    }
+
+    /// `true` when no identity was attached.
+    pub fn is_empty(&self) -> bool {
+        self.authenticated_user.is_none()
+            && self.assumed_role.is_none()
+            && self.authenticated_roles.is_empty()
+    }
+}
+
 /// Handle passed into every workflow function. It carries the workflow id, the
-/// state backend, and a deterministic per-execution step counter.
+/// state backend, the identity the workflow runs under, and a deterministic
+/// per-execution step counter.
 ///
 /// All durable operations a workflow performs go through this context:
 /// [`DurableContext::step`] / [`DurableContext::step_with`] for checkpointed work
@@ -72,6 +109,7 @@ impl StepOptions {
 pub struct DurableContext {
     workflow_id: String,
     provider: Arc<dyn StateProvider>,
+    auth: AuthContext,
     // Monotonic step index. Because the workflow's control flow is
     // deterministic, the same code path yields the same seq on every replay,
     // which is how we match a step call to its stored checkpoint.
@@ -79,16 +117,41 @@ pub struct DurableContext {
 }
 
 impl DurableContext {
-    pub(crate) fn new(workflow_id: String, provider: Arc<dyn StateProvider>) -> Self {
+    pub(crate) fn new(
+        workflow_id: String,
+        provider: Arc<dyn StateProvider>,
+        auth: AuthContext,
+    ) -> Self {
         Self {
             workflow_id,
             provider,
+            auth,
             seq: Arc::new(AtomicI32::new(0)),
         }
     }
 
     pub fn workflow_id(&self) -> &str {
         &self.workflow_id
+    }
+
+    /// The identity this workflow runs under (see [`AuthContext`]).
+    pub fn auth(&self) -> &AuthContext {
+        &self.auth
+    }
+
+    /// The user this workflow was started on behalf of, if any.
+    pub fn authenticated_user(&self) -> Option<&str> {
+        self.auth.authenticated_user.as_deref()
+    }
+
+    /// The role assumed for this run, if any.
+    pub fn assumed_role(&self) -> Option<&str> {
+        self.auth.assumed_role.as_deref()
+    }
+
+    /// The roles available to the authenticated user.
+    pub fn authenticated_roles(&self) -> &[String] {
+        &self.auth.authenticated_roles
     }
 
     fn next_seq(&self) -> i32 {
