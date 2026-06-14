@@ -343,6 +343,23 @@ pub trait StateProvider: Send + Sync {
     /// value. If it exceeds `max`, the workflow is parked in
     /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED` instead of being recovered again.
     async fn bump_recovery_attempts(&self, id: &str, max: i32) -> Result<i32>;
+
+    /// Idempotently record that `parent_id`'s step `seq` started child workflow
+    /// `child_id`. Stored as an `operation_outputs` checkpoint carrying the child
+    /// id, so a replay of the parent re-attaches to the same child instead of
+    /// starting a new one. A second record for the same `(parent_id, seq)` is a
+    /// no-op.
+    async fn record_child_workflow(
+        &self,
+        parent_id: &str,
+        seq: i32,
+        name: &str,
+        child_id: &str,
+    ) -> Result<()>;
+
+    /// Return the child workflow id `parent_id` started at step `seq`, if one was
+    /// recorded by [`record_child_workflow`](Self::record_child_workflow).
+    async fn check_child_workflow(&self, parent_id: &str, seq: i32) -> Result<Option<String>>;
 }
 
 #[cfg(test)]

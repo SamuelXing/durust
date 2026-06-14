@@ -102,6 +102,49 @@ async fn pg_auth_context_round_trip() -> Result<()> {
     Ok(())
 }
 
+/// Child workflows round-trip through Postgres: a parent starts a child, the
+/// child is linked via `parent_workflow_id` and the `child_workflow_id`
+/// checkpoint, and inherits the parent's identity.
+#[tokio::test]
+async fn pg_child_workflow() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_child_workflow: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let provider = PostgresProvider::connect(&url).await?;
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    engine.register("child", |ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(format!("{n}:{}", ctx.authenticated_user().unwrap_or("-")))
+    });
+    engine.register("parent", |ctx: DurableContext, n: i64| async move {
+        let mut child = ctx
+            .start_workflow::<_, String>("child", n, WorkflowOptions::default())
+            .await?;
+        child.get_result().await
+    });
+
+    let parent_id = format!("parent-{tag}");
+    let opts = WorkflowOptions::with_id(&parent_id).authenticated_user("alice");
+    let mut handle = engine
+        .run_workflow::<_, String>("parent", 5_i64, opts)
+        .await?;
+    assert_eq!(handle.get_result().await?, "5:alice");
+
+    let child = engine
+        .retrieve_workflow::<String>(&format!("{parent_id}-0"))
+        .await?;
+    let status = child.get_status().await?;
+    assert_eq!(
+        status.parent_workflow_id.as_deref(),
+        Some(parent_id.as_str())
+    );
+    assert_eq!(status.authenticated_user.as_deref(), Some("alice"));
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
 /// Postgres surfaces the dedup unique-violation and the destination FK violation
 /// as typed, classifiable errors (verifies the sqlx Postgres driver mapping).
 #[tokio::test]

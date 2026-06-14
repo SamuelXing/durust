@@ -150,6 +150,9 @@ pub struct DurableEngine {
     inflight: Arc<AtomicUsize>,
     /// Per-queue dispatcher tasks spawned by [`launch`](Self::launch).
     dispatchers: std::sync::Mutex<Vec<JoinHandle<()>>>,
+    /// Shared execution core, built once from the registrations on first run and
+    /// reused by every run path (and by workflows that start child workflows).
+    runtime: std::sync::OnceLock<Arc<Runtime>>,
 }
 
 impl DurableEngine {
@@ -187,7 +190,28 @@ impl DurableEngine {
             shutting_down: Arc::new(AtomicBool::new(false)),
             inflight: Arc::new(AtomicUsize::new(0)),
             dispatchers: std::sync::Mutex::new(Vec::new()),
+            runtime: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The shared execution core, built once from the current registrations.
+    ///
+    /// Built lazily on the first run so all `register`/`register_queue` calls are
+    /// captured; registering after the first workflow starts is not reflected
+    /// (register before running, as you would before `launch`).
+    fn runtime(&self) -> Arc<Runtime> {
+        self.runtime
+            .get_or_init(|| {
+                Arc::new(Runtime {
+                    provider: self.provider.clone(),
+                    workflows: self.workflows.clone(),
+                    queues: self.queues.clone(),
+                    executor_id: self.executor_id.clone(),
+                    app_version: self.app_version.clone(),
+                    inflight: self.inflight.clone(),
+                })
+            })
+            .clone()
     }
 
     /// This process's unique executor id.
@@ -226,30 +250,25 @@ impl DurableEngine {
     /// once per launch; safe to call again after `shutdown`.
     pub async fn launch(&self) -> Result<()> {
         self.shutting_down.store(false, Ordering::SeqCst);
-        let bg = Background {
-            provider: self.provider.clone(),
-            executor_id: self.executor_id.clone(),
-            app_version: self.app_version.clone(),
-            shutting_down: self.shutting_down.clone(),
-            inflight: self.inflight.clone(),
-        };
+        let rt = self.runtime();
         let mut tasks = self.dispatchers.lock().expect("dispatcher lock poisoned");
         for queue in self.queues.values() {
             tasks.push(tokio::spawn(queue_dispatch_loop(
                 queue.clone(),
-                self.workflows.clone(),
-                bg.clone(),
+                rt.clone(),
+                self.shutting_down.clone(),
             )));
         }
         for (name, spec) in &self.scheduled {
-            let Some(handler) = self.workflows.get(name).cloned() else {
+            let Some(handler) = rt.workflows.get(name).cloned() else {
                 continue;
             };
             tasks.push(tokio::spawn(schedule_loop(
                 name.clone(),
                 spec.clone(),
                 handler,
-                bg.clone(),
+                rt.clone(),
+                self.shutting_down.clone(),
             )));
         }
         Ok(())
@@ -299,90 +318,41 @@ impl DurableEngine {
     where
         I: Serialize,
     {
+        let rt = self.runtime();
         let id = opts
             .workflow_id
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let input_json = serde_json::to_value(input)?;
-
-        let handler = self
+        let handler = rt
             .workflows
             .get(name)
             .cloned()
             .ok_or_else(|| Error::UnknownWorkflow(name.to_string()))?;
 
-        let queued = opts.queue.is_some();
-        if let Some(q) = &opts.queue {
-            if !self.queues.contains_key(q) {
-                return Err(Error::UnknownQueue(q.clone()));
-            }
-        }
-        if opts.delay.is_some() && !queued {
-            return Err(Error::app(
-                "WorkflowOptions.delay requires a queue; direct runs start immediately",
-            ));
-        }
-
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let status = match (queued, opts.delay) {
-            (false, _) => STATUS_PENDING,
-            (true, None) => STATUS_ENQUEUED,
-            (true, Some(_)) => STATUS_DELAYED,
+        // A top-level run takes its identity from the options.
+        let auth = AuthContext {
+            authenticated_user: opts.authenticated_user.clone(),
+            assumed_role: opts.assumed_role.clone(),
+            authenticated_roles: opts.authenticated_roles.clone(),
         };
-        // A queued row is unowned until a dispatcher claims it.
-        let executor = if queued {
-            ""
-        } else {
-            self.executor_id.as_str()
-        };
-
-        let mut row =
-            WorkflowStatus::new(&id, name, input_json, status, executor, &self.app_version);
-        row.queue_name = opts.queue.clone();
-        row.priority = opts.priority;
-        row.dedup_id = opts.dedup_id.clone();
-        row.authenticated_user = opts.authenticated_user.clone();
-        row.assumed_role = opts.assumed_role.clone();
-        row.authenticated_roles = opts.authenticated_roles.clone();
-        row.timeout_ms = opts.timeout.map(|d| d.as_millis() as i64);
-        row.delay_until_ms = opts.delay.map(|d| now_ms + d.as_millis() as i64);
-        if !queued {
-            // Direct runs start now, so the deadline is fixed here; for queued
-            // runs it is computed when a dispatcher claims the workflow.
-            row.started_at_ms = Some(now_ms);
-            row.deadline_ms = row.timeout_ms.map(|t| now_ms + t);
-        }
-
-        let canonical = self.provider.insert_workflow_status(row).await?;
+        let (canonical, queued) = rt
+            .insert_run(&id, name, input_json, &opts, None, &auth)
+            .await?;
 
         // Terminal already, or owned by a queue: observe via polling.
         if queued || is_terminal(&canonical.status) {
             return Ok(WorkflowHandle::polling(id, self.provider.clone()));
         }
 
-        let auth = AuthContext::from_status(&canonical);
-        Ok(self.spawn_local(id, handler, canonical.input, canonical.deadline_ms, auth))
-    }
-
-    /// Spawn a workflow run on a task and return a handle owning it. Each task
-    /// holds a drain guard so [`shutdown`](Self::shutdown) can wait it out.
-    fn spawn_local<O>(
-        &self,
-        id: String,
-        handler: WorkflowFn,
-        input: Value,
-        deadline_ms: Option<i64>,
-        auth: AuthContext,
-    ) -> WorkflowHandle<O> {
-        let provider = self.provider.clone();
-        let inflight = self.inflight.clone();
-        inflight.fetch_add(1, Ordering::SeqCst);
-        let task_id = id.clone();
-        let join = tokio::spawn(async move {
-            let _guard = InflightGuard(inflight);
-            run_to_completion(handler, provider, task_id, input, deadline_ms, auth).await
-        });
-        WorkflowHandle::local(id, self.provider.clone(), join)
+        let join = rt.spawn_owned(
+            id.clone(),
+            handler,
+            canonical.input,
+            canonical.deadline_ms,
+            auth,
+        );
+        Ok(WorkflowHandle::local(id, self.provider.clone(), join))
     }
 
     /// Enqueue a workflow on a registered queue — the Rust analog of Go's
@@ -511,13 +481,19 @@ impl DurableEngine {
             .get_workflow_status(id)
             .await?
             .ok_or_else(|| Error::UnknownWorkflow(id.to_string()))?;
-        let handler = self
+        let rt = self.runtime();
+        let handler = rt
             .workflows
             .get(&row.name)
             .cloned()
             .ok_or_else(|| Error::UnknownWorkflow(row.name.clone()))?;
         let auth = AuthContext::from_status(&row);
-        Ok(self.spawn_local(id.to_string(), handler, row.input, row.deadline_ms, auth))
+        let join = rt.spawn_owned(id.to_string(), handler, row.input, row.deadline_ms, auth);
+        Ok(WorkflowHandle::local(
+            id.to_string(),
+            self.provider.clone(),
+            join,
+        ))
     }
 
     /// Fork a workflow from `start_step` — the Rust analog of Go's
@@ -542,13 +518,15 @@ impl DurableEngine {
             .get_workflow_status(&new_id)
             .await?
             .ok_or_else(|| Error::UnknownWorkflow(new_id.clone()))?;
-        let handler = self
+        let rt = self.runtime();
+        let handler = rt
             .workflows
             .get(&row.name)
             .cloned()
             .ok_or_else(|| Error::UnknownWorkflow(row.name.clone()))?;
         let auth = AuthContext::from_status(&row);
-        Ok(self.spawn_local(new_id, handler, row.input, row.deadline_ms, auth))
+        let join = rt.spawn_owned(new_id.clone(), handler, row.input, row.deadline_ms, auth);
+        Ok(WorkflowHandle::local(new_id, self.provider.clone(), join))
     }
 
     /// Re-run every incomplete workflow of this engine's application version,
@@ -566,6 +544,7 @@ impl DurableEngine {
             ..Default::default()
         };
         let pending = self.provider.list_workflows(&filter).await?;
+        let rt = self.runtime();
         let mut resumed = 0;
         for record in pending {
             let attempts = self
@@ -591,12 +570,12 @@ impl DurableEngine {
                 continue;
             }
 
-            if let Some(handler) = self.workflows.get(&record.name).cloned() {
+            if let Some(handler) = rt.workflows.get(&record.name).cloned() {
                 // Best-effort: a workflow that fails again is marked ERROR by
                 // `run_to_completion`; we keep going with the rest.
                 let _ = run_to_completion(
+                    rt.clone(),
                     handler,
-                    self.provider.clone(),
                     record.id.clone(),
                     record.input.clone(),
                     record.deadline_ms,
@@ -616,15 +595,152 @@ impl DurableEngine {
     }
 }
 
-/// Shared context handed to the background loops (queue dispatch, scheduler):
-/// the state backend, this process's identity, and the lifecycle signals.
-#[derive(Clone)]
-struct Background {
+/// The shared execution core: everything needed to create and run a workflow.
+///
+/// Reachable both from [`DurableEngine`] methods and from inside a running
+/// workflow through [`DurableContext`], so a workflow can start child workflows
+/// using the same registry, queues, and identity as the engine. Held behind an
+/// `Arc`; see [`DurableEngine::runtime`].
+pub(crate) struct Runtime {
     provider: Arc<dyn StateProvider>,
+    workflows: HashMap<String, WorkflowFn>,
+    queues: HashMap<String, Arc<WorkflowQueue>>,
     executor_id: String,
     app_version: String,
-    shutting_down: Arc<AtomicBool>,
     inflight: Arc<AtomicUsize>,
+}
+
+impl Runtime {
+    pub(crate) fn provider(&self) -> &Arc<dyn StateProvider> {
+        &self.provider
+    }
+
+    /// Build a new run's status row from `opts` and persist it idempotently,
+    /// returning the canonical row and whether it was routed to a queue. Shared
+    /// by top-level runs and child workflows; `parent_id`/`auth` are stamped on
+    /// the row.
+    async fn insert_run(
+        &self,
+        id: &str,
+        name: &str,
+        input_json: Value,
+        opts: &WorkflowOptions,
+        parent_id: Option<&str>,
+        auth: &AuthContext,
+    ) -> Result<(WorkflowStatus, bool)> {
+        let queued = opts.queue.is_some();
+        if let Some(q) = &opts.queue {
+            if !self.queues.contains_key(q) {
+                return Err(Error::UnknownQueue(q.clone()));
+            }
+        }
+        if opts.delay.is_some() && !queued {
+            return Err(Error::app(
+                "WorkflowOptions.delay requires a queue; direct runs start immediately",
+            ));
+        }
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let status = match (queued, opts.delay) {
+            (false, _) => STATUS_PENDING,
+            (true, None) => STATUS_ENQUEUED,
+            (true, Some(_)) => STATUS_DELAYED,
+        };
+        // A queued row is unowned until a dispatcher claims it.
+        let executor = if queued {
+            ""
+        } else {
+            self.executor_id.as_str()
+        };
+
+        let mut row =
+            WorkflowStatus::new(id, name, input_json, status, executor, &self.app_version);
+        row.queue_name = opts.queue.clone();
+        row.priority = opts.priority;
+        row.dedup_id = opts.dedup_id.clone();
+        row.parent_workflow_id = parent_id.map(|s| s.to_string());
+        row.authenticated_user = auth.authenticated_user.clone();
+        row.assumed_role = auth.assumed_role.clone();
+        row.authenticated_roles = auth.authenticated_roles.clone();
+        row.timeout_ms = opts.timeout.map(|d| d.as_millis() as i64);
+        row.delay_until_ms = opts.delay.map(|d| now_ms + d.as_millis() as i64);
+        if !queued {
+            // Direct runs start now, so the deadline is fixed here; for queued
+            // runs it is computed when a dispatcher claims the workflow.
+            row.started_at_ms = Some(now_ms);
+            row.deadline_ms = row.timeout_ms.map(|t| now_ms + t);
+        }
+
+        let canonical = self.provider.insert_workflow_status(row).await?;
+        Ok((canonical, queued))
+    }
+
+    /// Spawn a run on a task this caller owns (for a local [`WorkflowHandle`]).
+    /// The task holds a drain guard so [`DurableEngine::shutdown`] waits it out.
+    fn spawn_owned(
+        self: &Arc<Self>,
+        id: String,
+        handler: WorkflowFn,
+        input: Value,
+        deadline_ms: Option<i64>,
+        auth: AuthContext,
+    ) -> JoinHandle<Result<Value>> {
+        let rt = self.clone();
+        self.inflight.fetch_add(1, Ordering::SeqCst);
+        let guard = InflightGuard(self.inflight.clone());
+        tokio::spawn(async move {
+            let _guard = guard;
+            run_to_completion(rt, handler, id, input, deadline_ms, auth).await
+        })
+    }
+
+    /// Spawn a run on a self-owned, detached task; the result is observed by
+    /// polling the status row. Used for queue claims, recovery, schedules, and
+    /// child workflows.
+    fn spawn_detached(
+        self: &Arc<Self>,
+        id: String,
+        handler: WorkflowFn,
+        input: Value,
+        deadline_ms: Option<i64>,
+        auth: AuthContext,
+    ) {
+        let join = self.spawn_owned(id, handler, input, deadline_ms, auth);
+        // Detach: the inflight guard inside the task keeps shutdown correct.
+        drop(join);
+    }
+
+    /// Start a child workflow under the deterministic `child_id`, stamping the
+    /// parent link and the inherited identity. A queued or already-terminal
+    /// child is left for polling; otherwise it runs now on a detached task.
+    pub(crate) async fn spawn_child(
+        self: &Arc<Self>,
+        child_id: &str,
+        name: &str,
+        input_json: Value,
+        opts: WorkflowOptions,
+        parent_id: &str,
+        auth: AuthContext,
+    ) -> Result<()> {
+        let handler = self
+            .workflows
+            .get(name)
+            .cloned()
+            .ok_or_else(|| Error::UnknownWorkflow(name.to_string()))?;
+        let (canonical, queued) = self
+            .insert_run(child_id, name, input_json, &opts, Some(parent_id), &auth)
+            .await?;
+        if !queued && !is_terminal(&canonical.status) {
+            self.spawn_detached(
+                child_id.to_string(),
+                handler,
+                canonical.input,
+                canonical.deadline_ms,
+                auth,
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Decrements the in-flight counter when a workflow task ends (even on panic).
@@ -645,16 +761,13 @@ impl Drop for InflightGuard {
 /// base on success, and is jittered so multiple executors don't poll in step.
 async fn queue_dispatch_loop(
     queue: Arc<WorkflowQueue>,
-    workflows: HashMap<String, WorkflowFn>,
-    bg: Background,
+    rt: Arc<Runtime>,
+    shutting_down: Arc<AtomicBool>,
 ) {
-    let Background {
-        provider,
-        executor_id,
-        app_version,
-        shutting_down,
-        inflight,
-    } = bg;
+    let provider = rt.provider.clone();
+    let executor_id = rt.executor_id.clone();
+    let app_version = rt.app_version.clone();
+    let inflight = rt.inflight.clone();
     let local_running = Arc::new(AtomicUsize::new(0));
     let mut interval = queue.base_polling_interval;
 
@@ -694,7 +807,7 @@ async fn queue_dispatch_loop(
             match provider.dequeue_workflows(&req).await {
                 Ok(claimed) => {
                     for wf in claimed {
-                        let Some(handler) = workflows.get(&wf.name).cloned() else {
+                        let Some(handler) = rt.workflows.get(&wf.name).cloned() else {
                             tracing::error!(
                                 workflow = %wf.name,
                                 id = %wf.id,
@@ -704,7 +817,7 @@ async fn queue_dispatch_loop(
                         };
                         inflight.fetch_add(1, Ordering::SeqCst);
                         local_running.fetch_add(1, Ordering::SeqCst);
-                        let provider = provider.clone();
+                        let rt = rt.clone();
                         let inflight_guard = InflightGuard(inflight.clone());
                         let local_guard = InflightGuard(local_running.clone());
                         let auth = AuthContext::from_status(&wf);
@@ -714,8 +827,8 @@ async fn queue_dispatch_loop(
                             // Terminal state is recorded by run_to_completion;
                             // a handle observing this workflow polls it.
                             let _ = run_to_completion(
+                                rt,
                                 handler,
-                                provider,
                                 wf.id,
                                 wf.input,
                                 wf.deadline_ms,
@@ -750,16 +863,18 @@ async fn queue_dispatch_loop(
 /// Run a workflow handler to completion and record its terminal state.
 ///
 /// Free function (not a method) so it can run inside a spawned task without
-/// borrowing the engine.
+/// borrowing the engine. Carries the [`Runtime`] so the workflow can start child
+/// workflows through its [`DurableContext`].
 async fn run_to_completion(
+    rt: Arc<Runtime>,
     handler: WorkflowFn,
-    provider: Arc<dyn StateProvider>,
     id: String,
     input: Value,
     deadline_ms: Option<i64>,
     auth: AuthContext,
 ) -> Result<Value> {
-    let ctx = DurableContext::new(id.clone(), provider.clone(), auth);
+    let provider = rt.provider().clone();
+    let ctx = DurableContext::new(id.clone(), rt, auth);
     let run = handler(ctx, input);
 
     // Enforce a workflow deadline if one was set: when it elapses, the run
@@ -809,14 +924,17 @@ async fn run_to_completion(
 /// deterministic id derived from the tick time, so the run happens exactly once
 /// even across multiple executors (the idempotent status insert is the
 /// arbiter). Mirrors the Go SDK's `sched-{name}-{time}` scheme.
-async fn schedule_loop(name: String, spec: String, handler: WorkflowFn, bg: Background) {
-    let Background {
-        provider,
-        executor_id,
-        app_version,
-        shutting_down,
-        inflight,
-    } = bg;
+async fn schedule_loop(
+    name: String,
+    spec: String,
+    handler: WorkflowFn,
+    rt: Arc<Runtime>,
+    shutting_down: Arc<AtomicBool>,
+) {
+    let provider = rt.provider.clone();
+    let executor_id = rt.executor_id.clone();
+    let app_version = rt.app_version.clone();
+    let inflight = rt.inflight.clone();
     use std::str::FromStr;
     let schedule = match cron::Schedule::from_str(&spec) {
         Ok(s) => s,
@@ -864,15 +982,15 @@ async fn schedule_loop(name: String, spec: String, handler: WorkflowFn, bg: Back
                 // different executor that won the insert runs it instead.
                 if canonical.executor_id == executor_id && !is_terminal(&canonical.status) {
                     inflight.fetch_add(1, Ordering::SeqCst);
-                    let provider = provider.clone();
+                    let rt = rt.clone();
                     let handler = handler.clone();
                     let guard = InflightGuard(inflight.clone());
                     let auth = AuthContext::from_status(&canonical);
                     tokio::spawn(async move {
                         let _guard = guard;
                         let _ = run_to_completion(
+                            rt,
                             handler,
-                            provider,
                             wf_id,
                             canonical.input,
                             canonical.deadline_ms,

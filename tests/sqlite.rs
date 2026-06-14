@@ -221,6 +221,54 @@ async fn sqlite_auth_context_persists_and_propagates() -> Result<()> {
     Ok(())
 }
 
+/// A child workflow runs exactly once across a parent replay: re-running the
+/// parent re-attaches to the recorded child instead of starting a new one.
+#[tokio::test]
+async fn sqlite_child_workflow_runs_once_across_restart() -> Result<()> {
+    static CHILD_RUNS: AtomicUsize = AtomicUsize::new(0);
+    let (url, path) = temp_db_url("child");
+
+    let register = |engine: &mut DurableEngine| {
+        engine.register("child", |_ctx: DurableContext, n: i64| async move {
+            CHILD_RUNS.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, Error>(n + 100)
+        });
+        engine.register("parent", |ctx: DurableContext, n: i64| async move {
+            let mut child = ctx
+                .start_workflow::<_, i64>("child", n, WorkflowOptions::default())
+                .await?;
+            child.get_result().await
+        });
+    };
+
+    // Process 1: run the parent to completion; the child runs once.
+    {
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        register(&mut engine);
+        let out: i64 = engine.start_typed("parent", "wf-parent", 1_i64).await?;
+        assert_eq!(out, 101);
+    }
+
+    // Process 2: a fresh engine over the same file re-runs the parent under the
+    // same id. The recorded parent→child link is replayed, so the child is NOT
+    // started again.
+    {
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        register(&mut engine);
+        let out: i64 = engine.start_typed("parent", "wf-parent", 1_i64).await?;
+        assert_eq!(out, 101);
+    }
+
+    assert_eq!(
+        CHILD_RUNS.load(Ordering::SeqCst),
+        1,
+        "child workflow must run exactly once across a parent replay"
+    );
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 /// Management on the SQL backend: list filters (QueryBuilder), cancel/resume,
 /// and fork copying step checkpoints.
 #[tokio::test]
