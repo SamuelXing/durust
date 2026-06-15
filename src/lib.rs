@@ -60,8 +60,8 @@ pub use queue::{RateLimiter, WorkflowQueue};
 pub use serialize::Serializer;
 pub use sqlite::SqliteProvider;
 
-/// The `#[workflow]` attribute macro — the Rust analog of `@DBOS.workflow()`.
-/// Annotate an `async fn(DurableContext, Input) -> Result<Output>` to have it
+/// The `#[workflow]` attribute macro. Annotate an
+/// `async fn(DurableContext, Input) -> Result<Output>` to have it
 /// auto-registered with every [`DurableEngine`] in the binary.
 pub use durust_macros::workflow;
 

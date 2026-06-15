@@ -295,7 +295,7 @@ impl StateProvider for PostgresProvider {
 
         // SKIP LOCKED lets concurrent dispatchers claim disjoint sets without
         // blocking; with a global concurrency cap, NOWAIT instead surfaces
-        // contention so the counts above stay consistent (matches Go).
+        // contention so the counts above stay consistent.
         let lock = if req.global_concurrency.is_none() {
             "FOR UPDATE SKIP LOCKED"
         } else {

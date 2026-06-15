@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
-/// A reference to a workflow execution — the Go SDK's `WorkflowHandle[R]`.
+/// A reference to a workflow execution.
 ///
 /// Returned by [`crate::DurableEngine::run_workflow`] (and, later,
 /// `enqueue` / `retrieve_workflow`). It lets the caller await the workflow's

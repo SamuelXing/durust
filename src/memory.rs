@@ -180,7 +180,7 @@ impl StateProvider for InMemoryProvider {
             return Ok(Vec::new());
         }
 
-        // Candidates ordered by (priority, created_at), version-gated like Go.
+        // Candidates ordered by (priority, created_at), version-gated.
         let mut ids: Vec<(i32, i64, String)> = g
             .workflows
             .values()
