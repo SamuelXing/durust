@@ -269,6 +269,56 @@ async fn sqlite_child_workflow_runs_once_across_restart() -> Result<()> {
     Ok(())
 }
 
+/// Step introspection: `get_workflow_steps` lists a workflow's recorded
+/// operations (steps and a child invocation) in order, with names, outputs, and
+/// the child link; `current_step_id` reflects the running counter.
+#[tokio::test]
+async fn sqlite_workflow_steps_introspection() -> Result<()> {
+    let (url, path) = temp_db_url("steps");
+
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("kid", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n * 2)
+    });
+    engine.register("worker", |ctx: DurableContext, _: ()| async move {
+        let a = ctx
+            .step("alpha", || async { Ok::<_, Error>(1_i64) })
+            .await?;
+        let b = ctx.step("beta", || async { Ok::<_, Error>(a + 1) }).await?;
+        let mut child = ctx
+            .start_workflow::<_, i64>("kid", b, WorkflowOptions::default())
+            .await?;
+        child.get_result().await?;
+        // Two steps + one child invocation consumed seqs 0,1,2 → next is 3.
+        Ok::<_, Error>(ctx.current_step_id() as i64)
+    });
+
+    let next_seq: i64 = engine.start_typed("worker", "w1", ()).await?;
+    assert_eq!(next_seq, 3);
+
+    let steps = engine.get_workflow_steps("w1").await?;
+    assert_eq!(steps.len(), 3);
+
+    assert_eq!(steps[0].step_id, 0);
+    assert_eq!(steps[0].name, "alpha");
+    assert_eq!(steps[0].output, Some(serde_json::json!(1)));
+    assert_eq!(steps[0].child_workflow_id, None);
+
+    assert_eq!(steps[1].name, "beta");
+    assert_eq!(steps[1].output, Some(serde_json::json!(2)));
+
+    // The child invocation is recorded as step 2, carrying the child link.
+    assert_eq!(steps[2].step_id, 2);
+    assert_eq!(steps[2].name, "kid");
+    assert_eq!(steps[2].child_workflow_id.as_deref(), Some("w1-2"));
+
+    // An unknown workflow has no steps.
+    assert!(engine.get_workflow_steps("nope").await?.is_empty());
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 /// Management on the SQL backend: list filters (QueryBuilder), cancel/resume,
 /// and fork copying step checkpoints.
 #[tokio::test]

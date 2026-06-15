@@ -145,6 +145,52 @@ async fn pg_child_workflow() -> Result<()> {
     Ok(())
 }
 
+/// Step introspection round-trips through Postgres: `get_workflow_steps` returns
+/// recorded steps (output decoded per serialization) and the child link, ordered.
+#[tokio::test]
+async fn pg_workflow_steps() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_workflow_steps: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let provider = PostgresProvider::connect(&url).await?;
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    engine.register("kid", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n)
+    });
+    engine.register("worker", |ctx: DurableContext, _: ()| async move {
+        let v = ctx
+            .step("compute", || async { Ok::<_, Error>(42_i64) })
+            .await?;
+        let mut child = ctx
+            .start_workflow::<_, i64>("kid", v, WorkflowOptions::default())
+            .await?;
+        child.get_result().await
+    });
+
+    let id = format!("steps-{tag}");
+    let _: i64 = engine
+        .run_workflow::<_, i64>("worker", (), WorkflowOptions::with_id(&id))
+        .await?
+        .get_result()
+        .await?;
+
+    let steps = engine.get_workflow_steps(&id).await?;
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0].step_id, 0);
+    assert_eq!(steps[0].name, "compute");
+    assert_eq!(steps[0].output, Some(serde_json::json!(42)));
+    assert_eq!(steps[1].name, "kid");
+    assert_eq!(
+        steps[1].child_workflow_id.as_deref(),
+        Some(format!("{id}-1").as_str())
+    );
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
 /// Postgres surfaces the dedup unique-violation and the destination FK violation
 /// as typed, classifiable errors (verifies the sqlx Postgres driver mapping).
 #[tokio::test]
