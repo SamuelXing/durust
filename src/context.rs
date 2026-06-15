@@ -159,6 +159,13 @@ impl DurableContext {
         self.seq.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// The current step index — the `seq` the next durable operation will use,
+    /// i.e. how many durable operations (steps, sleeps, sends, child workflows)
+    /// this execution has performed so far. The Rust analog of Go's `GetStepID`.
+    pub fn current_step_id(&self) -> i32 {
+        self.seq.load(Ordering::SeqCst)
+    }
+
     /// Start a **child workflow** from within this workflow and return a handle
     /// to it. Await its result with [`WorkflowHandle::get_result`].
     ///

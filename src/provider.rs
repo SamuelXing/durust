@@ -192,6 +192,29 @@ pub struct ListFilter {
     pub sort_desc: bool,
 }
 
+/// One recorded operation of a workflow — the Rust analog of Go's `StepInfo`.
+///
+/// Materialized from an `operation_outputs` row by
+/// [`StateProvider::get_workflow_steps`]; durable steps, sleeps, sends, and
+/// child-workflow invocations all surface here, ordered by [`step_id`](Self::step_id).
+#[derive(Clone, Debug)]
+pub struct StepInfo {
+    /// Sequence index of the operation within the workflow (its `function_id`).
+    pub step_id: i32,
+    /// The step's recorded name (e.g. a step name, or `DBOS.sleep`/`DBOS.send`).
+    pub name: String,
+    /// The decoded output, if any (`None` for operations that record no value).
+    pub output: Option<Value>,
+    /// The recorded error string, if the operation failed.
+    pub error: Option<String>,
+    /// The child workflow this operation started, if it was a child-workflow call.
+    pub child_workflow_id: Option<String>,
+    /// When the operation started, if step timing was recorded.
+    pub started_at: Option<DateTime<Utc>>,
+    /// When the operation completed, if step timing was recorded.
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
 /// Parameters for one dequeue iteration, computed by the engine's dispatcher
 /// from a [`crate::WorkflowQueue`]'s configuration. Plain scalars so the storage
 /// layer stays decoupled from the queue type.
@@ -360,6 +383,12 @@ pub trait StateProvider: Send + Sync {
     /// Return the child workflow id `parent_id` started at step `seq`, if one was
     /// recorded by [`record_child_workflow`](Self::record_child_workflow).
     async fn check_child_workflow(&self, parent_id: &str, seq: i32) -> Result<Option<String>>;
+
+    /// List a workflow's recorded operations (its `operation_outputs` rows) as
+    /// [`StepInfo`], ordered by `step_id`. Outputs are decoded per each row's
+    /// recorded serialization format. Returns an empty list for an unknown
+    /// workflow or one that has run no steps.
+    async fn get_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepInfo>>;
 }
 
 #[cfg(test)]

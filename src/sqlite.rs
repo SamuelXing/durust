@@ -1,7 +1,7 @@
 use crate::error::Result;
 use crate::provider::{
     decode_roles, dedup_or, encode_roles, is_terminal, nonexistent_or, DequeueRequest, ListFilter,
-    StateProvider, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
+    StateProvider, StepInfo, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
     STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
 };
 use crate::serialize::{self, Serializer};
@@ -632,6 +632,44 @@ impl StateProvider for SqliteProvider {
         .await?;
         Ok(child.flatten())
     }
+
+    async fn get_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepInfo>> {
+        let rows = sqlx::query(
+            "SELECT function_id, function_name, output, error, child_workflow_id,
+                    started_at_epoch_ms, completed_at_epoch_ms, serialization
+             FROM operation_outputs
+             WHERE workflow_uuid = ?
+             ORDER BY function_id ASC",
+        )
+        .bind(workflow_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_step).collect()
+    }
+}
+
+/// Map an `operation_outputs` row to a [`StepInfo`], decoding `output` per the
+/// row's recorded serialization format.
+fn row_to_step(row: &sqlx::sqlite::SqliteRow) -> Result<StepInfo> {
+    let fmt: Option<String> = row.try_get("serialization").ok().flatten();
+    let output: Option<String> = row.try_get("output").ok().flatten();
+    Ok(StepInfo {
+        step_id: row.get("function_id"),
+        name: row.try_get("function_name").unwrap_or_default(),
+        output: serialize::decode_opt(fmt.as_deref(), output.as_deref())?,
+        error: row.try_get("error").ok().flatten(),
+        child_workflow_id: row.try_get("child_workflow_id").ok().flatten(),
+        started_at: row
+            .try_get::<Option<i64>, _>("started_at_epoch_ms")
+            .ok()
+            .flatten()
+            .map(ms_to_dt),
+        completed_at: row
+            .try_get::<Option<i64>, _>("completed_at_epoch_ms")
+            .ok()
+            .flatten()
+            .map(ms_to_dt),
+    })
 }
 
 /// Append the WHERE clause shared by `list_workflows` (SQLite dialect).

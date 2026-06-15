@@ -1,7 +1,8 @@
 use crate::error::{Error, Result};
 use crate::provider::{
-    is_terminal, DequeueRequest, ListFilter, StateProvider, WorkflowStatus, STATUS_CANCELLED,
-    STATUS_DELAYED, STATUS_ENQUEUED, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
+    is_terminal, DequeueRequest, ListFilter, StateProvider, StepInfo, WorkflowStatus,
+    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED,
+    STATUS_PENDING,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -17,12 +18,20 @@ struct NotificationRow {
     created_at_ms: i64,
 }
 
+/// One recorded operation, mirroring an `operation_outputs` row: it holds either
+/// a step `output` or a `child_workflow_id` (a started child workflow).
+#[derive(Clone, Default)]
+struct StepRow {
+    name: String,
+    output: Option<Value>,
+    child_workflow_id: Option<String>,
+}
+
 #[derive(Default)]
 struct Inner {
     workflows: HashMap<String, WorkflowStatus>,
-    steps: HashMap<(String, i32), Value>,
-    /// Child-workflow links keyed by `(parent_id, seq)` → child workflow id.
-    child_links: HashMap<(String, i32), String>,
+    /// Recorded operations keyed by `(workflow_id, seq)`.
+    steps: HashMap<(String, i32), StepRow>,
     notifications: Vec<NotificationRow>,
     /// Workflow events keyed by `(workflow_id, key)`.
     events: HashMap<(String, String), Value>,
@@ -104,22 +113,30 @@ impl StateProvider for InMemoryProvider {
 
     async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<Value>> {
         let g = self.inner.lock().await;
-        Ok(g.steps.get(&(workflow_id.to_string(), seq)).cloned())
+        Ok(g.steps
+            .get(&(workflow_id.to_string(), seq))
+            .and_then(|r| r.output.clone()))
     }
 
     async fn record_step_result(
         &self,
         workflow_id: &str,
         seq: i32,
-        _name: &str,
+        name: &str,
         value: Value,
     ) -> Result<Value> {
         let mut g = self.inner.lock().await;
         let canonical = g
             .steps
             .entry((workflow_id.to_string(), seq))
-            .or_insert(value)
-            .clone();
+            .or_insert_with(|| StepRow {
+                name: name.to_string(),
+                output: Some(value),
+                child_workflow_id: None,
+            })
+            .output
+            .clone()
+            .unwrap_or(Value::Null);
         Ok(canonical)
     }
 
@@ -235,7 +252,7 @@ impl StateProvider for InMemoryProvider {
         workflow_id: &str,
         topic: &str,
         seq: i32,
-        _step_name: &str,
+        step_name: &str,
     ) -> Result<Option<Value>> {
         // Single mutex covers both the claim and the checkpoint, giving the
         // same atomicity the SQL backends get from a transaction.
@@ -253,8 +270,14 @@ impl StateProvider for InMemoryProvider {
         let canonical = g
             .steps
             .entry((workflow_id.to_string(), seq))
-            .or_insert(message)
-            .clone();
+            .or_insert_with(|| StepRow {
+                name: step_name.to_string(),
+                output: Some(message),
+                child_workflow_id: None,
+            })
+            .output
+            .clone()
+            .unwrap_or(Value::Null);
         Ok(Some(canonical))
     }
 
@@ -386,7 +409,7 @@ impl StateProvider for InMemoryProvider {
         // observability; the in-memory provider has no such column.)
 
         // Copy step checkpoints with seq < start_step into the forked workflow.
-        let copied: Vec<(i32, Value)> = g
+        let copied: Vec<(i32, StepRow)> = g
             .steps
             .iter()
             .filter(|((wid, seq), _)| wid == original_id && *seq < start_step)
@@ -416,18 +439,44 @@ impl StateProvider for InMemoryProvider {
         &self,
         parent_id: &str,
         seq: i32,
-        _name: &str,
+        name: &str,
         child_id: &str,
     ) -> Result<()> {
         let mut g = self.inner.lock().await;
-        g.child_links
+        g.steps
             .entry((parent_id.to_string(), seq))
-            .or_insert_with(|| child_id.to_string());
+            .or_insert_with(|| StepRow {
+                name: name.to_string(),
+                output: None,
+                child_workflow_id: Some(child_id.to_string()),
+            });
         Ok(())
     }
 
     async fn check_child_workflow(&self, parent_id: &str, seq: i32) -> Result<Option<String>> {
         let g = self.inner.lock().await;
-        Ok(g.child_links.get(&(parent_id.to_string(), seq)).cloned())
+        Ok(g.steps
+            .get(&(parent_id.to_string(), seq))
+            .and_then(|r| r.child_workflow_id.clone()))
+    }
+
+    async fn get_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepInfo>> {
+        let g = self.inner.lock().await;
+        let mut steps: Vec<StepInfo> = g
+            .steps
+            .iter()
+            .filter(|((wid, _), _)| wid == workflow_id)
+            .map(|((_, seq), row)| StepInfo {
+                step_id: *seq,
+                name: row.name.clone(),
+                output: row.output.clone(),
+                error: None,
+                child_workflow_id: row.child_workflow_id.clone(),
+                started_at: None,
+                completed_at: None,
+            })
+            .collect();
+        steps.sort_by_key(|s| s.step_id);
+        Ok(steps)
     }
 }

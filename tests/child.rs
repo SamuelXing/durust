@@ -63,6 +63,35 @@ async fn child_workflow_inherits_identity() -> Result<()> {
     Ok(())
 }
 
+/// `get_workflow_steps` on the in-memory backend reports steps and the child
+/// invocation with names, outputs, and the child link, ordered by step id.
+#[tokio::test]
+async fn workflow_steps_introspection_in_memory() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("kid", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n)
+    });
+    engine.register("worker", |ctx: DurableContext, _: ()| async move {
+        let v = ctx
+            .step("compute", || async { Ok::<_, Error>(7_i64) })
+            .await?;
+        let mut child = ctx
+            .start_workflow::<_, i64>("kid", v, WorkflowOptions::default())
+            .await?;
+        child.get_result().await
+    });
+
+    engine.start_typed::<_, i64>("worker", "w", ()).await?;
+
+    let steps = engine.get_workflow_steps("w").await?;
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0].name, "compute");
+    assert_eq!(steps[0].output, Some(serde_json::json!(7)));
+    assert_eq!(steps[1].name, "kid");
+    assert_eq!(steps[1].child_workflow_id.as_deref(), Some("w-1"));
+    Ok(())
+}
+
 /// A child can itself be routed through a queue: the parent enqueues it and a
 /// dispatcher runs it, while the parent awaits the result by polling.
 #[tokio::test]

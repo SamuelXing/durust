@@ -2,8 +2,9 @@ use crate::context::{AuthContext, DurableContext};
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{
-    is_terminal, DequeueRequest, ListFilter, StateProvider, WorkflowStatus, STATUS_CANCELLED,
-    STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_PENDING, STATUS_SUCCESS,
+    is_terminal, DequeueRequest, ListFilter, StateProvider, StepInfo, WorkflowStatus,
+    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_PENDING,
+    STATUS_SUCCESS,
 };
 use crate::queue::WorkflowQueue;
 use serde::{de::DeserializeOwned, Serialize};
@@ -457,6 +458,14 @@ impl DurableEngine {
     /// `ListWorkflows`.
     pub async fn list_workflows(&self, filter: &ListFilter) -> Result<Vec<WorkflowStatus>> {
         self.provider.list_workflows(filter).await
+    }
+
+    /// List a workflow's recorded operations — the Rust analog of Go's
+    /// `GetWorkflowSteps`. Returns each durable step / sleep / send / child
+    /// invocation as a [`StepInfo`], ordered by step id. Empty for an unknown
+    /// workflow or one that has run no steps.
+    pub async fn get_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepInfo>> {
+        self.provider.get_workflow_steps(workflow_id).await
     }
 
     /// Cancel a workflow — the Rust analog of Go's `CancelWorkflow`. A
