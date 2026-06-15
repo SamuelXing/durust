@@ -7,6 +7,8 @@ use durust::{
     DurableContext, DurableEngine, Error, ErrorCode, PostgresProvider, Result, Serializer,
     StateProvider, WorkflowOptions, WorkflowQueue, WorkflowStatus, STATUS_PENDING,
 };
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -239,6 +241,44 @@ async fn pg_patch() -> Result<()> {
         .get_result()
         .await?;
     assert!(!patched, "a pre-patch workflow stays on the old path");
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// A durable `select` round-trips through Postgres: the winning index and value
+/// are recorded as a `DBOS.select` step.
+#[tokio::test]
+async fn pg_select() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_select: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let provider = PostgresProvider::connect(&url).await?;
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    engine.register("racer", |ctx: DurableContext, _: ()| async move {
+        let branches: Vec<Pin<Box<dyn Future<Output = i64> + Send>>> = vec![
+            Box::pin(async { 7_i64 }),
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                8_i64
+            }),
+        ];
+        ctx.select(branches).await
+    });
+
+    let id = format!("select-{tag}");
+    let (index, value): (usize, i64) = engine
+        .run_workflow::<_, (usize, i64)>("racer", (), WorkflowOptions::with_id(&id))
+        .await?
+        .get_result()
+        .await?;
+    assert_eq!((index, value), (0, 7));
+
+    let steps = engine.get_workflow_steps(&id).await?;
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].name, "DBOS.select");
 
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())

@@ -5,6 +5,8 @@ use durust::{
     DurableContext, DurableEngine, Error, ListFilter, Result, SqliteProvider, WorkflowOptions,
     WorkflowQueue, STATUS_CANCELLED, STATUS_SUCCESS,
 };
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -174,6 +176,92 @@ async fn sqlite_deprecate_patch_keeps_alignment() -> Result<()> {
         WORK_RUNS.load(Ordering::Relaxed),
         1,
         "work runs once: deprecate_patch consumed the marker slot, keeping seq aligned"
+    );
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// Fan-out is durable: two steps run concurrently via `try_join!`, each
+/// checkpoints independently, and a replay re-runs neither.
+#[tokio::test]
+async fn sqlite_concurrent_steps_are_durable() -> Result<()> {
+    static A_RUNS: AtomicUsize = AtomicUsize::new(0);
+    static B_RUNS: AtomicUsize = AtomicUsize::new(0);
+    let (url, path) = temp_db_url("fanout");
+
+    let register = |engine: &mut DurableEngine| {
+        engine.register("fanout", |ctx: DurableContext, _: ()| async move {
+            let (a, b) = tokio::try_join!(
+                ctx.step("a", || async {
+                    A_RUNS.fetch_add(1, Ordering::Relaxed);
+                    Ok::<_, Error>(1_i64)
+                }),
+                ctx.step("b", || async {
+                    B_RUNS.fetch_add(1, Ordering::Relaxed);
+                    Ok::<_, Error>(2_i64)
+                }),
+            )?;
+            Ok::<_, Error>(a + b)
+        });
+    };
+
+    for _ in 0..2 {
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        register(&mut engine);
+        let v: i64 = engine.start_typed("fanout", "f", ()).await?;
+        assert_eq!(v, 3);
+    }
+
+    assert_eq!(
+        A_RUNS.load(Ordering::Relaxed),
+        1,
+        "step a runs once across replay"
+    );
+    assert_eq!(
+        B_RUNS.load(Ordering::Relaxed),
+        1,
+        "step b runs once across replay"
+    );
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// A `select` winner is durable: replay returns the recorded outcome without
+/// re-running any branch.
+#[tokio::test]
+async fn sqlite_select_winner_is_durable() -> Result<()> {
+    static FAST_RUNS: AtomicUsize = AtomicUsize::new(0);
+    let (url, path) = temp_db_url("select");
+
+    let register = |engine: &mut DurableEngine| {
+        engine.register("racer", |ctx: DurableContext, _: ()| async move {
+            let branches: Vec<Pin<Box<dyn Future<Output = i64> + Send>>> = vec![
+                Box::pin(async {
+                    FAST_RUNS.fetch_add(1, Ordering::Relaxed);
+                    2_i64
+                }),
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    1_i64
+                }),
+            ];
+            ctx.select(branches).await
+        });
+    };
+
+    for _ in 0..2 {
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        register(&mut engine);
+        let (index, value): (usize, i64) = engine.start_typed("racer", "r", ()).await?;
+        assert_eq!((index, value), (0, 2));
+    }
+
+    assert_eq!(
+        FAST_RUNS.load(Ordering::Relaxed),
+        1,
+        "the winning branch runs once; replay reads the recorded outcome"
     );
 
     let _ = std::fs::remove_file(path);

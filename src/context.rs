@@ -4,9 +4,11 @@ use crate::handle::WorkflowHandle;
 use crate::provider::{StateProvider, WorkflowStatus, STATUS_CANCELLED};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
-use std::future::Future;
+use std::future::{poll_fn, Future};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 /// Retry policy for a durable step.
@@ -332,6 +334,59 @@ impl DurableContext {
         // Run with retries; only the final result/error is observed.
         let result = self.run_with_retries(&opts, &mut f).await?;
         self.checkpoint(seq, &opts.name, result).await
+    }
+
+    /// Race several async `branches` and return the `(index, value)` of the first
+    /// to complete — a **durable** select.
+    ///
+    /// The winning index and value are recorded as a single step, so a replay
+    /// returns the same winner without re-running anything. On a tie the lowest
+    /// index wins.
+    ///
+    /// The branches must be **plain async work** — do not call
+    /// [`step`](Self::step), [`start_workflow`](Self::start_workflow), or other
+    /// durable operations inside them. The whole race is checkpointed as one
+    /// operation and, on replay, the branches are not polled at all, so any
+    /// durable calls nested inside would desynchronize the step sequence.
+    ///
+    /// ```ignore
+    /// let (winner, value) = ctx
+    ///     .select(vec![
+    ///         Box::pin(async { fetch_primary().await }),
+    ///         Box::pin(async { fetch_fallback().await }),
+    ///     ])
+    ///     .await?;
+    /// ```
+    pub async fn select<T>(
+        &self,
+        branches: Vec<Pin<Box<dyn Future<Output = T> + Send + '_>>>,
+    ) -> Result<(usize, T)>
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        if branches.is_empty() {
+            return Err(Error::app("select requires at least one branch"));
+        }
+        let seq = self.next_seq();
+        if let Some(stored) = self.replay_or_guard::<(usize, T)>(seq).await? {
+            return Ok(stored);
+        }
+
+        // Poll the branches in index order on this one task; the first ready wins
+        // (lowest index on a tie). The losers are dropped — and so cancelled —
+        // when `branches` goes out of scope.
+        let mut branches = branches;
+        let (index, value) = poll_fn(|cx| {
+            for (i, branch) in branches.iter_mut().enumerate() {
+                if let Poll::Ready(value) = branch.as_mut().poll(cx) {
+                    return Poll::Ready((i, value));
+                }
+            }
+            Poll::Pending
+        })
+        .await;
+
+        self.checkpoint(seq, "DBOS.select", (index, value)).await
     }
 
     /// Shared step preamble: serve a replayed checkpoint if present, otherwise
