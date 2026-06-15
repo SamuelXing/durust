@@ -86,6 +86,100 @@ async fn sqlite_recovers_across_restart() -> Result<()> {
     Ok(())
 }
 
+/// A patch decision is durable: replaying the workflow re-reads the marker and
+/// stays on the new path, and the post-patch step runs exactly once.
+#[tokio::test]
+async fn sqlite_patch_is_durable_across_replay() -> Result<()> {
+    static WORK_RUNS: AtomicUsize = AtomicUsize::new(0);
+    let (url, path) = temp_db_url("patch");
+
+    let register = |engine: &mut DurableEngine| {
+        engine.register("wf", |ctx: DurableContext, _: ()| async move {
+            let patched = ctx.patch("feat").await?;
+            let v = ctx
+                .step("work", || async {
+                    WORK_RUNS.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, Error>(10_i64)
+                })
+                .await?;
+            Ok::<_, Error>((patched, v))
+        });
+    };
+
+    for _ in 0..2 {
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        register(&mut engine);
+        let (patched, v): (bool, i64) = engine.start_typed("wf", "w", ()).await?;
+        assert!(
+            patched,
+            "the new path is taken on the first run and on replay"
+        );
+        assert_eq!(v, 10);
+    }
+
+    assert_eq!(
+        WORK_RUNS.load(Ordering::SeqCst),
+        1,
+        "the post-patch step runs exactly once across the replay"
+    );
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// Deprecating a patch keeps step numbering aligned: a run that recorded the
+/// patch consumes the marker's slot under the new (deprecated) code, so the
+/// following step still replays instead of re-running.
+#[tokio::test]
+async fn sqlite_deprecate_patch_keeps_alignment() -> Result<()> {
+    static WORK_RUNS: AtomicUsize = AtomicUsize::new(0);
+    let (url, path) = temp_db_url("deprecate");
+
+    // Phase A — code carrying the patch: records the marker at seq 0, "work" at 1.
+    {
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        engine.register("wf", |ctx: DurableContext, _: ()| async move {
+            let _ = ctx.patch("feat").await?;
+            let v = ctx
+                .step("work", || async {
+                    WORK_RUNS.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, Error>(5_i64)
+                })
+                .await?;
+            Ok::<_, Error>(v)
+        });
+        let v: i64 = engine.start_typed("wf", "w", ()).await?;
+        assert_eq!(v, 5);
+    }
+
+    // Phase B — patch deprecated: deprecate_patch consumes the recorded marker's
+    // slot, so "work" stays at seq 1 and replays rather than re-running.
+    {
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        engine.register("wf", |ctx: DurableContext, _: ()| async move {
+            ctx.deprecate_patch("feat").await?;
+            let v = ctx
+                .step("work", || async {
+                    WORK_RUNS.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, Error>(5_i64)
+                })
+                .await?;
+            Ok::<_, Error>(v)
+        });
+        let v: i64 = engine.start_typed("wf", "w", ()).await?;
+        assert_eq!(v, 5);
+    }
+
+    assert_eq!(
+        WORK_RUNS.load(Ordering::SeqCst),
+        1,
+        "work runs once: deprecate_patch consumed the marker slot, keeping seq aligned"
+    );
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 /// The SQL dequeue path end to end: enqueue → dispatcher claims → result; and
 /// the (queue_name, deduplication_id) unique index rejects a duplicate.
 #[tokio::test]

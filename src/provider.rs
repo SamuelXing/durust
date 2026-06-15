@@ -389,6 +389,15 @@ pub trait StateProvider: Send + Sync {
     /// recorded serialization format. Returns an empty list for an unknown
     /// workflow or one that has run no steps.
     async fn get_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepInfo>>;
+
+    /// The `function_name` recorded at `(workflow_id, seq)`, if a row exists.
+    /// Used by the patch system to tell a marker from a pre-patch step.
+    async fn get_step_name(&self, workflow_id: &str, seq: i32) -> Result<Option<String>>;
+
+    /// Idempotently record a name-only marker row at `(workflow_id, seq)` (no
+    /// output) — the checkpoint the patch system writes so a replay observes the
+    /// same patch decision. A second record for the same key is a no-op.
+    async fn record_patch(&self, workflow_id: &str, seq: i32, name: &str) -> Result<()>;
 }
 
 #[cfg(test)]

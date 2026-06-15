@@ -479,4 +479,23 @@ impl StateProvider for InMemoryProvider {
         steps.sort_by_key(|s| s.step_id);
         Ok(steps)
     }
+
+    async fn get_step_name(&self, workflow_id: &str, seq: i32) -> Result<Option<String>> {
+        let g = self.inner.lock().await;
+        Ok(g.steps
+            .get(&(workflow_id.to_string(), seq))
+            .map(|r| r.name.clone()))
+    }
+
+    async fn record_patch(&self, workflow_id: &str, seq: i32, name: &str) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        g.steps
+            .entry((workflow_id.to_string(), seq))
+            .or_insert_with(|| StepRow {
+                name: name.to_string(),
+                output: None,
+                child_workflow_id: None,
+            });
+        Ok(())
+    }
 }

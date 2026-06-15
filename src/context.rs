@@ -165,6 +165,72 @@ impl DurableContext {
         self.seq.load(Ordering::Relaxed)
     }
 
+    /// Decide whether this workflow should run the **patched** (new) code at this
+    /// point: returns `true` for new code, `false` for old.
+    ///
+    /// This lets you change a workflow's body while long-lived workflows are
+    /// still running. Wrap the changed region in a patch:
+    ///
+    /// ```ignore
+    /// if ctx.patch("use-v2-pricing").await? {
+    ///     // new code
+    /// } else {
+    ///     // old code
+    /// }
+    /// ```
+    ///
+    /// A workflow that reaches this point for the first time (new, or one that
+    /// started but hadn't got here yet) records a marker and takes the new path.
+    /// A workflow that already executed past this point before the patch existed
+    /// takes the old path, and its existing checkpoints stay aligned because the
+    /// marker only consumes a step slot on the new path.
+    pub async fn patch(&self, name: &str) -> Result<bool> {
+        let seq = self.current_step_id();
+        let marker = format!("{PATCH_PREFIX}{name}");
+        let patched = match self.provider.get_step_name(&self.workflow_id, seq).await? {
+            // Not seen before: record the marker and take the new path.
+            None => {
+                self.provider
+                    .record_patch(&self.workflow_id, seq, &marker)
+                    .await?;
+                true
+            }
+            // Our own marker (a replay/recovery of a patched run): new path.
+            Some(recorded) if recorded == marker => true,
+            // A different step already occupies this slot (a pre-patch run): old path.
+            Some(_) => false,
+        };
+        if patched {
+            // The marker takes its own step slot, so new-path steps that follow
+            // are numbered after it. Old-path runs don't consume it.
+            self.next_seq();
+        }
+        Ok(patched)
+    }
+
+    /// Remove a patch once every workflow that recorded it has finished migrating
+    /// — the counterpart to [`patch`](Self::patch). Call it where the `patch`
+    /// call used to be, then keep only the new code.
+    ///
+    /// For a run that recorded this patch, it consumes the marker's step slot so
+    /// the following checkpoints still line up; for any other run it does
+    /// nothing. Once no running workflow carries the marker, the call can be
+    /// deleted entirely.
+    pub async fn deprecate_patch(&self, name: &str) -> Result<()> {
+        let seq = self.current_step_id();
+        let marker = format!("{PATCH_PREFIX}{name}");
+        if self
+            .provider
+            .get_step_name(&self.workflow_id, seq)
+            .await?
+            .as_deref()
+            == Some(marker.as_str())
+        {
+            self.next_seq();
+        }
+        Ok(())
+    }
+
     /// Start a **child workflow** from within this workflow and return a handle
     /// to it. Await its result with [`WorkflowHandle::get_result`].
     ///
@@ -529,3 +595,8 @@ impl DurableContext {
 /// keeps this portable across backends; a Postgres LISTEN/NOTIFY fast path is a
 /// future optimization.)
 const NOTIFICATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Prefix on the `function_name` of a patch marker recorded in `operation_outputs`.
+/// A shared identifier, so a patch decision a worker in any language recorded is
+/// read back consistently.
+const PATCH_PREFIX: &str = "DBOS.patch-";
