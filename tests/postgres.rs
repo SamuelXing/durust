@@ -5,7 +5,7 @@
 
 use durust::{
     DurableContext, DurableEngine, Error, ErrorCode, PostgresProvider, Result, Serializer,
-    WorkflowOptions, WorkflowQueue,
+    StateProvider, WorkflowOptions, WorkflowQueue, WorkflowStatus, STATUS_PENDING,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -186,6 +186,59 @@ async fn pg_workflow_steps() -> Result<()> {
         steps[1].child_workflow_id.as_deref(),
         Some(format!("{id}-1").as_str())
     );
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// Code patching round-trips through Postgres: a new workflow takes the patched
+/// path and the marker is recorded; a pre-patch workflow takes the old path.
+#[tokio::test]
+async fn pg_patch() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_patch: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let provider = PostgresProvider::connect(&url).await?;
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    engine.register("wf", |ctx: DurableContext, _: ()| async move {
+        ctx.patch("feature").await
+    });
+
+    // A brand-new workflow takes the new path and records the marker.
+    let fresh = format!("patch-new-{tag}");
+    let patched: bool = engine
+        .run_workflow::<_, bool>("wf", (), WorkflowOptions::with_id(&fresh))
+        .await?
+        .get_result()
+        .await?;
+    assert!(patched);
+    let steps = engine.get_workflow_steps(&fresh).await?;
+    assert_eq!(steps[0].name, "DBOS.patch-feature");
+
+    // A workflow with a different step already at seq 0 takes the old path.
+    let old = format!("patch-old-{tag}");
+    let provider2 = PostgresProvider::connect(&url).await?;
+    provider2
+        .insert_workflow_status(WorkflowStatus::new(
+            &old,
+            "wf",
+            serde_json::Value::Null,
+            STATUS_PENDING,
+            "",
+            "0.1.0",
+        ))
+        .await?;
+    provider2
+        .record_step_result(&old, 0, "legacy_step", serde_json::json!(1))
+        .await?;
+    let patched: bool = engine
+        .run_workflow::<_, bool>("wf", (), WorkflowOptions::with_id(&old))
+        .await?
+        .get_result()
+        .await?;
+    assert!(!patched, "a pre-patch workflow stays on the old path");
 
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())

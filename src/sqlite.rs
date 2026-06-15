@@ -646,6 +646,32 @@ impl StateProvider for SqliteProvider {
         .await?;
         rows.iter().map(row_to_step).collect()
     }
+
+    async fn get_step_name(&self, workflow_id: &str, seq: i32) -> Result<Option<String>> {
+        let name: Option<String> = sqlx::query_scalar(
+            "SELECT function_name FROM operation_outputs
+             WHERE workflow_uuid = ? AND function_id = ?",
+        )
+        .bind(workflow_id)
+        .bind(seq)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(name)
+    }
+
+    async fn record_patch(&self, workflow_id: &str, seq: i32, name: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO operation_outputs (workflow_uuid, function_id, function_name)
+             VALUES (?, ?, ?)
+             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
+        )
+        .bind(workflow_id)
+        .bind(seq)
+        .bind(name)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 /// Map an `operation_outputs` row to a [`StepInfo`], decoding `output` per the
