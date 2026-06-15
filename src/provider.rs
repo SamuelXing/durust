@@ -46,7 +46,7 @@ pub(crate) fn decode_roles(stored: Option<&str>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Workflow lifecycle states, aligned with the DBOS Go SDK.
+/// Workflow lifecycle states — the values stored in the `status` column.
 ///
 /// `ENQUEUED` — sitting in a queue, waiting to be claimed by a dispatcher.
 /// `DELAYED` — enqueued with a delay; transitions to `ENQUEUED` when due.
@@ -71,11 +71,11 @@ pub fn is_terminal(status: &str) -> bool {
     )
 }
 
-/// A persisted workflow instance — the Go SDK's `WorkflowStatus`.
+/// A persisted workflow instance.
 ///
 /// Carries everything the engine, queues, and management APIs need. Fields for
-/// features that are not implemented yet (e.g. child workflows) are present
-/// anyway so the storage schema stays stable as those features land.
+/// features that are not implemented yet are present anyway so the storage
+/// schema stays stable as those features land.
 #[derive(Clone, Debug)]
 pub struct WorkflowStatus {
     pub id: String,
@@ -170,9 +170,9 @@ impl WorkflowStatus {
     }
 }
 
-/// Filter for [`StateProvider::list_workflows`] — the Rust analog of Go's
-/// `ListWorkflows` options. All fields are ANDed; empty/`None` fields are
-/// ignored. Times are epoch milliseconds, matched against `created_at`.
+/// Filter for [`StateProvider::list_workflows`]. All fields are ANDed;
+/// empty/`None` fields are ignored. Times are epoch milliseconds, matched
+/// against `created_at`.
 #[derive(Clone, Default)]
 pub struct ListFilter {
     pub workflow_ids: Vec<String>,
@@ -192,7 +192,7 @@ pub struct ListFilter {
     pub sort_desc: bool,
 }
 
-/// One recorded operation of a workflow — the Rust analog of Go's `StepInfo`.
+/// One recorded operation of a workflow.
 ///
 /// Materialized from an `operation_outputs` row by
 /// [`StateProvider::get_workflow_steps`]; durable steps, sleeps, sends, and
@@ -278,8 +278,8 @@ pub trait StateProvider: Send + Sync {
     /// returned, guaranteeing every caller observes the same result.
     ///
     /// Durable sleep is built on this too: the wake instant is recorded as an
-    /// ordinary step (`DBOS.sleep`), exactly as the Go SDK stores it in
-    /// `operation_outputs` — there is no separate timers table.
+    /// ordinary step (`DBOS.sleep`) in `operation_outputs` — there is no
+    /// separate timers table.
     async fn record_step_result(
         &self,
         workflow_id: &str,

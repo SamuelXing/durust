@@ -9,10 +9,9 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Retry policy for a durable step — the Rust analog of Go's `WithStepMaxRetries`
-/// / `WithBackoffFactor` / `WithBaseInterval` / `WithMaxInterval`.
+/// Retry policy for a durable step.
 ///
-/// Defaults match Go: no retries, factor 2.0, 100ms base, 5s cap.
+/// Defaults: no retries, factor 2.0, 100ms base, 5s cap.
 #[derive(Clone)]
 pub struct StepOptions {
     /// Step name recorded with the checkpoint.
@@ -161,7 +160,7 @@ impl DurableContext {
 
     /// The current step index — the `seq` the next durable operation will use,
     /// i.e. how many durable operations (steps, sleeps, sends, child workflows)
-    /// this execution has performed so far. The Rust analog of Go's `GetStepID`.
+    /// this execution has performed so far.
     pub fn current_step_id(&self) -> i32 {
         self.seq.load(Ordering::SeqCst)
     }
@@ -338,10 +337,9 @@ impl DurableContext {
     /// Durably sleep for `dur`.
     ///
     /// The absolute wake time is fixed and persisted on the first call as an
-    /// ordinary `DBOS.sleep` step (the same way the Go SDK records it in
-    /// `operation_outputs`), so the timer does not drift if the workflow crashes
-    /// and is replayed: a replay reads the same wake instant and only waits the
-    /// *remaining* time.
+    /// ordinary `DBOS.sleep` step in `operation_outputs`, so the timer does not
+    /// drift if the workflow crashes and is replayed: a replay reads the same
+    /// wake instant and only waits the *remaining* time.
     pub async fn sleep(&self, dur: Duration) -> Result<()> {
         let seq = self.next_seq();
         let wake_at = self.durable_wake_at(seq, dur).await?;
@@ -385,9 +383,9 @@ impl DurableContext {
         }
     }
 
-    /// Durably send a message to another workflow on `topic` — the Rust analog
-    /// of Go's `Send`. Recorded as a `DBOS.send` step, so a replay does not
-    /// re-send. Errors if the destination workflow does not exist.
+    /// Durably send a message to another workflow on `topic`. Recorded as a
+    /// `DBOS.send` step, so a replay does not re-send. Errors if the destination
+    /// workflow does not exist.
     ///
     /// Like any step side effect, the send commits before its checkpoint: a
     /// crash in that window re-sends on replay (at-least-once).
@@ -411,8 +409,8 @@ impl DurableContext {
     }
 
     /// Receive the oldest unconsumed message sent to this workflow on `topic`,
-    /// waiting up to `timeout` — the Rust analog of Go's `Recv`. Messages are
-    /// consumed FIFO, exactly once: the claim and the step checkpoint commit
+    /// waiting up to `timeout`. Messages are consumed FIFO, exactly once: the
+    /// claim and the step checkpoint commit
     /// atomically, and a replay returns the recorded message without consuming
     /// another. Returns `None` on timeout (also recorded, so a replay does not
     /// wait again). The timeout deadline itself is durable: a crash mid-wait
@@ -457,9 +455,9 @@ impl DurableContext {
         }
     }
 
-    /// Publish (or overwrite) the value of event `key` on this workflow — the
-    /// Rust analog of Go's `SetEvent`. Recorded as a `DBOS.setEvent` step;
-    /// other workflows and external code read it with `get_event`.
+    /// Publish (or overwrite) the value of event `key` on this workflow.
+    /// Recorded as a `DBOS.setEvent` step; other workflows and external code
+    /// read it with `get_event`.
     pub async fn set_event<T: Serialize>(&self, key: &str, value: T) -> Result<()> {
         let seq = self.next_seq();
         if let Some(_done) = self.replay_or_guard::<Value>(seq).await? {
@@ -475,9 +473,9 @@ impl DurableContext {
     }
 
     /// Read event `key` of another workflow, waiting up to `timeout` for it to
-    /// be set — the Rust analog of Go's `GetEvent` inside a workflow. The value
-    /// observed is recorded as a `DBOS.getEvent` step, so replays see the same
-    /// value even if the event is overwritten later. Returns `None` on timeout.
+    /// be set. The value observed is recorded as a `DBOS.getEvent` step, so
+    /// replays see the same value even if the event is overwritten later.
+    /// Returns `None` on timeout.
     pub async fn get_event<T: DeserializeOwned>(
         &self,
         target_workflow_id: &str,
@@ -527,7 +525,7 @@ impl DurableContext {
     }
 }
 
-/// How often blocked `recv`/`get_event` calls re-check the database. (The Go
-/// SDK avoids polling with Postgres LISTEN/NOTIFY; polling keeps this portable
-/// across backends and is a future optimization point.)
+/// How often blocked `recv`/`get_event` calls re-check the database. (Polling
+/// keeps this portable across backends; a Postgres LISTEN/NOTIFY fast path is a
+/// future optimization.)
 const NOTIFICATION_POLL_INTERVAL: Duration = Duration::from_millis(25);

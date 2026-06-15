@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-/// Rate limit for workflow starts on a queue — the Go SDK's `RateLimiter`.
+/// Rate limit for workflow starts on a queue.
 /// At most `limit` workflows may start within any trailing `period` window.
 #[derive(Clone, Debug)]
 pub struct RateLimiter {
@@ -8,7 +8,7 @@ pub struct RateLimiter {
     pub period: Duration,
 }
 
-/// A named durable queue — the Rust analog of Go's `NewWorkflowQueue`.
+/// A named durable queue.
 ///
 /// Workflows are enqueued with [`crate::DurableEngine::enqueue`] (or
 /// `run_workflow` with `WorkflowOptions.queue`) and claimed by a per-queue

@@ -1,9 +1,8 @@
 //! Procedural macros for `durust`.
 //!
-//! The only macro is [`macro@workflow`], the Rust analog of Python's
-//! `@DBOS.workflow()` decorator: it leaves your async fn untouched and emits a
-//! compile-time registration so the engine discovers it automatically — no
-//! manual `engine.register(...)` call, and the workflow name defaults to the
+//! The only macro is [`macro@workflow`]: it leaves your async fn untouched and
+//! emits a compile-time registration so the engine discovers it automatically —
+//! no manual `engine.register(...)` call, and the workflow name defaults to the
 //! function name.
 
 use proc_macro::TokenStream;

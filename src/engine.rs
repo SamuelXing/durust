@@ -65,8 +65,7 @@ pub struct WorkflowRegistration {
 
 inventory::collect!(WorkflowRegistration);
 
-/// Per-workflow start options — the Rust analog of Go's `WithWorkflowID`,
-/// `WithDeduplicationID`, `WithQueue`, `WithPriority`, `WithTimeout`.
+/// Per-workflow start options.
 ///
 /// `timeout` fixes a deadline when the workflow starts (at claim time for
 /// queued workflows); a run that overruns it is cancelled.
@@ -126,7 +125,7 @@ impl WorkflowOptions {
     }
 }
 
-/// The durable execution engine — the Rust analog of the Go SDK's `DBOSContext`.
+/// The durable execution engine.
 ///
 /// Holds the state backend, a registry of workflow functions by name, and this
 /// process's identity (`executor_id`, `app_version`). There is no separate
@@ -301,15 +300,15 @@ impl DurableEngine {
     }
 
     /// Start (or attach to) a workflow and return a [`WorkflowHandle`] **without
-    /// blocking** on its completion — the Rust analog of Go's `RunWorkflow`.
+    /// blocking** on its completion.
     ///
     /// The status row is created idempotently under the resolved id. Without a
     /// queue, the workflow runs immediately on a spawned task. With
     /// `opts.queue` set, the row is persisted `ENQUEUED` (or `DELAYED` when
     /// `opts.delay` is set) and a polling handle is returned — a dispatcher on
-    /// any executor claims and runs it, exactly like Go's `WithQueue`. If the
-    /// id already exists in a terminal state, a polling handle over the stored
-    /// result is returned instead of re-running.
+    /// any executor claims and runs it. If the id already exists in a terminal
+    /// state, a polling handle over the stored result is returned instead of
+    /// re-running.
     pub async fn run_workflow<I, O>(
         &self,
         name: &str,
@@ -356,8 +355,8 @@ impl DurableEngine {
         Ok(WorkflowHandle::local(id, self.provider.clone(), join))
     }
 
-    /// Enqueue a workflow on a registered queue — the Rust analog of Go's
-    /// `Enqueue`. Sugar for [`run_workflow`](Self::run_workflow) with
+    /// Enqueue a workflow on a registered queue.
+    /// Sugar for [`run_workflow`](Self::run_workflow) with
     /// `opts.queue` set; the returned handle observes the workflow by polling,
     /// since any executor may claim and run it.
     pub async fn enqueue<I, O>(
@@ -439,10 +438,9 @@ impl DurableEngine {
         handle.get_result().await
     }
 
-    /// Get a [`WorkflowHandle`] for an existing workflow — the Rust analog of
-    /// Go's `RetrieveWorkflow`. The handle observes the workflow by polling, so
-    /// it works regardless of which executor is running it. Errors if no
-    /// workflow exists under `id`.
+    /// Get a [`WorkflowHandle`] for an existing workflow. The handle observes the
+    /// workflow by polling, so it works regardless of which executor is running
+    /// it. Errors if no workflow exists under `id`.
     pub async fn retrieve_workflow<O>(&self, id: &str) -> Result<WorkflowHandle<O>> {
         self.provider
             .get_workflow_status(id)
@@ -454,31 +452,29 @@ impl DurableEngine {
         ))
     }
 
-    /// List workflows matching `filter` — the Rust analog of Go's
-    /// `ListWorkflows`.
+    /// List workflows matching `filter`.
     pub async fn list_workflows(&self, filter: &ListFilter) -> Result<Vec<WorkflowStatus>> {
         self.provider.list_workflows(filter).await
     }
 
-    /// List a workflow's recorded operations — the Rust analog of Go's
-    /// `GetWorkflowSteps`. Returns each durable step / sleep / send / child
-    /// invocation as a [`StepInfo`], ordered by step id. Empty for an unknown
-    /// workflow or one that has run no steps.
+    /// List a workflow's recorded operations. Returns each durable step / sleep /
+    /// send / child invocation as a [`StepInfo`], ordered by step id. Empty for
+    /// an unknown workflow or one that has run no steps.
     pub async fn get_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepInfo>> {
         self.provider.get_workflow_steps(workflow_id).await
     }
 
-    /// Cancel a workflow — the Rust analog of Go's `CancelWorkflow`. A
-    /// non-terminal workflow is set `CANCELLED` and removed from its queue; a
-    /// running workflow stops at its next step (cooperative cancellation).
+    /// Cancel a workflow. A non-terminal workflow is set `CANCELLED` and removed
+    /// from its queue; a running workflow stops at its next step (cooperative
+    /// cancellation).
     pub async fn cancel_workflow(&self, id: &str) -> Result<()> {
         self.provider.cancel_workflow(id).await
     }
 
-    /// Resume a cancelled (or otherwise non-terminal) workflow — the Rust analog
-    /// of Go's `ResumeWorkflow`. The workflow is returned to `PENDING` and
-    /// re-run from its checkpoints; the returned handle tracks the new run.
-    /// Errors if the workflow does not exist or is already `SUCCESS`/`ERROR`.
+    /// Resume a cancelled (or otherwise non-terminal) workflow. The workflow is
+    /// returned to `PENDING` and re-run from its checkpoints; the returned handle
+    /// tracks the new run. Errors if the workflow does not exist or is already
+    /// `SUCCESS`/`ERROR`.
     pub async fn resume_workflow<O>(&self, id: &str) -> Result<WorkflowHandle<O>> {
         if !self.provider.resume_workflow(id).await? {
             return Err(Error::app(format!(
@@ -505,11 +501,10 @@ impl DurableEngine {
         ))
     }
 
-    /// Fork a workflow from `start_step` — the Rust analog of Go's
-    /// `ForkWorkflow`. Creates a new workflow that reuses the original's
-    /// checkpoints for steps `< start_step` and re-executes from there. The new
-    /// id comes from `opts.workflow_id` or is generated; the returned handle
-    /// tracks the forked run.
+    /// Fork a workflow from `start_step`. Creates a new workflow that reuses the
+    /// original's checkpoints for steps `< start_step` and re-executes from
+    /// there. The new id comes from `opts.workflow_id` or is generated; the
+    /// returned handle tracks the forked run.
     pub async fn fork_workflow<O>(
         &self,
         original_id: &str,
@@ -762,10 +757,10 @@ impl Drop for InflightGuard {
 
 /// Per-queue dispatcher: polls for due work and runs claimed workflows.
 ///
-/// Mirrors the Go SDK's `queueRunner.runQueue` loop: each iteration first
-/// transitions due `DELAYED` rows, then claims up to a worker-concurrency-
-/// adjusted batch (global concurrency and rate limits are enforced inside
-/// [`StateProvider::dequeue_workflows`]), and spawns each claim. The polling
+/// Each polling iteration first transitions due `DELAYED` rows, then claims up
+/// to a worker-concurrency-adjusted batch (global concurrency and rate limits
+/// are enforced inside [`StateProvider::dequeue_workflows`]), and spawns each
+/// claim. The polling
 /// interval backs off exponentially on dequeue errors, scales back toward the
 /// base on success, and is jittered so multiple executors don't poll in step.
 async fn queue_dispatch_loop(
@@ -888,7 +883,7 @@ async fn run_to_completion(
 
     // Enforce a workflow deadline if one was set: when it elapses, the run
     // future is dropped (cancelled at its next await) and the workflow is
-    // marked CANCELLED, mirroring Go's deadline-driven cancellation.
+    // marked CANCELLED.
     let result = match deadline_ms {
         Some(dl) => {
             let remaining = (dl - chrono::Utc::now().timestamp_millis()).max(0) as u64;
@@ -932,7 +927,7 @@ async fn run_to_completion(
 /// Per-schedule cron loop: at each tick, start the workflow under a
 /// deterministic id derived from the tick time, so the run happens exactly once
 /// even across multiple executors (the idempotent status insert is the
-/// arbiter). Mirrors the Go SDK's `sched-{name}-{time}` scheme.
+/// arbiter). The per-tick id has the form `sched-{name}-{time}`.
 async fn schedule_loop(
     name: String,
     spec: String,
