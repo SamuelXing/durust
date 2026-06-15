@@ -21,6 +21,8 @@ struct NotificationRow {
 struct Inner {
     workflows: HashMap<String, WorkflowStatus>,
     steps: HashMap<(String, i32), Value>,
+    /// Child-workflow links keyed by `(parent_id, seq)` → child workflow id.
+    child_links: HashMap<(String, i32), String>,
     notifications: Vec<NotificationRow>,
     /// Workflow events keyed by `(workflow_id, key)`.
     events: HashMap<(String, String), Value>,
@@ -408,5 +410,24 @@ impl StateProvider for InMemoryProvider {
             row.updated_at = Utc::now();
         }
         Ok(attempts)
+    }
+
+    async fn record_child_workflow(
+        &self,
+        parent_id: &str,
+        seq: i32,
+        _name: &str,
+        child_id: &str,
+    ) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        g.child_links
+            .entry((parent_id.to_string(), seq))
+            .or_insert_with(|| child_id.to_string());
+        Ok(())
+    }
+
+    async fn check_child_workflow(&self, parent_id: &str, seq: i32) -> Result<Option<String>> {
+        let g = self.inner.lock().await;
+        Ok(g.child_links.get(&(parent_id.to_string(), seq)).cloned())
     }
 }

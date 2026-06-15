@@ -600,6 +600,40 @@ impl StateProvider for PostgresProvider {
         tx.commit().await?;
         Ok(attempts)
     }
+
+    async fn record_child_workflow(
+        &self,
+        parent_id: &str,
+        seq: i32,
+        name: &str,
+        child_id: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO operation_outputs
+                 (workflow_uuid, function_id, function_name, child_workflow_id)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
+        )
+        .bind(parent_id)
+        .bind(seq)
+        .bind(name)
+        .bind(child_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn check_child_workflow(&self, parent_id: &str, seq: i32) -> Result<Option<String>> {
+        let child: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT child_workflow_id FROM operation_outputs
+             WHERE workflow_uuid = $1 AND function_id = $2",
+        )
+        .bind(parent_id)
+        .bind(seq)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(child.flatten())
+    }
 }
 
 /// Append the WHERE clause shared by `list_workflows` (Postgres dialect).

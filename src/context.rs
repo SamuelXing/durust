@@ -1,4 +1,6 @@
+use crate::engine::{Runtime, WorkflowOptions};
 use crate::error::{Error, Result};
+use crate::handle::WorkflowHandle;
 use crate::provider::{StateProvider, WorkflowStatus, STATUS_CANCELLED};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
@@ -109,6 +111,8 @@ impl AuthContext {
 pub struct DurableContext {
     workflow_id: String,
     provider: Arc<dyn StateProvider>,
+    /// Shared execution core, so a workflow can start child workflows.
+    runtime: Arc<Runtime>,
     auth: AuthContext,
     // Monotonic step index. Because the workflow's control flow is
     // deterministic, the same code path yields the same seq on every replay,
@@ -117,14 +121,11 @@ pub struct DurableContext {
 }
 
 impl DurableContext {
-    pub(crate) fn new(
-        workflow_id: String,
-        provider: Arc<dyn StateProvider>,
-        auth: AuthContext,
-    ) -> Self {
+    pub(crate) fn new(workflow_id: String, runtime: Arc<Runtime>, auth: AuthContext) -> Self {
         Self {
             workflow_id,
-            provider,
+            provider: runtime.provider().clone(),
+            runtime,
             auth,
             seq: Arc::new(AtomicI32::new(0)),
         }
@@ -156,6 +157,63 @@ impl DurableContext {
 
     fn next_seq(&self) -> i32 {
         self.seq.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Start a **child workflow** from within this workflow and return a handle
+    /// to it. Await its result with [`WorkflowHandle::get_result`].
+    ///
+    /// The child runs durably and independently of the parent. It is keyed to
+    /// this call's step position: unless `opts.workflow_id` is set, it gets the
+    /// deterministic id `{parent_id}-{seq}`, and the parent→child link is
+    /// checkpointed. On replay the same child is re-attached instead of being
+    /// started again, so the child runs at most once per logical call.
+    ///
+    /// The child inherits this workflow's identity ([`AuthContext`]) and records
+    /// its `parent_workflow_id`. Pass `opts.queue` to route the child through a
+    /// queue instead of running it inline.
+    pub async fn start_workflow<I, O>(
+        &self,
+        name: &str,
+        input: I,
+        opts: WorkflowOptions,
+    ) -> Result<WorkflowHandle<O>>
+    where
+        I: Serialize,
+    {
+        let seq = self.next_seq();
+
+        // Replay: re-attach to the child already started at this step.
+        if let Some(child_id) = self
+            .provider
+            .check_child_workflow(&self.workflow_id, seq)
+            .await?
+        {
+            return Ok(WorkflowHandle::polling(child_id, self.provider.clone()));
+        }
+
+        let child_id = opts
+            .workflow_id
+            .clone()
+            .unwrap_or_else(|| format!("{}-{}", self.workflow_id, seq));
+        let mut opts = opts;
+        opts.workflow_id = Some(child_id.clone());
+        let input_json = serde_json::to_value(input)?;
+
+        self.runtime
+            .spawn_child(
+                &child_id,
+                name,
+                input_json,
+                opts,
+                &self.workflow_id,
+                self.auth.clone(),
+            )
+            .await?;
+        self.provider
+            .record_child_workflow(&self.workflow_id, seq, name, &child_id)
+            .await?;
+
+        Ok(WorkflowHandle::polling(child_id, self.provider.clone()))
     }
 
     /// Run a durable step with the default policy (no retries).
