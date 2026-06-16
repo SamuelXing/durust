@@ -1,0 +1,76 @@
+//! Durable concurrency on the in-memory provider: fan-out via `try_join!` over
+//! `ctx.step` is already durable (each step checkpoints independently), and
+//! `ctx.select` durably races branches and returns the first to complete.
+
+use durust::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Two steps run concurrently with `try_join!`; both are checkpointed, in poll
+/// order. No special API — plain futures composition over `ctx.step`.
+#[tokio::test]
+async fn concurrent_steps_via_try_join() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("fanout", |ctx: DurableContext, _: ()| async move {
+        let (a, b) = tokio::try_join!(
+            ctx.step("a", || async { Ok::<_, Error>(10_i64) }),
+            ctx.step("b", || async { Ok::<_, Error>(32_i64) }),
+        )?;
+        Ok::<_, Error>(a + b)
+    });
+
+    let out: i64 = engine.start_typed("fanout", "f", ()).await?;
+    assert_eq!(out, 42);
+
+    // Both branches were recorded as steps, numbered by poll order.
+    let steps = engine.get_workflow_steps("f").await?;
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0].name, "a");
+    assert_eq!(steps[1].name, "b");
+    Ok(())
+}
+
+/// `select` returns the index and value of the first branch to complete and
+/// records the outcome as a single `DBOS.select` step.
+#[tokio::test]
+async fn select_returns_first_to_complete() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("racer", |ctx: DurableContext, _: ()| async move {
+        let branches: Vec<Pin<Box<dyn Future<Output = i64> + Send>>> = vec![
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                1
+            }),
+            Box::pin(async { 2 }),
+        ];
+        ctx.select(branches).await
+    });
+
+    let (index, value): (usize, i64) = engine.start_typed("racer", "r", ()).await?;
+    assert_eq!((index, value), (1, 2), "the immediately-ready branch wins");
+
+    let steps = engine.get_workflow_steps("r").await?;
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].name, "DBOS.select");
+    Ok(())
+}
+
+/// `select` over no branches is a programming error, surfaced as a failure.
+#[tokio::test]
+async fn select_with_no_branches_errors() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("empty", |ctx: DurableContext, _: ()| async move {
+        let branches: Vec<Pin<Box<dyn Future<Output = i64> + Send>>> = vec![];
+        ctx.select(branches).await
+    });
+
+    let res = engine
+        .run_workflow::<_, (usize, i64)>("empty", (), WorkflowOptions::with_id("e"))
+        .await?
+        .get_result()
+        .await;
+    assert!(res.is_err(), "select with no branches must fail");
+    Ok(())
+}
