@@ -331,6 +331,7 @@ impl StateProvider for InMemoryProvider {
                     && filter
                         .end_time_ms
                         .is_none_or(|t| w.created_at.timestamp_millis() <= t)
+                    && (!filter.queues_only || w.queue_name.is_some())
             })
             .cloned()
             .collect();

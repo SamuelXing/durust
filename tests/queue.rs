@@ -3,8 +3,8 @@
 //! enqueue, deduplication, and rate limiting.
 
 use durust::{
-    DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, RateLimiter, Result,
-    WorkflowOptions, WorkflowQueue, STATUS_DELAYED, STATUS_ENQUEUED,
+    DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, ListFilter, RateLimiter,
+    Result, WorkflowOptions, WorkflowQueue, STATUS_DELAYED, STATUS_ENQUEUED,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -247,6 +247,95 @@ async fn rate_limit_caps_starts() -> Result<()> {
     );
     let enqueued = futures_count_enqueued(&mut handles).await?;
     assert_eq!(enqueued, 2, "the overflow workflows must remain ENQUEUED");
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// The registry reports every registered queue, sorted by name, regardless of
+/// which ones this process listens to.
+#[tokio::test]
+async fn list_registered_queues_is_sorted() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register_queue(WorkflowQueue::new("zebra").worker_concurrency(2));
+    engine.register_queue(WorkflowQueue::new("alpha"));
+
+    let names: Vec<String> = engine
+        .list_registered_queues()
+        .into_iter()
+        .map(|q| q.name)
+        .collect();
+    assert_eq!(names, vec!["alpha".to_string(), "zebra".to_string()]);
+    Ok(())
+}
+
+/// `listen_queues` dispatches only the named subset: an unlistened queue still
+/// accepts enqueues, but nothing claims them in this process.
+#[tokio::test]
+async fn listen_queues_dispatches_only_listened() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("add_one", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n + 1)
+    });
+    engine.register_queue(test_queue("listened"));
+    engine.register_queue(test_queue("ignored"));
+    engine.listen_queues(["listened"]);
+    engine.launch().await?;
+
+    // The listened queue runs to completion.
+    let mut run = engine
+        .enqueue::<_, i64>("listened", "add_one", 41_i64, WorkflowOptions::default())
+        .await?;
+    assert_eq!(run.get_result().await?, 42);
+
+    // The ignored queue accepts the enqueue but never dispatches it here.
+    let mut idle = engine
+        .enqueue::<_, i64>("ignored", "add_one", 1_i64, WorkflowOptions::default())
+        .await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        idle.get_status().await?.status,
+        STATUS_ENQUEUED,
+        "an unlistened queue is not dispatched by this process"
+    );
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// `ListFilter::queues_only` returns only workflows that are on a queue,
+/// excluding directly-run ones.
+#[tokio::test]
+async fn queues_only_filters_to_queued_workflows() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(())
+    });
+    engine.register_queue(test_queue("q"));
+    engine.launch().await?;
+
+    // One direct run, one enqueued.
+    engine
+        .run_workflow::<_, ()>("noop", (), WorkflowOptions::with_id("direct"))
+        .await?
+        .get_result()
+        .await?;
+    engine
+        .enqueue::<_, ()>("q", "noop", (), WorkflowOptions::with_id("queued"))
+        .await?
+        .get_result()
+        .await?;
+
+    let queued: Vec<String> = engine
+        .list_workflows(&ListFilter {
+            queues_only: true,
+            ..Default::default()
+        })
+        .await?
+        .into_iter()
+        .map(|w| w.id)
+        .collect();
+    assert_eq!(queued, vec!["queued".to_string()]);
 
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())

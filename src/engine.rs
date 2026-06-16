@@ -139,6 +139,10 @@ pub struct DurableEngine {
     provider: Arc<dyn StateProvider>,
     workflows: HashMap<String, WorkflowFn>,
     queues: HashMap<String, Arc<WorkflowQueue>>,
+    /// If set, only these registered queues get a dispatcher at
+    /// [`launch`](Self::launch); `None` dispatches every registered queue. Set
+    /// by [`listen_queues`](Self::listen_queues).
+    listen_filter: Option<std::collections::HashSet<String>>,
     /// `(workflow_name, cron_spec)` for `#[workflow(schedule = …)]` workflows;
     /// each gets a scheduler task in [`launch`](Self::launch).
     scheduled: Vec<(String, String)>,
@@ -187,6 +191,7 @@ impl DurableEngine {
             provider,
             workflows,
             queues: HashMap::new(),
+            listen_filter: None,
             scheduled,
             executor_id: uuid::Uuid::new_v4().to_string(),
             app_version: app_version.into(),
@@ -248,6 +253,27 @@ impl DurableEngine {
         self.queues.insert(queue.name.clone(), Arc::new(queue));
     }
 
+    /// Restrict which registered queues this process dispatches at
+    /// [`launch`](Self::launch) to the named subset. By default every registered
+    /// queue gets a dispatcher; call this (before `launch`) to have a process
+    /// that *enqueues* to many queues but only *runs* work from some of them.
+    /// Names that are not registered are ignored. Must be called before `launch`.
+    pub fn listen_queues<I, S>(&mut self, names: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.listen_filter = Some(names.into_iter().map(Into::into).collect());
+    }
+
+    /// All queues registered on this engine, sorted by name. Includes queues this
+    /// process does not dispatch (see [`listen_queues`](Self::listen_queues)).
+    pub fn list_registered_queues(&self) -> Vec<WorkflowQueue> {
+        let mut queues: Vec<WorkflowQueue> = self.queues.values().map(|q| (**q).clone()).collect();
+        queues.sort_by(|a, b| a.name.cmp(&b.name));
+        queues
+    }
+
     /// Start background processing: one dispatcher task per registered queue and
     /// one scheduler task per `#[workflow(schedule = …)]` workflow. Workflow
     /// timeouts are enforced inline per run, so they need no separate sweep. Call
@@ -257,6 +283,12 @@ impl DurableEngine {
         let rt = self.runtime();
         let mut tasks = self.dispatchers.lock().expect("dispatcher lock poisoned");
         for queue in self.queues.values() {
+            // Skip queues this process is configured not to listen to.
+            if let Some(listen) = &self.listen_filter {
+                if !listen.contains(&queue.name) {
+                    continue;
+                }
+            }
             tasks.push(tokio::spawn(queue_dispatch_loop(
                 queue.clone(),
                 rt.clone(),

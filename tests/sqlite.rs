@@ -641,3 +641,39 @@ async fn sqlite_management() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// `queues_only` is enforced in SQL: only workflows with a non-null queue_name
+/// come back.
+#[tokio::test]
+async fn sqlite_queues_only_filter() -> Result<()> {
+    let (url, path) = temp_db_url("queues-only");
+
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(())
+    });
+    engine.register_queue(WorkflowQueue::new("q").base_polling_interval(Duration::from_millis(10)));
+    engine.launch().await?;
+
+    engine.start_typed::<_, ()>("noop", "direct", ()).await?;
+    engine
+        .enqueue::<_, ()>("q", "noop", (), WorkflowOptions::with_id("queued"))
+        .await?
+        .get_result()
+        .await?;
+
+    let queued: Vec<String> = engine
+        .list_workflows(&ListFilter {
+            queues_only: true,
+            ..Default::default()
+        })
+        .await?
+        .into_iter()
+        .map(|w| w.id)
+        .collect();
+    assert_eq!(queued, vec!["queued".to_string()]);
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
