@@ -2,7 +2,7 @@ use crate::error::Result;
 use crate::provider::{
     decode_roles, dedup_or, encode_roles, is_terminal, nonexistent_or, DequeueRequest, ListFilter,
     StateProvider, StepInfo, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
-    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
+    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STREAM_CLOSED_SENTINEL,
 };
 use crate::serialize::{self, Serializer};
 use async_trait::async_trait;
@@ -671,6 +671,91 @@ impl StateProvider for SqliteProvider {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn write_stream(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        value: Option<Value>,
+        function_id: i32,
+    ) -> Result<()> {
+        // A closed entry stores the sentinel verbatim with no serialization;
+        // user values are encoded and tagged with the serializer name.
+        let (stored, ser): (String, Option<String>) = match value {
+            Some(v) => (
+                self.serializer.encode(&v)?,
+                Some(self.serializer.name().to_string()),
+            ),
+            None => (STREAM_CLOSED_SENTINEL.to_string(), None),
+        };
+
+        // Check-then-append in one transaction; SQLite serializes writers, so
+        // the next offset cannot be claimed concurrently.
+        let mut tx = self.pool.begin().await?;
+
+        let closed: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM streams WHERE workflow_uuid = ? AND key = ? AND value = ? LIMIT 1",
+        )
+        .bind(workflow_id)
+        .bind(key)
+        .bind(STREAM_CLOSED_SENTINEL)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if closed.is_some() {
+            return Err(crate::error::Error::app(format!(
+                "stream `{key}` is already closed"
+            )));
+        }
+
+        sqlx::query(
+            "INSERT INTO streams (workflow_uuid, key, value, \"offset\", function_id, serialization)
+             SELECT ?, ?, ?, COALESCE(
+                 (SELECT MAX(\"offset\") FROM streams WHERE workflow_uuid = ? AND key = ?), -1
+             ) + 1, ?, ?",
+        )
+        .bind(workflow_id)
+        .bind(key)
+        .bind(&stored)
+        .bind(workflow_id)
+        .bind(key)
+        .bind(function_id)
+        .bind(&ser)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| nonexistent_or(e, workflow_id))?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn read_stream(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        from_offset: i32,
+    ) -> Result<(Vec<Value>, bool)> {
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT value, serialization FROM streams
+             WHERE workflow_uuid = ? AND key = ? AND \"offset\" >= ?
+             ORDER BY \"offset\" ASC",
+        )
+        .bind(workflow_id)
+        .bind(key)
+        .bind(from_offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut values = Vec::with_capacity(rows.len());
+        let mut closed = false;
+        for (value, fmt) in rows {
+            if value == STREAM_CLOSED_SENTINEL {
+                closed = true;
+                break;
+            }
+            values.push(serialize::decode(fmt.as_deref(), &value)?);
+        }
+        Ok((values, closed))
     }
 }
 

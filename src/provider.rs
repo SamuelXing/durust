@@ -63,6 +63,12 @@ pub const STATUS_ERROR: &str = "ERROR";
 pub const STATUS_CANCELLED: &str = "CANCELLED";
 pub const STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED: &str = "MAX_RECOVERY_ATTEMPTS_EXCEEDED";
 
+/// Value written into a stream's `value` column to mark it closed. Stored
+/// verbatim (no serialization), so a reader in any language recognizes the
+/// close the same way — a shared on-disk identifier, like the `DBOS.*` step
+/// names. User values are serializer-encoded, so they never collide with it.
+pub(crate) const STREAM_CLOSED_SENTINEL: &str = "__DBOS_STREAM_CLOSED__";
+
 /// `true` if `status` is terminal (no further execution will occur).
 pub fn is_terminal(status: &str) -> bool {
     matches!(
@@ -398,6 +404,31 @@ pub trait StateProvider: Send + Sync {
     /// output) — the checkpoint the patch system writes so a replay observes the
     /// same patch decision. A second record for the same key is a no-op.
     async fn record_patch(&self, workflow_id: &str, seq: i32, name: &str) -> Result<()>;
+
+    /// Append one entry to the append-only stream `(workflow_id, key)` at the
+    /// next offset (`MAX(offset) + 1`, starting at 0), stamped with the producing
+    /// step's `function_id`. `value` is the user value to encode and store;
+    /// `None` writes the close sentinel instead, which seals the stream. Errors
+    /// if the stream is already closed. The destination workflow's existence is
+    /// enforced by the streams foreign key.
+    async fn write_stream(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        value: Option<Value>,
+        function_id: i32,
+    ) -> Result<()>;
+
+    /// Read stream `(workflow_id, key)` entries with `offset >= from_offset` in
+    /// order, decoding each per its stored serialization. Returns the decoded
+    /// values and whether the close sentinel was reached (the sentinel itself is
+    /// not included). Reading never blocks — the caller polls.
+    async fn read_stream(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        from_offset: i32,
+    ) -> Result<(Vec<Value>, bool)>;
 }
 
 #[cfg(test)]

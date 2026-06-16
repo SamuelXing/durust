@@ -35,6 +35,9 @@ struct Inner {
     notifications: Vec<NotificationRow>,
     /// Workflow events keyed by `(workflow_id, key)`.
     events: HashMap<(String, String), Value>,
+    /// Append-only streams keyed by `(workflow_id, key)`. Each entry's offset is
+    /// its index; `None` is the close sentinel sealing the stream.
+    streams: HashMap<(String, String), Vec<Option<Value>>>,
 }
 
 /// In-memory [`StateProvider`] for tests and quick starts (no database needed).
@@ -497,5 +500,47 @@ impl StateProvider for InMemoryProvider {
                 child_workflow_id: None,
             });
         Ok(())
+    }
+
+    async fn write_stream(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        value: Option<Value>,
+        _function_id: i32,
+    ) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        let entries = g
+            .streams
+            .entry((workflow_id.to_string(), key.to_string()))
+            .or_default();
+        if entries.iter().any(|e| e.is_none()) {
+            return Err(Error::app(format!("stream `{key}` is already closed")));
+        }
+        entries.push(value);
+        Ok(())
+    }
+
+    async fn read_stream(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        from_offset: i32,
+    ) -> Result<(Vec<Value>, bool)> {
+        let g = self.inner.lock().await;
+        let mut values = Vec::new();
+        let mut closed = false;
+        if let Some(entries) = g.streams.get(&(workflow_id.to_string(), key.to_string())) {
+            for entry in entries.iter().skip(from_offset.max(0) as usize) {
+                match entry {
+                    Some(v) => values.push(v.clone()),
+                    None => {
+                        closed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok((values, closed))
     }
 }

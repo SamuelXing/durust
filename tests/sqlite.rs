@@ -268,6 +268,60 @@ async fn sqlite_select_winner_is_durable() -> Result<()> {
     Ok(())
 }
 
+/// A durable stream round-trips through SQLite and survives replay: re-running
+/// the producer over the same database does not re-append, so the reader still
+/// sees exactly the values written once.
+#[tokio::test]
+async fn sqlite_stream_is_durable_across_replay() -> Result<()> {
+    let (url, path) = temp_db_url("stream");
+
+    let register = |engine: &mut DurableEngine| {
+        engine.register("producer", |ctx: DurableContext, _: ()| async move {
+            for i in 0..3_i64 {
+                ctx.write_stream("nums", i).await?;
+            }
+            ctx.close_stream("nums").await?;
+            Ok::<_, Error>(())
+        });
+    };
+
+    for _ in 0..2 {
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        register(&mut engine);
+        engine.start_typed::<_, ()>("producer", "p", ()).await?;
+
+        let (values, closed): (Vec<i64>, bool) = engine.read_stream("p", "nums").await?;
+        assert_eq!(
+            values,
+            vec![0, 1, 2],
+            "stream holds each value exactly once"
+        );
+        assert!(closed);
+    }
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// Writing to a closed stream errors at the SQL layer too.
+#[tokio::test]
+async fn sqlite_write_to_closed_stream_errors() -> Result<()> {
+    let (url, path) = temp_db_url("stream-closed");
+
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("bad", |ctx: DurableContext, _: ()| async move {
+        ctx.close_stream("s").await?;
+        ctx.write_stream("s", 1_i64).await?;
+        Ok::<_, Error>(())
+    });
+
+    let res: Result<()> = engine.start_typed("bad", "p", ()).await;
+    assert!(res.is_err(), "writing after close must fail");
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 /// The SQL dequeue path end to end: enqueue → dispatcher claims → result; and
 /// the (queue_name, deduplication_id) unique index rejects a duplicate.
 #[tokio::test]

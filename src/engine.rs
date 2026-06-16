@@ -17,6 +17,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
+/// How often a blocking [`DurableEngine::read_stream`] re-checks the backend for
+/// newly written stream entries while the producer is still active.
+const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 /// A type-erased workflow handler: takes a context + JSON input, returns JSON output.
 pub type WorkflowFn = Arc<
     dyn Fn(DurableContext, Value) -> Pin<Box<dyn Future<Output = Result<Value>> + Send>>
@@ -462,6 +466,65 @@ impl DurableEngine {
     /// an unknown workflow or one that has run no steps.
     pub async fn get_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepInfo>> {
         self.provider.get_workflow_steps(workflow_id).await
+    }
+
+    /// Read the durable stream `key` produced by `workflow_id`, blocking until it
+    /// is closed (a producer called [`close_stream`](crate::DurableContext::close_stream))
+    /// or the producing workflow becomes inactive (no longer `PENDING`/`ENQUEUED`).
+    /// Returns every value written, in order, and whether the stream is closed.
+    ///
+    /// Values are drained as the producer writes them; this polls the backend
+    /// until the end condition is met. For a non-blocking read of what is
+    /// currently available, use [`read_stream_snapshot`](Self::read_stream_snapshot).
+    /// Errors if the workflow does not exist.
+    pub async fn read_stream<T: DeserializeOwned>(
+        &self,
+        workflow_id: &str,
+        key: &str,
+    ) -> Result<(Vec<T>, bool)> {
+        let mut all = Vec::new();
+        let mut offset = 0_i32;
+        loop {
+            let (values, closed) = self.provider.read_stream(workflow_id, key, offset).await?;
+            offset += values.len() as i32;
+            for v in values {
+                all.push(serde_json::from_value(v)?);
+            }
+            if closed {
+                return Ok((all, true));
+            }
+            // No close sentinel yet: keep reading only while the producer is
+            // still active. Once it is gone, no more values can arrive.
+            match self.provider.get_workflow_status(workflow_id).await? {
+                None => return Err(Error::nonexistent_workflow(workflow_id)),
+                Some(s) if s.status != STATUS_PENDING && s.status != STATUS_ENQUEUED => {
+                    return Ok((all, true));
+                }
+                _ => {}
+            }
+            tokio::time::sleep(STREAM_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Read the currently-available values of stream `key` on `workflow_id`
+    /// starting at `from_offset`, without blocking. Returns the values in order
+    /// and whether the close sentinel has been reached. Use this to poll a stream
+    /// incrementally; pass the count read so far as the next `from_offset`.
+    pub async fn read_stream_snapshot<T: DeserializeOwned>(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        from_offset: i32,
+    ) -> Result<(Vec<T>, bool)> {
+        let (values, closed) = self
+            .provider
+            .read_stream(workflow_id, key, from_offset)
+            .await?;
+        let out = values
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<std::result::Result<Vec<T>, _>>()?;
+        Ok((out, closed))
     }
 
     /// Cancel a workflow. A non-terminal workflow is set `CANCELLED` and removed

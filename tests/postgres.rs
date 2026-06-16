@@ -284,6 +284,46 @@ async fn pg_select() -> Result<()> {
     Ok(())
 }
 
+/// A durable stream round-trips through Postgres: a producer writes values and
+/// closes the stream, and an external reader drains them in order and sees the
+/// close.
+#[tokio::test]
+async fn pg_stream_round_trip() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_stream_round_trip: DATABASE_URL unset");
+        return Ok(());
+    };
+    let id = format!("stream-{}", uuid::Uuid::new_v4());
+
+    let provider = PostgresProvider::connect(&url).await?;
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    engine.register("producer", |ctx: DurableContext, _: ()| async move {
+        for i in 0..3_i64 {
+            ctx.write_stream("nums", i).await?;
+        }
+        ctx.close_stream("nums").await?;
+        Ok::<_, Error>(())
+    });
+
+    engine
+        .run_workflow::<_, ()>("producer", (), WorkflowOptions::with_id(&id))
+        .await?
+        .get_result()
+        .await?;
+
+    let (values, closed): (Vec<i64>, bool) = engine.read_stream(&id, "nums").await?;
+    assert_eq!(values, vec![0, 1, 2]);
+    assert!(closed);
+
+    // A snapshot read from an offset returns only the tail, without blocking.
+    let (tail, closed): (Vec<i64>, bool) = engine.read_stream_snapshot(&id, "nums", 2).await?;
+    assert_eq!(tail, vec![2]);
+    assert!(closed);
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
 /// Postgres surfaces the dedup unique-violation and the destination FK violation
 /// as typed, classifiable errors (verifies the sqlx Postgres driver mapping).
 #[tokio::test]

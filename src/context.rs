@@ -640,6 +640,52 @@ impl DurableContext {
         }
     }
 
+    /// Append `value` to the append-only durable stream `key` on this workflow.
+    /// Recorded as a `DBOS.writeStream` step, so a replay does not re-append.
+    /// Each write lands at the next offset; readers drain values in order with
+    /// [`DurableEngine::read_stream`](crate::DurableEngine::read_stream).
+    ///
+    /// Errors if the stream was already closed by
+    /// [`close_stream`](Self::close_stream). Like any step side effect, the
+    /// append commits before its checkpoint: a crash in that window re-appends
+    /// on replay (at-least-once).
+    pub async fn write_stream<T: Serialize>(&self, key: &str, value: T) -> Result<()> {
+        let seq = self.next_seq();
+        if self.replay_or_guard::<Value>(seq).await?.is_some() {
+            return Ok(());
+        }
+        self.provider
+            .write_stream(
+                &self.workflow_id,
+                key,
+                Some(serde_json::to_value(value)?),
+                seq,
+            )
+            .await?;
+        self.provider
+            .record_step_result(&self.workflow_id, seq, "DBOS.writeStream", Value::Null)
+            .await?;
+        Ok(())
+    }
+
+    /// Close the durable stream `key` on this workflow, sealing it against
+    /// further writes. Recorded as a `DBOS.closeStream` step. A reader draining
+    /// the stream observes the close and stops. Writing to a closed stream
+    /// errors.
+    pub async fn close_stream(&self, key: &str) -> Result<()> {
+        let seq = self.next_seq();
+        if self.replay_or_guard::<Value>(seq).await?.is_some() {
+            return Ok(());
+        }
+        self.provider
+            .write_stream(&self.workflow_id, key, None, seq)
+            .await?;
+        self.provider
+            .record_step_result(&self.workflow_id, seq, "DBOS.closeStream", Value::Null)
+            .await?;
+        Ok(())
+    }
+
     /// Escape hatch for building application errors inside steps.
     pub fn err(&self, msg: impl Into<String>) -> Error {
         Error::app(msg)
