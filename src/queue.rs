@@ -36,6 +36,10 @@ pub struct WorkflowQueue {
     pub rate_limit: Option<RateLimiter>,
     /// Max workflows claimed per polling iteration (default 100).
     pub max_tasks_per_iteration: usize,
+    /// When `true`, workflows are enqueued under a partition key and each
+    /// partition gets its own concurrency / rate-limit budget (see
+    /// [`partitioned`](Self::partitioned)).
+    pub partitioned: bool,
     /// Starting (and minimum) polling interval (default 1s).
     pub base_polling_interval: Duration,
     /// Ceiling the interval backs off to on dequeue errors (default 120s).
@@ -51,6 +55,7 @@ impl WorkflowQueue {
             priority_enabled: false,
             rate_limit: None,
             max_tasks_per_iteration: 100,
+            partitioned: false,
             base_polling_interval: Duration::from_secs(1),
             max_polling_interval: Duration::from_secs(120),
         }
@@ -78,6 +83,16 @@ impl WorkflowQueue {
 
     pub fn max_tasks_per_iteration(mut self, n: usize) -> Self {
         self.max_tasks_per_iteration = n;
+        self
+    }
+
+    /// Enable partitioned mode: enqueue workflows under a partition key (via
+    /// [`WorkflowOptions::partition_key`](crate::WorkflowOptions)), and the
+    /// dispatcher applies this queue's worker/global concurrency and rate limit
+    /// independently per partition. A workflow enqueued to a partitioned queue
+    /// without a partition key is never dispatched.
+    pub fn partitioned(mut self) -> Self {
+        self.partitioned = true;
         self
     }
 

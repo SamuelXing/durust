@@ -15,7 +15,7 @@ use sqlx::{QueryBuilder, Row};
 /// Columns selected when materializing a [`WorkflowStatus`] from `workflow_status`.
 /// `serialization` drives how `inputs`/`output` are decoded (see [`crate::Serializer`]).
 const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, executor_id, \
-     application_version, queue_name, priority, deduplication_id, recovery_attempts, \
+     application_version, queue_name, queue_partition_key, priority, deduplication_id, recovery_attempts, \
      parent_workflow_id, workflow_timeout_ms, workflow_deadline_epoch_ms, \
      started_at_epoch_ms, rate_limited, delay_until_epoch_ms, completed_at, forked_from, \
      authenticated_user, assumed_role, authenticated_roles, \
@@ -82,6 +82,7 @@ fn row_to_status(row: &sqlx::postgres::PgRow) -> WorkflowStatus {
         executor_id: row.get("executor_id"),
         app_version: row.get("application_version"),
         queue_name: row.try_get("queue_name").ok().flatten(),
+        queue_partition_key: row.try_get("queue_partition_key").ok().flatten(),
         priority: row.get("priority"),
         dedup_id: row.try_get("deduplication_id").ok().flatten(),
         recovery_attempts: row.get::<i64, _>("recovery_attempts") as i32,
@@ -123,12 +124,12 @@ impl StateProvider for PostgresProvider {
         sqlx::query(
             "INSERT INTO workflow_status
                  (workflow_uuid, name, inputs, status, executor_id, application_version,
-                  queue_name, priority, deduplication_id, parent_workflow_id,
+                  queue_name, queue_partition_key, priority, deduplication_id, parent_workflow_id,
                   workflow_timeout_ms, workflow_deadline_epoch_ms, delay_until_epoch_ms,
                   authenticated_user, assumed_role, authenticated_roles,
                   serialization, created_at, updated_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                     $17, $18, $19)
+                     $17, $18, $19, $20)
              ON CONFLICT (workflow_uuid) DO NOTHING",
         )
         .bind(&s.id)
@@ -138,6 +139,7 @@ impl StateProvider for PostgresProvider {
         .bind(&s.executor_id)
         .bind(&s.app_version)
         .bind(&s.queue_name)
+        .bind(&s.queue_partition_key)
         .bind(s.priority)
         .bind(&s.dedup_id)
         .bind(&s.parent_workflow_id)
@@ -264,29 +266,49 @@ impl StateProvider for PostgresProvider {
 
         let mut max_tasks = req.max_tasks;
 
+        // A partitioned queue scopes every count and the candidate scan to one
+        // partition key; a non-partitioned queue (`None`) leaves them unscoped.
+        let part = req.partition_key.as_deref();
+
         if let (Some(limit), Some(period_ms)) = (req.rate_limit_max, req.rate_limit_period_ms) {
-            let recent: i64 = sqlx::query_scalar(
+            let part_clause = if part.is_some() {
+                " AND queue_partition_key = $5"
+            } else {
+                ""
+            };
+            let sql = format!(
                 "SELECT COUNT(*) FROM workflow_status
                  WHERE queue_name = $1 AND rate_limited = TRUE
-                   AND status NOT IN ($2, $3) AND started_at_epoch_ms > $4",
-            )
-            .bind(&req.queue_name)
-            .bind(STATUS_ENQUEUED)
-            .bind(STATUS_DELAYED)
-            .bind(now_ms - period_ms)
-            .fetch_one(&mut *tx)
-            .await?;
+                   AND status NOT IN ($2, $3) AND started_at_epoch_ms > $4{part_clause}"
+            );
+            let mut q = sqlx::query_scalar(&sql)
+                .bind(&req.queue_name)
+                .bind(STATUS_ENQUEUED)
+                .bind(STATUS_DELAYED)
+                .bind(now_ms - period_ms);
+            if let Some(p) = part {
+                q = q.bind(p);
+            }
+            let recent: i64 = q.fetch_one(&mut *tx).await?;
             max_tasks = max_tasks.min((limit - recent).max(0));
         }
 
         if let Some(global) = req.global_concurrency {
-            let pending: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM workflow_status WHERE queue_name = $1 AND status = $2",
-            )
-            .bind(&req.queue_name)
-            .bind(STATUS_PENDING)
-            .fetch_one(&mut *tx)
-            .await?;
+            let part_clause = if part.is_some() {
+                " AND queue_partition_key = $3"
+            } else {
+                ""
+            };
+            let sql = format!(
+                "SELECT COUNT(*) FROM workflow_status WHERE queue_name = $1 AND status = $2{part_clause}"
+            );
+            let mut q = sqlx::query_scalar(&sql)
+                .bind(&req.queue_name)
+                .bind(STATUS_PENDING);
+            if let Some(p) = part {
+                q = q.bind(p);
+            }
+            let pending: i64 = q.fetch_one(&mut *tx).await?;
             max_tasks = max_tasks.min((global - pending).max(0));
         }
 
@@ -302,19 +324,27 @@ impl StateProvider for PostgresProvider {
         } else {
             "FOR UPDATE NOWAIT"
         };
-        let ids: Vec<String> = sqlx::query_scalar(&format!(
+        // With a partition key the clause takes $4 and LIMIT moves to $5.
+        let (part_clause, limit_ph) = if part.is_some() {
+            (" AND queue_partition_key = $4", "$5")
+        } else {
+            ("", "$4")
+        };
+        let sql = format!(
             "SELECT workflow_uuid FROM workflow_status
              WHERE queue_name = $1 AND status = $2
-               AND (application_version = $3 OR application_version = '')
+               AND (application_version = $3 OR application_version = ''){part_clause}
              ORDER BY priority ASC, created_at ASC
-             {lock} LIMIT $4"
-        ))
-        .bind(&req.queue_name)
-        .bind(STATUS_ENQUEUED)
-        .bind(&req.app_version)
-        .bind(max_tasks)
-        .fetch_all(&mut *tx)
-        .await?;
+             {lock} LIMIT {limit_ph}"
+        );
+        let mut q = sqlx::query_scalar(&sql)
+            .bind(&req.queue_name)
+            .bind(STATUS_ENQUEUED)
+            .bind(&req.app_version);
+        if let Some(p) = part {
+            q = q.bind(p);
+        }
+        let ids: Vec<String> = q.bind(max_tasks).fetch_all(&mut *tx).await?;
 
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -358,6 +388,18 @@ impl StateProvider for PostgresProvider {
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected())
+    }
+
+    async fn queue_partitions(&self, queue_name: &str) -> Result<Vec<String>> {
+        let keys: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT queue_partition_key FROM workflow_status
+             WHERE queue_name = $1 AND status = $2 AND queue_partition_key IS NOT NULL",
+        )
+        .bind(queue_name)
+        .bind(STATUS_ENQUEUED)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(keys)
     }
 
     async fn insert_notification(

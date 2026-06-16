@@ -98,6 +98,8 @@ pub struct WorkflowStatus {
     pub app_version: String,
     /// Queue this workflow was enqueued on, if any.
     pub queue_name: Option<String>,
+    /// Partition key within a partitioned queue, if any.
+    pub queue_partition_key: Option<String>,
     /// Dispatch priority within a queue; lower runs first.
     pub priority: i32,
     /// Deduplication key, unique per queue among active workflows.
@@ -156,6 +158,7 @@ impl WorkflowStatus {
             executor_id: executor_id.into(),
             app_version: app_version.into(),
             queue_name: None,
+            queue_partition_key: None,
             priority: 0,
             dedup_id: None,
             recovery_attempts: 0,
@@ -234,6 +237,10 @@ pub struct DequeueRequest {
     pub executor_id: String,
     /// Only workflows of this application version (or none) are claimed.
     pub app_version: String,
+    /// For a partitioned queue, restrict the claim to this partition and scope
+    /// the concurrency / rate-limit counts to it. `None` for a non-partitioned
+    /// queue (matches the queue's rows regardless of partition key).
+    pub partition_key: Option<String>,
     /// Upper bound for this iteration, already adjusted for worker concurrency
     /// (`worker_concurrency - locally running`).
     pub max_tasks: i64,
@@ -312,6 +319,11 @@ pub trait StateProvider: Send + Sync {
     /// `ENQUEUED`. Returns how many were transitioned. Called by the dispatcher
     /// at the top of each polling iteration.
     async fn transition_delayed_workflows(&self, now_ms: i64) -> Result<u64>;
+
+    /// Distinct non-null partition keys among the `ENQUEUED` workflows on
+    /// `queue_name`. The dispatcher of a partitioned queue iterates these and
+    /// dequeues each partition independently.
+    async fn queue_partitions(&self, queue_name: &str) -> Result<Vec<String>>;
 
     /// Append a message for `destination_id` on `topic`. Errors if the
     /// destination workflow does not exist (FK violation in the SQL backends).

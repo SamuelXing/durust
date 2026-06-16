@@ -13,7 +13,7 @@ use sqlx::{QueryBuilder, Row};
 use std::str::FromStr;
 
 const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, executor_id, \
-     application_version, queue_name, priority, deduplication_id, recovery_attempts, \
+     application_version, queue_name, queue_partition_key, priority, deduplication_id, recovery_attempts, \
      parent_workflow_id, workflow_timeout_ms, workflow_deadline_epoch_ms, \
      started_at_epoch_ms, rate_limited, delay_until_epoch_ms, completed_at, forked_from, \
      authenticated_user, assumed_role, authenticated_roles, \
@@ -84,6 +84,7 @@ fn row_to_status(row: &sqlx::sqlite::SqliteRow) -> WorkflowStatus {
         executor_id: row.get("executor_id"),
         app_version: row.get("application_version"),
         queue_name: row.try_get("queue_name").ok().flatten(),
+        queue_partition_key: row.try_get("queue_partition_key").ok().flatten(),
         priority: row.get::<i64, _>("priority") as i32,
         dedup_id: row.try_get("deduplication_id").ok().flatten(),
         recovery_attempts: row.get::<i64, _>("recovery_attempts") as i32,
@@ -121,11 +122,11 @@ impl StateProvider for SqliteProvider {
         sqlx::query(
             "INSERT INTO workflow_status
                  (workflow_uuid, name, inputs, status, executor_id, application_version,
-                  queue_name, priority, deduplication_id, parent_workflow_id,
+                  queue_name, queue_partition_key, priority, deduplication_id, parent_workflow_id,
                   workflow_timeout_ms, workflow_deadline_epoch_ms, delay_until_epoch_ms,
                   authenticated_user, assumed_role, authenticated_roles,
                   serialization, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (workflow_uuid) DO NOTHING",
         )
         .bind(&s.id)
@@ -135,6 +136,7 @@ impl StateProvider for SqliteProvider {
         .bind(&s.executor_id)
         .bind(&s.app_version)
         .bind(&s.queue_name)
+        .bind(&s.queue_partition_key)
         .bind(s.priority)
         .bind(&s.dedup_id)
         .bind(&s.parent_workflow_id)
@@ -262,29 +264,44 @@ impl StateProvider for SqliteProvider {
 
         let mut max_tasks = req.max_tasks;
 
+        // A partitioned queue scopes every count and the candidate scan to one
+        // partition key; a non-partitioned queue (`None`) leaves them unscoped.
+        let part = req.partition_key.as_deref();
+        let part_clause = if part.is_some() {
+            " AND queue_partition_key = ?"
+        } else {
+            ""
+        };
+
         if let (Some(limit), Some(period_ms)) = (req.rate_limit_max, req.rate_limit_period_ms) {
-            let recent: i64 = sqlx::query_scalar(
+            let sql = format!(
                 "SELECT COUNT(*) FROM workflow_status
                  WHERE queue_name = ? AND rate_limited = TRUE
-                   AND status NOT IN (?, ?) AND started_at_epoch_ms > ?",
-            )
-            .bind(&req.queue_name)
-            .bind(STATUS_ENQUEUED)
-            .bind(STATUS_DELAYED)
-            .bind(now_ms - period_ms)
-            .fetch_one(&mut *tx)
-            .await?;
+                   AND status NOT IN (?, ?) AND started_at_epoch_ms > ?{part_clause}"
+            );
+            let mut q = sqlx::query_scalar(&sql)
+                .bind(&req.queue_name)
+                .bind(STATUS_ENQUEUED)
+                .bind(STATUS_DELAYED)
+                .bind(now_ms - period_ms);
+            if let Some(p) = part {
+                q = q.bind(p);
+            }
+            let recent: i64 = q.fetch_one(&mut *tx).await?;
             max_tasks = max_tasks.min((limit - recent).max(0));
         }
 
         if let Some(global) = req.global_concurrency {
-            let pending: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM workflow_status WHERE queue_name = ? AND status = ?",
-            )
-            .bind(&req.queue_name)
-            .bind(STATUS_PENDING)
-            .fetch_one(&mut *tx)
-            .await?;
+            let sql = format!(
+                "SELECT COUNT(*) FROM workflow_status WHERE queue_name = ? AND status = ?{part_clause}"
+            );
+            let mut q = sqlx::query_scalar(&sql)
+                .bind(&req.queue_name)
+                .bind(STATUS_PENDING);
+            if let Some(p) = part {
+                q = q.bind(p);
+            }
+            let pending: i64 = q.fetch_one(&mut *tx).await?;
             max_tasks = max_tasks.min((global - pending).max(0));
         }
 
@@ -292,19 +309,21 @@ impl StateProvider for SqliteProvider {
             return Ok(Vec::new());
         }
 
-        let ids: Vec<String> = sqlx::query_scalar(
+        let sql = format!(
             "SELECT workflow_uuid FROM workflow_status
              WHERE queue_name = ? AND status = ?
-               AND (application_version = ? OR application_version = '')
+               AND (application_version = ? OR application_version = ''){part_clause}
              ORDER BY priority ASC, created_at ASC
-             LIMIT ?",
-        )
-        .bind(&req.queue_name)
-        .bind(STATUS_ENQUEUED)
-        .bind(&req.app_version)
-        .bind(max_tasks)
-        .fetch_all(&mut *tx)
-        .await?;
+             LIMIT ?"
+        );
+        let mut q = sqlx::query_scalar(&sql)
+            .bind(&req.queue_name)
+            .bind(STATUS_ENQUEUED)
+            .bind(&req.app_version);
+        if let Some(p) = part {
+            q = q.bind(p);
+        }
+        let ids: Vec<String> = q.bind(max_tasks).fetch_all(&mut *tx).await?;
 
         let rate_limited = req.rate_limit_max.is_some();
         let mut claimed = Vec::with_capacity(ids.len());
@@ -354,6 +373,18 @@ impl StateProvider for SqliteProvider {
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected())
+    }
+
+    async fn queue_partitions(&self, queue_name: &str) -> Result<Vec<String>> {
+        let keys: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT queue_partition_key FROM workflow_status
+             WHERE queue_name = ? AND status = ? AND queue_partition_key IS NOT NULL",
+        )
+        .bind(queue_name)
+        .bind(STATUS_ENQUEUED)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(keys)
     }
 
     async fn insert_notification(

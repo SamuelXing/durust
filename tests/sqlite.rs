@@ -677,3 +677,54 @@ async fn sqlite_queues_only_filter() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// A partitioned queue persists each workflow's partition key and dispatches
+/// every active partition independently.
+#[tokio::test]
+async fn sqlite_partitioned_queue_dispatch() -> Result<()> {
+    let (url, path) = temp_db_url("partition");
+
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("echo", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n)
+    });
+    engine.register_queue(
+        WorkflowQueue::new("pq")
+            .partitioned()
+            .base_polling_interval(Duration::from_millis(10)),
+    );
+    engine.launch().await?;
+
+    let mut a = engine
+        .enqueue::<_, i64>(
+            "pq",
+            "echo",
+            1_i64,
+            WorkflowOptions::with_id("a").partition_key("east"),
+        )
+        .await?;
+    let mut b = engine
+        .enqueue::<_, i64>(
+            "pq",
+            "echo",
+            2_i64,
+            WorkflowOptions::with_id("b").partition_key("west"),
+        )
+        .await?;
+    assert_eq!(a.get_result().await?, 1);
+    assert_eq!(b.get_result().await?, 2);
+
+    // The partition key round-trips through the workflow_status row.
+    assert_eq!(
+        a.get_status().await?.queue_partition_key.as_deref(),
+        Some("east")
+    );
+    assert_eq!(
+        b.get_status().await?.queue_partition_key.as_deref(),
+        Some("west")
+    );
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
