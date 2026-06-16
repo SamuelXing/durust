@@ -846,4 +846,8 @@ fn push_list_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a ListFilt
         clause(qb);
         qb.push("created_at <= ").push_bind(t);
     }
+    if filter.queues_only {
+        clause(qb);
+        qb.push("queue_name IS NOT NULL");
+    }
 }

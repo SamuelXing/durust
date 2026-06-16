@@ -196,6 +196,9 @@ pub struct ListFilter {
     pub offset: Option<i64>,
     /// Sort by `created_at` descending instead of ascending.
     pub sort_desc: bool,
+    /// Return only workflows that are (or were) on a queue — those with a
+    /// non-null `queue_name`.
+    pub queues_only: bool,
 }
 
 /// One recorded operation of a workflow.
