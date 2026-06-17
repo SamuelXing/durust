@@ -406,6 +406,76 @@ impl StateProvider for InMemoryProvider {
         Ok(true)
     }
 
+    async fn cancel_workflows(&self, ids: &[String]) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        let now = Utc::now();
+        for id in ids {
+            if let Some(row) = g.workflows.get_mut(id) {
+                if !is_terminal(&row.status) {
+                    row.status = STATUS_CANCELLED.to_string();
+                    row.completed_at_ms = Some(now.timestamp_millis());
+                    row.started_at_ms = None;
+                    row.queue_name = None;
+                    row.dedup_id = None;
+                    row.updated_at = now;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn resume_workflows(&self, ids: &[String]) -> Result<Vec<String>> {
+        let mut g = self.inner.lock().await;
+        let now = Utc::now();
+        let mut resumed = Vec::new();
+        for id in ids {
+            let Some(row) = g.workflows.get_mut(id) else {
+                continue;
+            };
+            // Same gate as resume_workflow: skip only SUCCESS/ERROR.
+            if is_terminal(&row.status) && row.status != STATUS_CANCELLED {
+                continue;
+            }
+            row.status = STATUS_PENDING.to_string();
+            row.recovery_attempts = 0;
+            row.deadline_ms = None;
+            row.dedup_id = None;
+            row.started_at_ms = None;
+            row.completed_at_ms = None;
+            row.updated_at = now;
+            resumed.push(id.clone());
+        }
+        Ok(resumed)
+    }
+
+    async fn delete_workflows(&self, ids: &[String], delete_children: bool) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        let mut targets: Vec<String> = ids.to_vec();
+        if delete_children {
+            // Breadth-first over parent_workflow_id, mirroring the SQL backends'
+            // recursive descendant collection.
+            let mut i = 0;
+            while i < targets.len() {
+                let parent = targets[i].clone();
+                i += 1;
+                for (cid, row) in g.workflows.iter() {
+                    if row.parent_workflow_id.as_deref() == Some(parent.as_str())
+                        && !targets.contains(cid)
+                    {
+                        targets.push(cid.clone());
+                    }
+                }
+            }
+        }
+        for id in &targets {
+            g.workflows.remove(id);
+            g.steps.retain(|(wf, _), _| wf != id);
+            g.streams.retain(|(wf, _), _| wf != id);
+            g.notifications.retain(|n| &n.destination_id != id);
+        }
+        Ok(())
+    }
+
     async fn fork_workflow(
         &self,
         original_id: &str,

@@ -607,6 +607,48 @@ impl DurableEngine {
         ))
     }
 
+    /// Cancel many workflows in one round-trip. Each that exists and is not
+    /// terminal is set `CANCELLED` and removed from its queue; missing or
+    /// already-terminal ids are silently skipped (no error). An empty slice is a
+    /// no-op.
+    pub async fn cancel_workflows(&self, ids: &[String]) -> Result<()> {
+        self.provider.cancel_workflows(ids).await
+    }
+
+    /// Resume many workflows in one round-trip. Each that exists and is not
+    /// `SUCCESS`/`ERROR` returns to `PENDING` and is re-dispatched here; the
+    /// returned handles track exactly those runs (skipped ids yield no handle, so
+    /// the result may be shorter than `ids`).
+    pub async fn resume_workflows<O>(&self, ids: &[String]) -> Result<Vec<WorkflowHandle<O>>> {
+        let resumed = self.provider.resume_workflows(ids).await?;
+        let rt = self.runtime();
+        let mut handles = Vec::with_capacity(resumed.len());
+        for id in resumed {
+            let row = self
+                .provider
+                .get_workflow_status(&id)
+                .await?
+                .ok_or_else(|| Error::UnknownWorkflow(id.clone()))?;
+            let handler = rt
+                .workflows
+                .get(&row.name)
+                .cloned()
+                .ok_or_else(|| Error::UnknownWorkflow(row.name.clone()))?;
+            let auth = AuthContext::from_status(&row);
+            let join = rt.spawn_owned(id.clone(), handler, row.input, row.deadline_ms, auth);
+            handles.push(WorkflowHandle::local(id, self.provider.clone(), join));
+        }
+        Ok(handles)
+    }
+
+    /// Delete many workflows and (via `ON DELETE CASCADE`) their step / event /
+    /// stream rows, regardless of state. When `delete_children`, every descendant
+    /// by `parent_workflow_id` (transitively) is deleted too. Missing ids are
+    /// skipped. An empty slice is a no-op.
+    pub async fn delete_workflows(&self, ids: &[String], delete_children: bool) -> Result<()> {
+        self.provider.delete_workflows(ids, delete_children).await
+    }
+
     /// Fork a workflow from `start_step`. Creates a new workflow that reuses the
     /// original's checkpoints for steps `< start_step` and re-executes from
     /// there. The new id comes from `opts.workflow_id` or is generated; the
