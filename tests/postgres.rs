@@ -367,3 +367,54 @@ async fn pg_typed_db_errors() -> Result<()> {
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
+
+/// A partitioned queue persists the partition key and dispatches each partition
+/// independently through Postgres.
+#[tokio::test]
+async fn pg_partitioned_queue_dispatch() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_partitioned_queue_dispatch: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+
+    let provider = PostgresProvider::connect(&url).await?;
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    engine.register("echo", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n)
+    });
+    engine.register_queue(
+        WorkflowQueue::new("pq")
+            .partitioned()
+            .base_polling_interval(Duration::from_millis(10)),
+    );
+    engine.launch().await?;
+
+    let east = format!("east-{tag}");
+    let west = format!("west-{tag}");
+    let mut a = engine
+        .enqueue::<_, i64>(
+            "pq",
+            "echo",
+            1_i64,
+            WorkflowOptions::with_id(&east).partition_key("east"),
+        )
+        .await?;
+    let mut b = engine
+        .enqueue::<_, i64>(
+            "pq",
+            "echo",
+            2_i64,
+            WorkflowOptions::with_id(&west).partition_key("west"),
+        )
+        .await?;
+    assert_eq!(a.get_result().await?, 1);
+    assert_eq!(b.get_result().await?, 2);
+    assert_eq!(
+        a.get_status().await?.queue_partition_key.as_deref(),
+        Some("east")
+    );
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}

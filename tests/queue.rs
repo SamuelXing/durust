@@ -289,7 +289,7 @@ async fn listen_queues_dispatches_only_listened() -> Result<()> {
     assert_eq!(run.get_result().await?, 42);
 
     // The ignored queue accepts the enqueue but never dispatches it here.
-    let mut idle = engine
+    let idle = engine
         .enqueue::<_, i64>("ignored", "add_one", 1_i64, WorkflowOptions::default())
         .await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -336,6 +336,78 @@ async fn queues_only_filters_to_queued_workflows() -> Result<()> {
         .map(|w| w.id)
         .collect();
     assert_eq!(queued, vec!["queued".to_string()]);
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// A partitioned queue applies worker concurrency *per partition*: with a limit
+/// of 1 and two active partitions, one workflow from each runs at once, so two
+/// run concurrently overall.
+#[tokio::test]
+async fn partitioned_queue_concurrency_is_per_partition() -> Result<()> {
+    static CURRENT: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("work", |ctx: DurableContext, _: ()| async move {
+        let now = CURRENT.fetch_add(1, Ordering::SeqCst) + 1;
+        PEAK.fetch_max(now, Ordering::SeqCst);
+        ctx.sleep(Duration::from_millis(80)).await?;
+        CURRENT.fetch_sub(1, Ordering::SeqCst);
+        Ok::<_, Error>(())
+    });
+    engine.register_queue(test_queue("pq").partitioned().worker_concurrency(1));
+    engine.launch().await?;
+
+    // Two workflows in each of two partitions.
+    let mut handles = Vec::new();
+    for part in ["a", "a", "b", "b"] {
+        handles.push(
+            engine
+                .enqueue::<_, ()>(
+                    "pq",
+                    "work",
+                    (),
+                    WorkflowOptions::default().partition_key(part),
+                )
+                .await?,
+        );
+    }
+    for h in &mut handles {
+        h.get_result().await?;
+    }
+
+    assert_eq!(
+        PEAK.load(Ordering::SeqCst),
+        2,
+        "each partition runs one at a time, but the two partitions run in parallel"
+    );
+
+    engine.shutdown(Duration::from_secs(2)).await?;
+    Ok(())
+}
+
+/// A workflow enqueued to a partitioned queue without a partition key is never
+/// dispatched (partition discovery only sees keyed rows).
+#[tokio::test]
+async fn partitioned_queue_ignores_keyless_enqueue() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(())
+    });
+    engine.register_queue(test_queue("pq").partitioned());
+    engine.launch().await?;
+
+    let idle = engine
+        .enqueue::<_, ()>("pq", "noop", (), WorkflowOptions::default())
+        .await?;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        idle.get_status().await?.status,
+        STATUS_ENQUEUED,
+        "no partition key means nothing dispatches it"
+    );
 
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())

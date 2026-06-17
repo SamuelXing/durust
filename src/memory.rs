@@ -149,6 +149,13 @@ impl StateProvider for InMemoryProvider {
 
         let mut max_tasks = req.max_tasks;
 
+        // For a partitioned queue every count is scoped to one partition key;
+        // for a non-partitioned queue (`None`) all of the queue's rows match.
+        let in_partition = |w: &WorkflowStatus| {
+            req.partition_key.is_none()
+                || w.queue_partition_key.as_deref() == req.partition_key.as_deref()
+        };
+
         // Rate limiter: count rate-limited starts within the trailing window.
         if let (Some(limit), Some(period_ms)) = (req.rate_limit_max, req.rate_limit_period_ms) {
             let cutoff = now_ms - period_ms;
@@ -157,6 +164,7 @@ impl StateProvider for InMemoryProvider {
                 .values()
                 .filter(|w| {
                     w.queue_name.as_deref() == Some(req.queue_name.as_str())
+                        && in_partition(w)
                         && w.rate_limited
                         && w.status != STATUS_ENQUEUED
                         && w.status != STATUS_DELAYED
@@ -173,6 +181,7 @@ impl StateProvider for InMemoryProvider {
                 .values()
                 .filter(|w| {
                     w.queue_name.as_deref() == Some(req.queue_name.as_str())
+                        && in_partition(w)
                         && w.status == STATUS_PENDING
                 })
                 .count() as i64;
@@ -189,6 +198,7 @@ impl StateProvider for InMemoryProvider {
             .values()
             .filter(|w| {
                 w.queue_name.as_deref() == Some(req.queue_name.as_str())
+                    && in_partition(w)
                     && w.status == STATUS_ENQUEUED
                     && (w.app_version.is_empty() || w.app_version == req.app_version)
             })
@@ -227,6 +237,19 @@ impl StateProvider for InMemoryProvider {
             }
         }
         Ok(n)
+    }
+
+    async fn queue_partitions(&self, queue_name: &str) -> Result<Vec<String>> {
+        let g = self.inner.lock().await;
+        let mut keys: Vec<String> = g
+            .workflows
+            .values()
+            .filter(|w| w.queue_name.as_deref() == Some(queue_name) && w.status == STATUS_ENQUEUED)
+            .filter_map(|w| w.queue_partition_key.clone())
+            .collect();
+        keys.sort();
+        keys.dedup();
+        Ok(keys)
     }
 
     async fn insert_notification(

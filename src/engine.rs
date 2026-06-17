@@ -83,6 +83,11 @@ pub struct WorkflowOptions {
     pub queue: Option<String>,
     /// Dispatch priority within a queue; lower runs first.
     pub priority: i32,
+    /// Partition key for a partitioned queue (see
+    /// [`WorkflowQueue::partitioned`](crate::WorkflowQueue::partitioned)). Each
+    /// partition gets its own concurrency / rate-limit budget. Ignored by
+    /// non-partitioned queues and direct runs.
+    pub partition_key: Option<String>,
     /// Wall-clock deadline for the whole workflow.
     pub timeout: Option<Duration>,
     /// Delay before the workflow becomes eligible to run (queued workflows
@@ -115,6 +120,12 @@ impl WorkflowOptions {
     /// Set the role assumed for this run.
     pub fn assumed_role(mut self, role: impl Into<String>) -> Self {
         self.assumed_role = Some(role.into());
+        self
+    }
+
+    /// Set the partition key for a partitioned queue.
+    pub fn partition_key(mut self, key: impl Into<String>) -> Self {
+        self.partition_key = Some(key.into());
         self
     }
 
@@ -756,6 +767,7 @@ impl Runtime {
             WorkflowStatus::new(id, name, input_json, status, executor, &self.app_version);
         row.queue_name = opts.queue.clone();
         row.priority = opts.priority;
+        row.queue_partition_key = opts.partition_key.clone();
         row.dedup_id = opts.dedup_id.clone();
         row.parent_workflow_id = parent_id.map(|s| s.to_string());
         row.authenticated_user = auth.authenticated_user.clone();
@@ -858,6 +870,10 @@ impl Drop for InflightGuard {
 /// claim. The polling
 /// interval backs off exponentially on dequeue errors, scales back toward the
 /// base on success, and is jittered so multiple executors don't poll in step.
+///
+/// For a partitioned queue, each iteration claims from every active partition
+/// independently — worker concurrency is tracked per partition, and the DB-side
+/// global/rate limits are scoped to the partition (see [`DequeueRequest`]).
 async fn queue_dispatch_loop(
     queue: Arc<WorkflowQueue>,
     rt: Arc<Runtime>,
@@ -867,7 +883,8 @@ async fn queue_dispatch_loop(
     let executor_id = rt.executor_id.clone();
     let app_version = rt.app_version.clone();
     let inflight = rt.inflight.clone();
-    let local_running = Arc::new(AtomicUsize::new(0));
+    // Local running count per partition key (`""` for a non-partitioned queue).
+    let local_running: std::sync::Mutex<HashMap<String, Arc<AtomicUsize>>> = Default::default();
     let mut interval = queue.base_polling_interval;
 
     loop {
@@ -880,21 +897,48 @@ async fn queue_dispatch_loop(
             tracing::warn!(queue = %queue.name, error = %e, "failed to transition delayed workflows");
         }
 
-        // Worker concurrency is enforced here, against this process's running
-        // count; the DB-side checks handle the cross-executor limits.
-        let local = local_running.load(Ordering::Relaxed);
-        let max_tasks = (match queue.worker_concurrency {
-            Some(wc) => wc.saturating_sub(local),
-            None => queue.max_tasks_per_iteration,
-        })
-        .min(queue.max_tasks_per_iteration) as i64;
-
         let mut had_error = false;
-        if max_tasks > 0 {
+
+        // The partitions to claim from this iteration: each active key for a
+        // partitioned queue, or a single unscoped pass otherwise.
+        let partition_keys: Vec<Option<String>> = if queue.partitioned {
+            match provider.queue_partitions(&queue.name).await {
+                Ok(keys) => keys.into_iter().map(Some).collect(),
+                Err(e) => {
+                    had_error = true;
+                    tracing::warn!(queue = %queue.name, error = %e, "listing partitions failed; backing off");
+                    Vec::new()
+                }
+            }
+        } else {
+            vec![None]
+        };
+
+        for pkey in partition_keys {
+            // Worker concurrency is enforced here, against this process's running
+            // count for the partition; the DB-side checks handle cross-executor
+            // limits.
+            let counter = {
+                let mut map = local_running.lock().expect("local running lock poisoned");
+                map.entry(pkey.clone().unwrap_or_default())
+                    .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+                    .clone()
+            };
+            let local = counter.load(Ordering::Relaxed);
+            let max_tasks = (match queue.worker_concurrency {
+                Some(wc) => wc.saturating_sub(local),
+                None => queue.max_tasks_per_iteration,
+            })
+            .min(queue.max_tasks_per_iteration) as i64;
+
+            if max_tasks <= 0 {
+                continue;
+            }
             let req = DequeueRequest {
                 queue_name: queue.name.clone(),
                 executor_id: executor_id.clone(),
                 app_version: app_version.clone(),
+                partition_key: pkey.clone(),
                 max_tasks,
                 global_concurrency: queue.global_concurrency,
                 rate_limit_max: queue.rate_limit.as_ref().map(|r| r.limit),
@@ -915,10 +959,10 @@ async fn queue_dispatch_loop(
                             continue;
                         };
                         inflight.fetch_add(1, Ordering::Relaxed);
-                        local_running.fetch_add(1, Ordering::Relaxed);
+                        counter.fetch_add(1, Ordering::Relaxed);
                         let rt = rt.clone();
                         let inflight_guard = InflightGuard(inflight.clone());
-                        let local_guard = InflightGuard(local_running.clone());
+                        let local_guard = InflightGuard(counter.clone());
                         let auth = AuthContext::from_status(&wf);
                         tokio::spawn(async move {
                             let _inflight = inflight_guard;
