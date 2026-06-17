@@ -629,6 +629,20 @@ impl StateProvider for SqliteProvider {
         Ok(())
     }
 
+    async fn set_workflow_delay(&self, id: &str, delay_until_ms: i64) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE workflow_status SET delay_until_epoch_ms = ?, updated_at = ?
+             WHERE workflow_uuid = ? AND status = ?",
+        )
+        .bind(delay_until_ms)
+        .bind(Utc::now().timestamp_millis())
+        .bind(id)
+        .bind(STATUS_DELAYED)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     async fn fork_workflow(
         &self,
         original_id: &str,

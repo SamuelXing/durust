@@ -476,6 +476,18 @@ impl StateProvider for InMemoryProvider {
         Ok(())
     }
 
+    async fn set_workflow_delay(&self, id: &str, delay_until_ms: i64) -> Result<bool> {
+        let mut g = self.inner.lock().await;
+        if let Some(row) = g.workflows.get_mut(id) {
+            if row.status == STATUS_DELAYED {
+                row.delay_until_ms = Some(delay_until_ms);
+                row.updated_at = Utc::now();
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     async fn fork_workflow(
         &self,
         original_id: &str,

@@ -389,6 +389,12 @@ pub trait StateProvider: Send + Sync {
     /// skipped. An empty slice is a no-op.
     async fn delete_workflows(&self, ids: &[String], delete_children: bool) -> Result<()>;
 
+    /// Reschedule a `DELAYED` workflow: set its `delay_until` to
+    /// `delay_until_ms`. Only affects a row currently in `DELAYED` (a queue
+    /// dispatcher promotes it to `ENQUEUED` once due); anything else is a no-op.
+    /// Returns whether a row was updated.
+    async fn set_workflow_delay(&self, id: &str, delay_until_ms: i64) -> Result<bool>;
+
     /// Create `new_id` as a fork of `original_id`: a fresh `PENDING` workflow
     /// with the same name/input, `forked_from = original_id`, and the original's
     /// step checkpoints with `seq < start_step` copied in so execution resumes

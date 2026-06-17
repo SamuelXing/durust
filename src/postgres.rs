@@ -647,6 +647,20 @@ impl StateProvider for PostgresProvider {
         Ok(())
     }
 
+    async fn set_workflow_delay(&self, id: &str, delay_until_ms: i64) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE workflow_status SET delay_until_epoch_ms = $2, updated_at = $3
+             WHERE workflow_uuid = $1 AND status = $4",
+        )
+        .bind(id)
+        .bind(delay_until_ms)
+        .bind(Utc::now().timestamp_millis())
+        .bind(STATUS_DELAYED)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     async fn fork_workflow(
         &self,
         original_id: &str,

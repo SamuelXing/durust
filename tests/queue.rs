@@ -157,6 +157,53 @@ async fn delayed_enqueue_waits_then_runs() -> Result<()> {
     Ok(())
 }
 
+/// set_workflow_delay reschedules a DELAYED workflow: a far-future delay is
+/// shortened so the workflow runs almost immediately. Non-DELAYED workflows are
+/// a no-op (returns false, no error).
+#[tokio::test]
+async fn set_workflow_delay_reschedules() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("echo", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n)
+    });
+    engine.register_queue(test_queue("resched"));
+    engine.launch().await?;
+
+    // Enqueue with a 60s delay so it would never run during the test...
+    let mut opts = WorkflowOptions::with_id("wf-resched");
+    opts.delay = Some(Duration::from_secs(60));
+    let mut handle = engine
+        .enqueue::<_, i64>("resched", "echo", 9_i64, opts)
+        .await?;
+    assert_eq!(handle.get_status().await?.status, STATUS_DELAYED);
+
+    // ...then pull it forward to ~20ms from now.
+    let started = Instant::now();
+    assert!(
+        engine
+            .set_workflow_delay("wf-resched", Duration::from_millis(20))
+            .await?,
+        "rescheduling a DELAYED workflow must report a match"
+    );
+    assert_eq!(handle.get_result().await?, 9);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the workflow must run on the shortened delay, not the original 60s"
+    );
+
+    // The now-completed workflow is no longer DELAYED: a further reschedule is a
+    // silent no-op. A missing id likewise.
+    assert!(
+        !engine
+            .set_workflow_delay("wf-resched", Duration::ZERO)
+            .await?
+    );
+    assert!(!engine.set_workflow_delay("ghost", Duration::ZERO).await?);
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
 /// Delay without a queue is rejected.
 #[tokio::test]
 async fn delay_requires_queue() -> Result<()> {

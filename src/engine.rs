@@ -649,6 +649,30 @@ impl DurableEngine {
         self.provider.delete_workflows(ids, delete_children).await
     }
 
+    /// Reschedule a `DELAYED` workflow to become eligible `delay` from now. Only
+    /// affects a workflow currently `DELAYED` (e.g. enqueued with
+    /// [`WorkflowOptions::delay`]); the queue dispatcher promotes it once due.
+    /// Returns `false` (no error) if no `DELAYED` row matched. See
+    /// [`set_workflow_delay_until`](Self::set_workflow_delay_until) for an
+    /// absolute time.
+    pub async fn set_workflow_delay(&self, id: &str, delay: Duration) -> Result<bool> {
+        let until = chrono::Utc::now().timestamp_millis() + delay.as_millis() as i64;
+        self.provider.set_workflow_delay(id, until).await
+    }
+
+    /// Reschedule a `DELAYED` workflow to become eligible at the absolute time
+    /// `at`. Like [`set_workflow_delay`](Self::set_workflow_delay) but with a
+    /// fixed instant rather than an offset from now.
+    pub async fn set_workflow_delay_until(
+        &self,
+        id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        self.provider
+            .set_workflow_delay(id, at.timestamp_millis())
+            .await
+    }
+
     /// Fork a workflow from `start_step`. Creates a new workflow that reuses the
     /// original's checkpoints for steps `< start_step` and re-executes from
     /// there. The new id comes from `opts.workflow_id` or is generated; the

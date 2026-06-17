@@ -712,6 +712,46 @@ async fn sqlite_bulk_ops() -> Result<()> {
     Ok(())
 }
 
+/// set_workflow_delay reschedules a DELAYED workflow through SQLite: a far-future
+/// delay is shortened so the dispatcher runs it promptly; a non-DELAYED row is a
+/// no-op.
+#[tokio::test]
+async fn sqlite_set_workflow_delay() -> Result<()> {
+    use durust::STATUS_DELAYED;
+    let (url, path) = temp_db_url("set-delay");
+
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("echo", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n)
+    });
+    engine.register_queue(WorkflowQueue::new("d").base_polling_interval(Duration::from_millis(10)));
+    engine.launch().await?;
+
+    let mut opts = WorkflowOptions::with_id("wf-d");
+    opts.delay = Some(Duration::from_secs(60));
+    let mut handle = engine.enqueue::<_, i64>("d", "echo", 5_i64, opts).await?;
+    assert_eq!(handle.get_status().await?.status, STATUS_DELAYED);
+
+    let started = std::time::Instant::now();
+    assert!(
+        engine
+            .set_workflow_delay("wf-d", Duration::from_millis(20))
+            .await?
+    );
+    assert_eq!(handle.get_result().await?, 5);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "must run on the shortened delay, not the original 60s"
+    );
+
+    // Completed → no longer DELAYED → silent no-op.
+    assert!(!engine.set_workflow_delay("wf-d", Duration::ZERO).await?);
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 /// `queues_only` is enforced in SQL: only workflows with a non-null queue_name
 /// come back.
 #[tokio::test]

@@ -564,3 +564,49 @@ async fn pg_partitioned_queue_dispatch() -> Result<()> {
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
+
+/// set_workflow_delay reschedules a DELAYED workflow through Postgres: a
+/// far-future delay is shortened so the dispatcher runs it promptly; a
+/// non-DELAYED row is a no-op.
+#[tokio::test]
+async fn pg_set_workflow_delay() -> Result<()> {
+    use durust::STATUS_DELAYED;
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_set_workflow_delay: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let wid = format!("wf-delay-{tag}");
+
+    let provider = PostgresProvider::connect(&url).await?;
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    engine.register("echo", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n)
+    });
+    engine
+        .register_queue(WorkflowQueue::new("dq").base_polling_interval(Duration::from_millis(10)));
+    engine.launch().await?;
+
+    let mut opts = WorkflowOptions::with_id(&wid);
+    opts.delay = Some(Duration::from_secs(60));
+    let mut handle = engine.enqueue::<_, i64>("dq", "echo", 8_i64, opts).await?;
+    assert_eq!(handle.get_status().await?.status, STATUS_DELAYED);
+
+    let started = std::time::Instant::now();
+    assert!(
+        engine
+            .set_workflow_delay(&wid, Duration::from_millis(20))
+            .await?
+    );
+    assert_eq!(handle.get_result().await?, 8);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "must run on the shortened delay, not the original 60s"
+    );
+
+    // Completed → no longer DELAYED → silent no-op.
+    assert!(!engine.set_workflow_delay(&wid, Duration::ZERO).await?);
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
