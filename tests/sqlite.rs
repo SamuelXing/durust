@@ -642,6 +642,76 @@ async fn sqlite_management() -> Result<()> {
     Ok(())
 }
 
+/// Bulk cancel / resume / delete through SQLite: exercises the `IN (...)` lists,
+/// the `RETURNING` resume, and the recursive-CTE child delete (with FK cascade).
+#[tokio::test]
+async fn sqlite_bulk_ops() -> Result<()> {
+    use durust::{StateProvider, WorkflowStatus, STATUS_PENDING};
+    let (url, path) = temp_db_url("bulk");
+
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(())
+    });
+    let provider = SqliteProvider::connect(&url).await?;
+
+    let seed = |id: &str, status: &str, parent: Option<&str>| {
+        let mut s = WorkflowStatus::new(id, "noop", serde_json::Value::Null, status, "", "0.1.0");
+        s.parent_workflow_id = parent.map(|p| p.to_string());
+        s
+    };
+
+    for id in ["wf-1", "wf-2", "wf-3"] {
+        provider
+            .insert_workflow_status(seed(id, STATUS_PENDING, None))
+            .await?;
+    }
+
+    // Bulk cancel a subset + a missing id (skipped, no error).
+    engine
+        .cancel_workflows(&["wf-1".into(), "wf-2".into(), "ghost".into()])
+        .await?;
+    assert_eq!(
+        provider.get_workflow_status("wf-1").await?.unwrap().status,
+        STATUS_CANCELLED
+    );
+    assert_eq!(
+        provider.get_workflow_status("wf-3").await?.unwrap().status,
+        STATUS_PENDING
+    );
+
+    // Bulk resume returns a handle per transitioned id; they run to completion.
+    let handles = engine
+        .resume_workflows::<()>(&["wf-1".into(), "wf-2".into()])
+        .await?;
+    assert_eq!(handles.len(), 2);
+    for mut h in handles {
+        h.get_result().await?;
+    }
+    assert_eq!(
+        provider.get_workflow_status("wf-1").await?.unwrap().status,
+        STATUS_SUCCESS
+    );
+
+    // Recursive delete: parent → child → grandchild.
+    provider
+        .insert_workflow_status(seed("p", STATUS_SUCCESS, None))
+        .await?;
+    provider
+        .insert_workflow_status(seed("c", STATUS_SUCCESS, Some("p")))
+        .await?;
+    provider
+        .insert_workflow_status(seed("gc", STATUS_SUCCESS, Some("c")))
+        .await?;
+    engine.delete_workflows(&["p".into()], true).await?;
+    assert!(provider.get_workflow_status("p").await?.is_none());
+    assert!(provider.get_workflow_status("c").await?.is_none());
+    assert!(provider.get_workflow_status("gc").await?.is_none());
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 /// `queues_only` is enforced in SQL: only workflows with a non-null queue_name
 /// come back.
 #[tokio::test]

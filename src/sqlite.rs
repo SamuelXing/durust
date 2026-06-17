@@ -2,7 +2,8 @@ use crate::error::Result;
 use crate::provider::{
     decode_roles, dedup_or, encode_roles, is_terminal, nonexistent_or, DequeueRequest, ListFilter,
     StateProvider, StepInfo, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
-    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STREAM_CLOSED_SENTINEL,
+    STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
+    STREAM_CLOSED_SENTINEL,
 };
 use crate::serialize::{self, Serializer};
 use async_trait::async_trait;
@@ -554,6 +555,80 @@ impl StateProvider for SqliteProvider {
         Ok(res.rows_affected() > 0)
     }
 
+    async fn cancel_workflows(&self, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now().timestamp_millis();
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new("UPDATE workflow_status SET status = ");
+        qb.push_bind(STATUS_CANCELLED)
+            .push(", completed_at = ")
+            .push_bind(now)
+            .push(", started_at_epoch_ms = NULL, queue_name = NULL, deduplication_id = NULL, updated_at = ")
+            .push_bind(now)
+            .push(" WHERE workflow_uuid IN (");
+        push_bind_list(&mut qb, ids);
+        qb.push(") AND status NOT IN (");
+        push_bind_list(&mut qb, &[STATUS_SUCCESS, STATUS_ERROR, STATUS_CANCELLED]);
+        qb.push(")");
+        qb.build().execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn resume_workflows(&self, ids: &[String]) -> Result<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = Utc::now().timestamp_millis();
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new("UPDATE workflow_status SET status = ");
+        qb.push_bind(STATUS_PENDING)
+            .push(", recovery_attempts = 0, workflow_deadline_epoch_ms = NULL, deduplication_id = NULL, started_at_epoch_ms = NULL, completed_at = NULL, updated_at = ")
+            .push_bind(now)
+            .push(" WHERE workflow_uuid IN (");
+        push_bind_list(&mut qb, ids);
+        qb.push(") AND status NOT IN (");
+        push_bind_list(&mut qb, &[STATUS_SUCCESS, STATUS_ERROR]);
+        qb.push(") RETURNING workflow_uuid");
+        let resumed = qb
+            .build_query_scalar::<String>()
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(resumed)
+    }
+
+    async fn delete_workflows(&self, ids: &[String], delete_children: bool) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        // ON DELETE CASCADE removes each workflow's step / event / stream rows.
+        let mut qb: QueryBuilder<Sqlite> = if delete_children {
+            let mut qb = QueryBuilder::new(
+                "WITH RECURSIVE targets AS (
+                     SELECT workflow_uuid FROM workflow_status WHERE workflow_uuid IN (",
+            );
+            push_bind_list(&mut qb, ids);
+            qb.push(
+                ")
+                     UNION
+                     SELECT w.workflow_uuid FROM workflow_status w
+                       JOIN targets t ON w.parent_workflow_id = t.workflow_uuid
+                 )
+                 DELETE FROM workflow_status
+                 WHERE workflow_uuid IN (SELECT workflow_uuid FROM targets)",
+            );
+            qb
+        } else {
+            let mut qb = QueryBuilder::new("DELETE FROM workflow_status WHERE workflow_uuid IN (");
+            push_bind_list(&mut qb, ids);
+            qb.push(")");
+            qb
+        };
+        qb.build().execute(&self.pool).await?;
+        Ok(())
+    }
+
     async fn fork_workflow(
         &self,
         original_id: &str,
@@ -820,6 +895,15 @@ fn row_to_step(row: &sqlx::sqlite::SqliteRow) -> Result<StepInfo> {
 }
 
 /// Append the WHERE clause shared by `list_workflows` (SQLite dialect).
+/// Push a comma-separated `?, ?, …` of bound values for an `IN (...)` clause.
+/// Values are bound as owned `String`s so the list need not outlive the builder.
+fn push_bind_list<T: AsRef<str>>(qb: &mut QueryBuilder<'_, Sqlite>, items: &[T]) {
+    let mut sep = qb.separated(", ");
+    for it in items {
+        sep.push_bind(it.as_ref().to_owned());
+    }
+}
+
 fn push_list_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a ListFilter) {
     let mut sep = " WHERE ";
     let mut clause = |qb: &mut QueryBuilder<'a, Sqlite>| {

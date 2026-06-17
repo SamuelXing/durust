@@ -425,6 +425,95 @@ async fn pg_global_concurrency_caps_running() -> Result<()> {
     Ok(())
 }
 
+/// Bulk cancel / resume / delete through Postgres: exercises the `ANY($1)`
+/// statements, the `RETURNING` resume, and the recursive-CTE child delete (with
+/// FK cascade).
+#[tokio::test]
+async fn pg_bulk_ops() -> Result<()> {
+    use durust::{STATUS_CANCELLED, STATUS_SUCCESS};
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_bulk_ops: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let id = |s: &str| format!("{s}-{tag}");
+
+    let provider = PostgresProvider::connect(&url).await?;
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(())
+    });
+    let provider = PostgresProvider::connect(&url).await?;
+
+    let seed = |wid: String, status: &str, parent: Option<String>| {
+        let mut s = WorkflowStatus::new(wid, "noop", serde_json::Value::Null, status, "", "0.1.0");
+        s.parent_workflow_id = parent;
+        s
+    };
+
+    for s in ["wf-1", "wf-2", "wf-3"] {
+        provider
+            .insert_workflow_status(seed(id(s), STATUS_PENDING, None))
+            .await?;
+    }
+
+    // Bulk cancel a subset + a missing id (skipped, no error).
+    engine
+        .cancel_workflows(&[id("wf-1"), id("wf-2"), id("ghost")])
+        .await?;
+    assert_eq!(
+        provider
+            .get_workflow_status(&id("wf-1"))
+            .await?
+            .unwrap()
+            .status,
+        STATUS_CANCELLED
+    );
+    assert_eq!(
+        provider
+            .get_workflow_status(&id("wf-3"))
+            .await?
+            .unwrap()
+            .status,
+        STATUS_PENDING
+    );
+
+    // Bulk resume returns a handle per transitioned id.
+    let handles = engine
+        .resume_workflows::<()>(&[id("wf-1"), id("wf-2")])
+        .await?;
+    assert_eq!(handles.len(), 2);
+    for mut h in handles {
+        h.get_result().await?;
+    }
+    assert_eq!(
+        provider
+            .get_workflow_status(&id("wf-1"))
+            .await?
+            .unwrap()
+            .status,
+        STATUS_SUCCESS
+    );
+
+    // Recursive delete: parent → child → grandchild.
+    provider
+        .insert_workflow_status(seed(id("p"), STATUS_SUCCESS, None))
+        .await?;
+    provider
+        .insert_workflow_status(seed(id("c"), STATUS_SUCCESS, Some(id("p"))))
+        .await?;
+    provider
+        .insert_workflow_status(seed(id("gc"), STATUS_SUCCESS, Some(id("c"))))
+        .await?;
+    engine.delete_workflows(&[id("p")], true).await?;
+    assert!(provider.get_workflow_status(&id("p")).await?.is_none());
+    assert!(provider.get_workflow_status(&id("c")).await?.is_none());
+    assert!(provider.get_workflow_status(&id("gc")).await?.is_none());
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
 /// A partitioned queue persists the partition key and dispatches each partition
 /// independently through Postgres.
 #[tokio::test]

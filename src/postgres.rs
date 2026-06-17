@@ -576,6 +576,77 @@ impl StateProvider for PostgresProvider {
         Ok(res.rows_affected() > 0)
     }
 
+    async fn cancel_workflows(&self, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            "UPDATE workflow_status
+             SET status = $2, completed_at = $3, started_at_epoch_ms = NULL,
+                 queue_name = NULL, deduplication_id = NULL, updated_at = $3
+             WHERE workflow_uuid = ANY($1) AND status NOT IN ($4, $5, $6)",
+        )
+        .bind(ids)
+        .bind(STATUS_CANCELLED)
+        .bind(Utc::now().timestamp_millis())
+        .bind(STATUS_SUCCESS)
+        .bind(STATUS_ERROR)
+        .bind(STATUS_CANCELLED)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn resume_workflows(&self, ids: &[String]) -> Result<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let resumed: Vec<String> = sqlx::query_scalar(
+            "UPDATE workflow_status
+             SET status = $2, recovery_attempts = 0, workflow_deadline_epoch_ms = NULL,
+                 deduplication_id = NULL, started_at_epoch_ms = NULL, completed_at = NULL,
+                 updated_at = $3
+             WHERE workflow_uuid = ANY($1) AND status NOT IN ($4, $5)
+             RETURNING workflow_uuid",
+        )
+        .bind(ids)
+        .bind(STATUS_PENDING)
+        .bind(Utc::now().timestamp_millis())
+        .bind(STATUS_SUCCESS)
+        .bind(STATUS_ERROR)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(resumed)
+    }
+
+    async fn delete_workflows(&self, ids: &[String], delete_children: bool) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        // ON DELETE CASCADE removes each workflow's step / event / stream rows.
+        if delete_children {
+            sqlx::query(
+                "WITH RECURSIVE targets AS (
+                     SELECT workflow_uuid FROM workflow_status WHERE workflow_uuid = ANY($1)
+                     UNION
+                     SELECT w.workflow_uuid FROM workflow_status w
+                       JOIN targets t ON w.parent_workflow_id = t.workflow_uuid
+                 )
+                 DELETE FROM workflow_status
+                 WHERE workflow_uuid IN (SELECT workflow_uuid FROM targets)",
+            )
+            .bind(ids)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query("DELETE FROM workflow_status WHERE workflow_uuid = ANY($1)")
+                .bind(ids)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn fork_workflow(
         &self,
         original_id: &str,

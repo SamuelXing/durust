@@ -265,3 +265,109 @@ async fn cancel_removes_from_queue() -> Result<()> {
     assert_eq!(handle.get_status().await?.queue_name, None);
     Ok(())
 }
+
+/// cancel_workflows / resume_workflows act on many ids at once: non-terminal ids
+/// transition, missing and already-terminal ids are silently skipped, and resume
+/// returns a handle only for each id it actually transitioned.
+#[tokio::test]
+async fn bulk_cancel_and_resume() -> Result<()> {
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(())
+    });
+
+    // Two pending workflows to act on, one pending left untouched, one already
+    // completed.
+    for id in ["wf-1", "wf-2", "wf-3"] {
+        provider
+            .insert_workflow_status(WorkflowStatus::new(
+                id,
+                "noop",
+                serde_json::Value::Null,
+                STATUS_PENDING,
+                "",
+                "0.1.0",
+            ))
+            .await?;
+    }
+    let done: () = engine.start_typed("noop", "wf-done", ()).await?;
+    let _ = done;
+
+    // Cancel a subset plus a missing id and the completed one (both skipped).
+    engine
+        .cancel_workflows(&[
+            "wf-1".into(),
+            "wf-2".into(),
+            "ghost".into(),
+            "wf-done".into(),
+        ])
+        .await?;
+    assert_eq!(status_of(&provider, "wf-1").await, STATUS_CANCELLED);
+    assert_eq!(status_of(&provider, "wf-2").await, STATUS_CANCELLED);
+    assert_eq!(status_of(&provider, "wf-3").await, STATUS_PENDING);
+    assert_eq!(status_of(&provider, "wf-done").await, STATUS_SUCCESS);
+
+    // Resume the two cancelled plus the completed one: only the cancelled pair
+    // transitions, so we get exactly two handles.
+    let handles = engine
+        .resume_workflows::<()>(&["wf-1".into(), "wf-2".into(), "wf-done".into()])
+        .await?;
+    assert_eq!(handles.len(), 2, "completed wf-done must not be resumed");
+    for mut h in handles {
+        h.get_result().await?;
+    }
+    assert_eq!(status_of(&provider, "wf-1").await, STATUS_SUCCESS);
+    assert_eq!(status_of(&provider, "wf-2").await, STATUS_SUCCESS);
+    Ok(())
+}
+
+/// delete_workflows removes rows regardless of state; with delete_children it
+/// also removes descendants by parent lineage, otherwise it leaves them.
+#[tokio::test]
+async fn bulk_delete_with_children() -> Result<()> {
+    let provider = Arc::new(InMemoryProvider::new());
+    let engine = DurableEngine::new(provider.clone()).await?;
+
+    let seed = |id: &str, parent: Option<&str>| {
+        let mut s = WorkflowStatus::new(
+            id,
+            "w",
+            serde_json::Value::Null,
+            STATUS_SUCCESS,
+            "",
+            "0.1.0",
+        );
+        s.parent_workflow_id = parent.map(|p| p.to_string());
+        s
+    };
+
+    // parent → child → grandchild lineage.
+    provider.insert_workflow_status(seed("p", None)).await?;
+    provider
+        .insert_workflow_status(seed("c", Some("p")))
+        .await?;
+    provider
+        .insert_workflow_status(seed("gc", Some("c")))
+        .await?;
+
+    // Without delete_children: only the parent goes.
+    engine.delete_workflows(&["p".into()], false).await?;
+    assert!(provider.get_workflow_status("p").await?.is_none());
+    assert!(provider.get_workflow_status("c").await?.is_some());
+
+    // With delete_children: the whole subtree under c is removed.
+    engine.delete_workflows(&["c".into()], true).await?;
+    assert!(provider.get_workflow_status("c").await?.is_none());
+    assert!(provider.get_workflow_status("gc").await?.is_none());
+    Ok(())
+}
+
+async fn status_of(provider: &Arc<InMemoryProvider>, id: &str) -> String {
+    provider
+        .get_workflow_status(id)
+        .await
+        .unwrap()
+        .unwrap()
+        .status
+}

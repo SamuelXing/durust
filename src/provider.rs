@@ -370,6 +370,25 @@ pub trait StateProvider: Send + Sync {
     /// re-dispatches it.
     async fn resume_workflow(&self, id: &str) -> Result<bool>;
 
+    /// Cancel many workflows in one round-trip. Each existing, non-terminal id is
+    /// set `CANCELLED` (same effect as [`cancel_workflow`](Self::cancel_workflow));
+    /// missing or already-terminal ids are silently skipped (no error). An empty
+    /// slice is a no-op.
+    async fn cancel_workflows(&self, ids: &[String]) -> Result<()>;
+
+    /// Resume many workflows in one round-trip. Each existing id that is not
+    /// `SUCCESS`/`ERROR` returns to `PENDING` (same effect as
+    /// [`resume_workflow`](Self::resume_workflow)). Returns the ids actually
+    /// transitioned, so the caller can re-dispatch exactly those. An empty slice
+    /// returns an empty vec.
+    async fn resume_workflows(&self, ids: &[String]) -> Result<Vec<String>>;
+
+    /// Delete workflows and (via `ON DELETE CASCADE`) their step / event / stream
+    /// rows, regardless of state. When `delete_children`, every descendant by
+    /// `parent_workflow_id` (transitively) is deleted too. Missing ids are
+    /// skipped. An empty slice is a no-op.
+    async fn delete_workflows(&self, ids: &[String], delete_children: bool) -> Result<()>;
+
     /// Create `new_id` as a fork of `original_id`: a fresh `PENDING` workflow
     /// with the same name/input, `forked_from = original_id`, and the original's
     /// step checkpoints with `seq < start_step` copied in so execution resumes
