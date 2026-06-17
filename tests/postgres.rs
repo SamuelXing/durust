@@ -368,6 +368,63 @@ async fn pg_typed_db_errors() -> Result<()> {
     Ok(())
 }
 
+/// Global concurrency caps how many of a queue's workflows run at once, even
+/// under the snapshot-isolation (`REPEATABLE READ` + `FOR UPDATE NOWAIT`) dequeue
+/// path it triggers. With a cap of 1, the observed peak must stay 1.
+#[tokio::test]
+async fn pg_global_concurrency_caps_running() -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CURRENT: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_global_concurrency_caps_running: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+
+    let provider = PostgresProvider::connect(&url).await?;
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    engine.register("track", |ctx: DurableContext, _: ()| async move {
+        let now = CURRENT.fetch_add(1, Ordering::SeqCst) + 1;
+        PEAK.fetch_max(now, Ordering::SeqCst);
+        ctx.sleep(Duration::from_millis(60)).await?;
+        CURRENT.fetch_sub(1, Ordering::SeqCst);
+        Ok::<_, Error>(())
+    });
+    engine.register_queue(
+        WorkflowQueue::new("gc")
+            .global_concurrency(1)
+            .base_polling_interval(Duration::from_millis(10)),
+    );
+    engine.launch().await?;
+
+    let mut handles = Vec::new();
+    for i in 0..4 {
+        handles.push(
+            engine
+                .enqueue::<_, ()>(
+                    "gc",
+                    "track",
+                    (),
+                    WorkflowOptions::with_id(format!("gc-{tag}-{i}")),
+                )
+                .await?,
+        );
+    }
+    for mut h in handles {
+        h.get_result().await?;
+    }
+    assert_eq!(
+        PEAK.load(Ordering::SeqCst),
+        1,
+        "global_concurrency(1) must keep at most one workflow running"
+    );
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
 /// A partitioned queue persists the partition key and dispatches each partition
 /// independently through Postgres.
 #[tokio::test]

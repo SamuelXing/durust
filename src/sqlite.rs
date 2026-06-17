@@ -258,8 +258,13 @@ impl StateProvider for SqliteProvider {
 
     async fn dequeue_workflows(&self, req: &DequeueRequest) -> Result<Vec<WorkflowStatus>> {
         let now_ms = Utc::now().timestamp_millis();
-        // SQLite serializes writers, so a plain transaction gives us the same
-        // claim-once guarantee Postgres gets from FOR UPDATE SKIP LOCKED.
+        // A plain (deferred) transaction suffices for claim-once here: each queue
+        // has a single dispatch loop (one per `launch`), which iterates its
+        // partitions sequentially, so two dequeue transactions never scan the
+        // same queue's rows at once, and SQLite is single-process. Postgres needs
+        // FOR UPDATE + snapshot isolation only because dispatchers race across
+        // processes; Go's SQLite `BEGIN IMMEDIATE` is defense-in-depth for that
+        // model and not required under this one.
         let mut tx = self.pool.begin().await?;
 
         let mut max_tasks = req.max_tasks;

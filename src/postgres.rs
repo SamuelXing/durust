@@ -264,6 +264,17 @@ impl StateProvider for PostgresProvider {
         let now_ms = Utc::now().timestamp_millis();
         let mut tx = self.pool.begin().await?;
 
+        // Snapshot isolation is only required for global concurrency or rate
+        // limiting, where the COUNT and the candidate scan must see a consistent
+        // view across concurrent dispatchers; worker concurrency alone is
+        // enforced in-process, so READ COMMITTED suffices. This must run before
+        // any query in the transaction. (Mirrors Go's QueueDequeueIsolation.)
+        if req.global_concurrency.is_some() || req.rate_limit_max.is_some() {
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                .execute(&mut *tx)
+                .await?;
+        }
+
         let mut max_tasks = req.max_tasks;
 
         // A partitioned queue scopes every count and the candidate scan to one
