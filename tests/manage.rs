@@ -3,8 +3,8 @@
 
 use durust::{
     DurableContext, DurableEngine, Error, InMemoryProvider, ListFilter, Result, StateProvider,
-    WorkflowAggregate, WorkflowAggregateQuery, WorkflowOptions, WorkflowStatus, STATUS_CANCELLED,
-    STATUS_PENDING, STATUS_SUCCESS,
+    StepAggregateQuery, WorkflowAggregate, WorkflowAggregateQuery, WorkflowOptions, WorkflowStatus,
+    STATUS_CANCELLED, STATUS_PENDING, STATUS_SUCCESS,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -539,6 +539,81 @@ async fn workflow_aggregates_group_and_filter() -> Result<()> {
     // A query that groups by nothing is rejected.
     assert!(engine
         .get_workflow_aggregates(&WorkflowAggregateQuery::default())
+        .await
+        .is_err());
+    Ok(())
+}
+
+/// Step aggregates count per function name and report the max step duration;
+/// select/group validation is enforced.
+#[tokio::test]
+async fn step_aggregates_count_and_duration() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("work", |ctx: DurableContext, _: ()| async move {
+        ctx.step("fast", || async { Ok::<_, Error>(1_i64) }).await?;
+        ctx.step("slow", || async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok::<_, Error>(2_i64)
+        })
+        .await?;
+        ctx.step("fast", || async { Ok::<_, Error>(3_i64) }).await?;
+        Ok::<_, Error>(())
+    });
+    engine.start_typed::<_, ()>("work", "w", ()).await?;
+
+    // Group by function name; select count and max duration.
+    let by_fn = engine
+        .get_step_aggregates(&StepAggregateQuery {
+            by_function_name: true,
+            select_count: true,
+            select_max_duration_ms: true,
+            ..Default::default()
+        })
+        .await?;
+    let row = |name: &str| {
+        by_fn
+            .iter()
+            .find(|r| r.group.get("function_name") == Some(&Some(name.to_string())))
+            .cloned()
+            .unwrap_or_else(|| panic!("no group for {name}"))
+    };
+    assert_eq!(row("fast").count, Some(2));
+    assert_eq!(row("slow").count, Some(1));
+    assert!(
+        row("slow").max_duration_ms.unwrap_or(0) >= 10,
+        "the slow step's duration should reflect its ~20ms of work"
+    );
+
+    // Group by derived status: every step succeeded → one SUCCESS group of 3.
+    let by_status = engine
+        .get_step_aggregates(&StepAggregateQuery {
+            by_status: true,
+            select_count: true,
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(by_status.len(), 1);
+    assert_eq!(
+        by_status[0].group.get("status"),
+        Some(&Some("SUCCESS".to_string()))
+    );
+    assert_eq!(by_status[0].count, Some(3));
+    // Duration was not selected, so it is absent.
+    assert!(by_status[0].max_duration_ms.is_none());
+
+    // A query that groups by nothing, or selects nothing, is rejected.
+    assert!(engine
+        .get_step_aggregates(&StepAggregateQuery {
+            select_count: true,
+            ..Default::default()
+        })
+        .await
+        .is_err());
+    assert!(engine
+        .get_step_aggregates(&StepAggregateQuery {
+            by_function_name: true,
+            ..Default::default()
+        })
         .await
         .is_err());
     Ok(())

@@ -1,9 +1,10 @@
 use crate::error::Result;
 use crate::provider::{
     decode_roles, dedup_or, encode_roles, is_terminal, nonexistent_or, DequeueRequest, ListFilter,
-    StateProvider, StepInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
-    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
-    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STREAM_CLOSED_SENTINEL,
+    StateProvider, StepAggregate, StepAggregateQuery, StepInfo, WorkflowAggregate,
+    WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
+    STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
+    STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL,
 };
 use crate::serialize::{self, Serializer};
 use async_trait::async_trait;
@@ -568,6 +569,69 @@ impl StateProvider for SqliteProvider {
             .collect())
     }
 
+    async fn get_step_aggregates(&self, query: &StepAggregateQuery) -> Result<Vec<StepAggregate>> {
+        let dims = query.group_exprs();
+        let bucket = query.time_bucket_ms.filter(|b| *b > 0);
+
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("SELECT ");
+        for (key, expr) in &dims {
+            qb.push(*expr).push(" AS ").push(*key).push(", ");
+        }
+        if let Some(b) = bucket {
+            qb.push("(completed_at_epoch_ms / ")
+                .push_bind(b)
+                .push(") * ")
+                .push_bind(b)
+                .push(" AS time_bucket, ");
+        }
+        // At least one select is guaranteed by the engine; emit a stable order.
+        let mut sel = Vec::new();
+        if query.select_count {
+            sel.push("COUNT(*) AS cnt");
+        }
+        if query.select_max_duration_ms {
+            sel.push("MAX(completed_at_epoch_ms - started_at_epoch_ms) AS max_dur");
+        }
+        qb.push(sel.join(", "));
+        qb.push(" FROM operation_outputs");
+        push_step_agg_filters(&mut qb, query);
+        qb.push(" GROUP BY ");
+        let mut first = true;
+        for (_, expr) in &dims {
+            if !first {
+                qb.push(", ");
+            }
+            first = false;
+            qb.push(*expr);
+        }
+        if let Some(b) = bucket {
+            if !first {
+                qb.push(", ");
+            }
+            qb.push("(completed_at_epoch_ms / ")
+                .push_bind(b)
+                .push(") * ")
+                .push_bind(b);
+        }
+        if let Some(lim) = query.limit {
+            qb.push(" LIMIT ").push_bind(lim);
+        }
+
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                row_to_step_aggregate(
+                    r,
+                    &dims,
+                    bucket.is_some(),
+                    query.select_count,
+                    query.select_max_duration_ms,
+                )
+            })
+            .collect())
+    }
+
     async fn cancel_workflow(&self, id: &str) -> Result<()> {
         let now = Utc::now().timestamp_millis();
         sqlx::query(
@@ -1120,6 +1184,72 @@ fn row_to_aggregate(
     WorkflowAggregate {
         group,
         count: row.try_get("cnt").unwrap_or(0),
+    }
+}
+
+/// Append the WHERE clause for `get_step_aggregates` (SQLite dialect).
+fn push_step_agg_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, q: &'a StepAggregateQuery) {
+    let mut sep = " WHERE ";
+    let mut clause = |qb: &mut QueryBuilder<'a, Sqlite>| {
+        qb.push(sep);
+        sep = " AND ";
+    };
+    if !q.status.is_empty() {
+        clause(qb);
+        qb.push(STEP_STATUS_EXPR).push(" IN (");
+        let mut sebs = qb.separated(", ");
+        for v in &q.status {
+            sebs.push_bind(v.as_str());
+        }
+        sebs.push_unseparated(")");
+    }
+    if !q.function_name.is_empty() {
+        clause(qb);
+        qb.push("function_name IN (");
+        let mut sebs = qb.separated(", ");
+        for v in &q.function_name {
+            sebs.push_bind(v.as_str());
+        }
+        sebs.push_unseparated(")");
+    }
+    if let Some(prefix) = &q.workflow_id_prefix {
+        clause(qb);
+        qb.push("workflow_uuid LIKE ")
+            .push_bind(format!("{prefix}%"));
+    }
+    if let Some(t) = q.completed_after_ms {
+        clause(qb);
+        qb.push("completed_at_epoch_ms >= ").push_bind(t);
+    }
+    if let Some(t) = q.completed_before_ms {
+        clause(qb);
+        qb.push("completed_at_epoch_ms <= ").push_bind(t);
+    }
+}
+
+/// Materialize one `get_step_aggregates` group row.
+fn row_to_step_aggregate(
+    row: &sqlx::sqlite::SqliteRow,
+    dims: &[(&str, &str)],
+    has_bucket: bool,
+    want_count: bool,
+    want_duration: bool,
+) -> StepAggregate {
+    let mut group: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for (key, _) in dims {
+        let v: Option<String> = row.try_get(*key).ok().flatten();
+        group.insert(key.to_string(), v);
+    }
+    if has_bucket {
+        let b: Option<i64> = row.try_get("time_bucket").ok().flatten();
+        group.insert("time_bucket".to_string(), b.map(|x| x.to_string()));
+    }
+    StepAggregate {
+        group,
+        count: want_count.then(|| row.try_get("cnt").unwrap_or(0)),
+        max_duration_ms: want_duration
+            .then(|| row.try_get("max_dur").ok().flatten())
+            .flatten(),
     }
 }
 

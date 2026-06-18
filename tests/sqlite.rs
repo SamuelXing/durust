@@ -983,3 +983,58 @@ async fn sqlite_step_timing_is_recorded() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// Step aggregates work in SQL: count + max duration grouped by function name,
+/// with the derived status filter.
+#[tokio::test]
+async fn sqlite_step_aggregates() -> Result<()> {
+    use durust::StepAggregateQuery;
+    let (url, path) = temp_db_url("step-aggregates");
+
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("work", |ctx: DurableContext, _: ()| async move {
+        ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+        ctx.step("b", || async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok::<_, Error>(2_i64)
+        })
+        .await?;
+        ctx.step("a", || async { Ok::<_, Error>(3_i64) }).await?;
+        Ok::<_, Error>(())
+    });
+    engine.start_typed::<_, ()>("work", "w", ()).await?;
+
+    let by_fn = engine
+        .get_step_aggregates(&StepAggregateQuery {
+            by_function_name: true,
+            select_count: true,
+            select_max_duration_ms: true,
+            ..Default::default()
+        })
+        .await?;
+    let a = by_fn
+        .iter()
+        .find(|r| r.group.get("function_name") == Some(&Some("a".to_string())))
+        .expect("group a");
+    let b = by_fn
+        .iter()
+        .find(|r| r.group.get("function_name") == Some(&Some("b".to_string())))
+        .expect("group b");
+    assert_eq!(a.count, Some(2));
+    assert_eq!(b.count, Some(1));
+    assert!(b.max_duration_ms.unwrap_or(0) >= 10);
+
+    // Filtering by the SUCCESS status keeps all steps (none errored).
+    let success = engine
+        .get_step_aggregates(&StepAggregateQuery {
+            by_function_name: true,
+            select_count: true,
+            status: vec!["SUCCESS".to_string()],
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(success.iter().filter_map(|r| r.count).sum::<i64>(), 3);
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}

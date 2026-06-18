@@ -326,6 +326,80 @@ pub struct WorkflowAggregate {
     pub count: i64,
 }
 
+/// A step's status derived from `operation_outputs`: a NULL `error` means the
+/// step succeeded, otherwise it errored. There is no explicit status column, so
+/// this SQL expression stands in for one wherever step status is grouped or
+/// filtered.
+pub(crate) const STEP_STATUS_EXPR: &str =
+    "(CASE WHEN error IS NULL THEN 'SUCCESS' ELSE 'ERROR' END)";
+
+/// Grouping, selected aggregates, and filters for
+/// [`StateProvider::get_step_aggregates`]: aggregate `operation_outputs` rows
+/// grouped by function name and/or derived status and/or a `completed_at` time
+/// bucket.
+///
+/// At least one `by_*` flag must be set or `time_bucket_ms` must be `Some`, and
+/// at least one `select_*` flag must be set.
+#[derive(Clone, Default)]
+pub struct StepAggregateQuery {
+    pub by_function_name: bool,
+    pub by_status: bool,
+    /// Select the per-group row count.
+    pub select_count: bool,
+    /// Select the per-group maximum step duration (`completed_at - started_at`).
+    /// Rows with no recorded timing (instantaneous markers) are ignored.
+    pub select_max_duration_ms: bool,
+    /// Also group by `completed_at` bucket of this size in milliseconds.
+    pub time_bucket_ms: Option<i64>,
+    // Filters (all ANDed; empty/`None` ignored).
+    pub status: Vec<String>,
+    pub function_name: Vec<String>,
+    pub workflow_id_prefix: Option<String>,
+    pub completed_after_ms: Option<i64>,
+    pub completed_before_ms: Option<i64>,
+    /// Cap on the number of group rows returned.
+    pub limit: Option<i64>,
+}
+
+impl StepAggregateQuery {
+    /// The enabled grouping dimensions as `(group_key, sql_expr)` pairs, in
+    /// stable order. `status` maps to [`STEP_STATUS_EXPR`] rather than a column;
+    /// `time_bucket` is a computed expression handled separately per backend.
+    pub(crate) fn group_exprs(&self) -> Vec<(&'static str, &'static str)> {
+        let mut v = Vec::new();
+        if self.by_function_name {
+            v.push(("function_name", "function_name"));
+        }
+        if self.by_status {
+            v.push(("status", STEP_STATUS_EXPR));
+        }
+        v
+    }
+
+    /// `true` when nothing to group by — an invalid query.
+    pub fn no_grouping(&self) -> bool {
+        !self.by_function_name && !self.by_status && self.time_bucket_ms.is_none()
+    }
+
+    /// `true` when no aggregate is selected — an invalid query.
+    pub fn no_select(&self) -> bool {
+        !self.select_count && !self.select_max_duration_ms
+    }
+}
+
+/// One aggregate group from [`StateProvider::get_step_aggregates`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StepAggregate {
+    /// Each enabled grouping dimension → its value (`function_name`, `status`,
+    /// and/or `time_bucket` as the bucket start in epoch ms).
+    pub group: std::collections::BTreeMap<String, Option<String>>,
+    /// Row count for this group, if `select_count` was set.
+    pub count: Option<i64>,
+    /// Maximum step duration in ms for this group, if `select_max_duration_ms`
+    /// was set; `None` when no row in the group had recorded timing.
+    pub max_duration_ms: Option<i64>,
+}
+
 /// One recorded operation of a workflow.
 ///
 /// Materialized from an `operation_outputs` row by
@@ -494,6 +568,11 @@ pub trait StateProvider: Send + Sync {
         &self,
         query: &WorkflowAggregateQuery,
     ) -> Result<Vec<WorkflowAggregate>>;
+
+    /// Aggregate step (`operation_outputs`) rows grouped per `query`, selecting
+    /// count and/or max duration. The engine validates that the query groups by
+    /// at least one dimension and selects at least one aggregate before calling.
+    async fn get_step_aggregates(&self, query: &StepAggregateQuery) -> Result<Vec<StepAggregate>>;
 
     /// Cancel a workflow: if it is not already terminal, set it `CANCELLED`,
     /// stamp `completed_at`, and clear queue assignment / dedup so it leaves any

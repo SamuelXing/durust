@@ -2,9 +2,9 @@ use crate::context::{AuthContext, DurableContext};
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{
-    is_terminal, DequeueRequest, ListFilter, StateProvider, StepInfo, WorkflowAggregate,
-    WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
-    STATUS_ERROR, STATUS_PENDING, STATUS_SUCCESS,
+    is_terminal, DequeueRequest, ListFilter, StateProvider, StepAggregate, StepAggregateQuery,
+    StepInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED,
+    STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_PENDING, STATUS_SUCCESS,
 };
 use crate::queue::WorkflowQueue;
 use serde::{de::DeserializeOwned, Serialize};
@@ -562,6 +562,29 @@ impl DurableEngine {
             ));
         }
         self.provider.get_workflow_aggregates(query).await
+    }
+
+    /// Aggregate step records grouped by function name / derived status and/or a
+    /// `completed_at` time bucket, selecting count and/or max duration, after
+    /// applying `query`'s filters. Returns one
+    /// [`StepAggregate`](crate::StepAggregate) per non-empty group.
+    ///
+    /// Errors if `query` groups by nothing, or selects no aggregate.
+    pub async fn get_step_aggregates(
+        &self,
+        query: &StepAggregateQuery,
+    ) -> Result<Vec<StepAggregate>> {
+        if query.no_grouping() {
+            return Err(Error::app(
+                "get_step_aggregates requires at least one grouping dimension",
+            ));
+        }
+        if query.no_select() {
+            return Err(Error::app(
+                "get_step_aggregates requires at least one selected aggregate",
+            ));
+        }
+        self.provider.get_step_aggregates(query).await
     }
 
     /// List a workflow's recorded operations. Returns each durable step / sleep /

@@ -1,8 +1,8 @@
 use crate::error::{Error, Result};
 use crate::provider::{
-    is_terminal, DequeueRequest, ListFilter, StateProvider, StepInfo, WorkflowAggregate,
-    WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
-    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
+    is_terminal, DequeueRequest, ListFilter, StateProvider, StepAggregate, StepAggregateQuery,
+    StepInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED,
+    STATUS_DELAYED, STATUS_ENQUEUED, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -480,6 +480,83 @@ impl StateProvider for InMemoryProvider {
             })
             .collect();
         // Stable order so callers (and tests) see a deterministic result.
+        out.sort_by(|a, b| a.group.iter().cmp(b.group.iter()));
+        if let Some(lim) = query.limit {
+            out.truncate(lim.max(0) as usize);
+        }
+        Ok(out)
+    }
+
+    async fn get_step_aggregates(&self, query: &StepAggregateQuery) -> Result<Vec<StepAggregate>> {
+        let g = self.inner.lock().await;
+        let dims = query.group_exprs();
+        // group key -> (count, max_duration_ms).
+        let mut acc: HashMap<Vec<(String, Option<String>)>, (i64, Option<i64>)> = HashMap::new();
+
+        for ((wid, _seq), row) in g.steps.iter() {
+            // No error is recorded on step rows, so every step counts as SUCCESS.
+            let status = "SUCCESS";
+            if !query.status.is_empty() && !query.status.iter().any(|s| s == status) {
+                continue;
+            }
+            if !query.function_name.is_empty() && !query.function_name.contains(&row.name) {
+                continue;
+            }
+            if query
+                .workflow_id_prefix
+                .as_ref()
+                .is_some_and(|p| !wid.starts_with(p))
+            {
+                continue;
+            }
+            // A NULL completed_at fails the bound, matching the SQL comparison.
+            if query
+                .completed_after_ms
+                .is_some_and(|t| row.completed_at_ms.is_none_or(|c| c < t))
+            {
+                continue;
+            }
+            if query
+                .completed_before_ms
+                .is_some_and(|t| row.completed_at_ms.is_none_or(|c| c > t))
+            {
+                continue;
+            }
+
+            let mut key: Vec<(String, Option<String>)> = dims
+                .iter()
+                .map(|(d, _)| {
+                    let val = match *d {
+                        "function_name" => Some(row.name.clone()),
+                        "status" => Some(status.to_string()),
+                        _ => None,
+                    };
+                    (d.to_string(), val)
+                })
+                .collect();
+            if let Some(bucket) = query.time_bucket_ms.filter(|b| *b > 0) {
+                let tb = row
+                    .completed_at_ms
+                    .map(|c| ((c / bucket) * bucket).to_string());
+                key.push(("time_bucket".to_string(), tb));
+            }
+
+            let entry = acc.entry(key).or_insert((0, None));
+            entry.0 += 1;
+            if let (Some(start), Some(end)) = (row.started_at_ms, row.completed_at_ms) {
+                let dur = end - start;
+                entry.1 = Some(entry.1.map_or(dur, |m| m.max(dur)));
+            }
+        }
+
+        let mut out: Vec<StepAggregate> = acc
+            .into_iter()
+            .map(|(k, (count, max_dur))| StepAggregate {
+                group: k.into_iter().collect(),
+                count: query.select_count.then_some(count),
+                max_duration_ms: query.select_max_duration_ms.then_some(max_dur).flatten(),
+            })
+            .collect();
         out.sort_by(|a, b| a.group.iter().cmp(b.group.iter()));
         if let Some(lim) = query.limit {
             out.truncate(lim.max(0) as usize);

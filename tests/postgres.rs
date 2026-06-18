@@ -716,3 +716,53 @@ async fn pg_workflow_aggregates() -> Result<()> {
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
+
+/// Step aggregates through Postgres: count + max duration grouped by function
+/// name, scoped to this run via the id prefix.
+#[tokio::test]
+async fn pg_step_aggregates() -> Result<()> {
+    use durust::StepAggregateQuery;
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_step_aggregates: DATABASE_URL unset");
+        return Ok(());
+    };
+    let id = format!("stepagg-{}", uuid::Uuid::new_v4());
+
+    let provider = PostgresProvider::connect(&url).await?;
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    engine.register("work", |ctx: DurableContext, _: ()| async move {
+        ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+        ctx.step("b", || async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok::<_, Error>(2_i64)
+        })
+        .await?;
+        ctx.step("a", || async { Ok::<_, Error>(3_i64) }).await?;
+        Ok::<_, Error>(())
+    });
+    engine.start_typed::<_, ()>("work", &id, ()).await?;
+
+    let by_fn = engine
+        .get_step_aggregates(&StepAggregateQuery {
+            by_function_name: true,
+            select_count: true,
+            select_max_duration_ms: true,
+            workflow_id_prefix: Some(id.clone()),
+            ..Default::default()
+        })
+        .await?;
+    let a = by_fn
+        .iter()
+        .find(|r| r.group.get("function_name") == Some(&Some("a".to_string())))
+        .expect("group a");
+    let b = by_fn
+        .iter()
+        .find(|r| r.group.get("function_name") == Some(&Some("b".to_string())))
+        .expect("group b");
+    assert_eq!(a.count, Some(2));
+    assert_eq!(b.count, Some(1));
+    assert!(b.max_duration_ms.unwrap_or(0) >= 10);
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
