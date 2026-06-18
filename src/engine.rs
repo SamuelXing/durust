@@ -417,11 +417,6 @@ impl DurableEngine {
         self.shutting_down.store(false, Ordering::Relaxed);
         let rt = self.runtime();
 
-        // Persist any `#[workflow(schedule = …)]` workflows as durable schedules
-        // (idempotent, named after the workflow) so the reconciler installs them
-        // alongside schedules created at runtime via `create_schedule`.
-        self.ensure_macro_schedules().await;
-
         let mut tasks = self.dispatchers.lock().expect("dispatcher lock poisoned");
         for queue in self.queues.values() {
             // Skip queues this process is configured not to listen to.
@@ -439,30 +434,23 @@ impl DurableEngine {
         tasks.push(tokio::spawn(schedule_reconciler(
             rt.clone(),
             self.shutting_down.clone(),
+            self.macro_schedules(),
         )));
         Ok(())
     }
 
-    /// Create a durable schedule for each `#[workflow(schedule = …)]` workflow,
-    /// named after the workflow, unless one already exists (so a user's
-    /// pause/edit of an auto-created schedule survives a relaunch). Failures are
-    /// logged, not fatal — a transient backend error retries on the next launch.
-    async fn ensure_macro_schedules(&self) {
-        for (name, spec) in &self.scheduled {
-            match self
-                .provider
-                .list_schedules(&ScheduleFilter::default())
-                .await
-            {
-                Ok(existing) if existing.iter().any(|s| s.schedule_name == *name) => continue,
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(schedule = %name, error = %e, "failed to list schedules");
-                    continue;
-                }
-            }
-            let schedule = WorkflowSchedule {
-                schedule_id: uuid::Uuid::new_v4().to_string(),
+    /// In-memory schedules for the `#[workflow(schedule = …)]` workflows, named
+    /// after the workflow. These are *not* persisted: a decorator-style schedule
+    /// is pure code, so it is re-seeded from the registry each launch and stops
+    /// firing the moment the attribute is removed. Persisted, manageable
+    /// schedules come from [`create_schedule`](Self::create_schedule) instead.
+    /// The synthetic `macro:` id lets the reconciler tell them apart and re-seat
+    /// a loop only when the cron spec changes.
+    fn macro_schedules(&self) -> Vec<WorkflowSchedule> {
+        self.scheduled
+            .iter()
+            .map(|(name, spec)| WorkflowSchedule {
+                schedule_id: format!("macro:{name}:{spec}"),
                 schedule_name: name.clone(),
                 workflow_name: name.clone(),
                 schedule: spec.clone(),
@@ -472,15 +460,8 @@ impl DurableEngine {
                 automatic_backfill: false,
                 cron_timezone: None,
                 queue_name: None,
-            };
-            // A concurrent executor may win the create; that unique violation is
-            // expected and harmless.
-            if let Err(e) = self.provider.create_schedule(&schedule).await {
-                if !e.is_unique_violation() {
-                    tracing::warn!(schedule = %name, error = %e, "failed to register schedule");
-                }
-            }
-        }
+            })
+            .collect()
     }
 
     /// Stop the queue dispatchers and wait for in-flight workflow tasks started
@@ -1341,10 +1322,18 @@ struct InstalledSchedule {
     stop: Arc<AtomicBool>,
 }
 
-/// Reconciles persisted schedules with running firing loops. Each pass lists the
-/// active schedules and installs a [`schedule_fire_loop`] for any that is newly
-/// active, retiring loops whose schedule was paused, deleted, or recreated.
-async fn schedule_reconciler(rt: Arc<Runtime>, shutting_down: Arc<AtomicBool>) {
+/// Reconciles the desired set of schedules with running firing loops. Each pass
+/// the desired set is the persisted `ACTIVE` schedules plus the in-memory
+/// `macro_schedules` (the `#[workflow(schedule)]` ones, re-seeded every launch),
+/// with a persisted schedule shadowing a macro one of the same name. It installs
+/// a [`schedule_fire_loop`] for any newly desired schedule and retires loops
+/// whose schedule was paused, deleted, recreated, or (for a macro) removed from
+/// the code.
+async fn schedule_reconciler(
+    rt: Arc<Runtime>,
+    shutting_down: Arc<AtomicBool>,
+    macro_schedules: Vec<WorkflowSchedule>,
+) {
     let mut installed: HashMap<String, InstalledSchedule> = HashMap::new();
 
     loop {
@@ -1355,7 +1344,7 @@ async fn schedule_reconciler(rt: Arc<Runtime>, shutting_down: Arc<AtomicBool>) {
             return;
         }
 
-        let active = match rt
+        let mut desired = match rt
             .provider
             .list_schedules(&ScheduleFilter {
                 statuses: vec![ScheduleStatus::Active],
@@ -1371,21 +1360,29 @@ async fn schedule_reconciler(rt: Arc<Runtime>, shutting_down: Arc<AtomicBool>) {
             }
         };
 
-        let active_names: std::collections::HashSet<&str> =
-            active.iter().map(|s| s.schedule_name.as_str()).collect();
-        // Retire loops whose schedule is gone, no longer active, or recreated.
+        // Add macro schedules not shadowed by a persisted one of the same name.
+        let persisted: std::collections::HashSet<&str> =
+            desired.iter().map(|s| s.schedule_name.as_str()).collect();
+        let extra: Vec<WorkflowSchedule> = macro_schedules
+            .iter()
+            .filter(|m| !persisted.contains(m.schedule_name.as_str()))
+            .cloned()
+            .collect();
+        desired.extend(extra);
+
+        // Retire loops whose schedule is gone, no longer desired, or recreated.
         installed.retain(|name, entry| {
-            let keep = active
+            let keep = desired
                 .iter()
                 .any(|s| s.schedule_name == *name && s.schedule_id == entry.schedule_id);
             if !keep {
                 entry.stop.store(true, Ordering::Relaxed);
             }
-            keep && active_names.contains(name.as_str())
+            keep
         });
 
-        // Install loops for newly active schedules.
-        for schedule in active {
+        // Install loops for newly desired schedules.
+        for schedule in desired {
             if installed.contains_key(&schedule.schedule_name) {
                 continue;
             }

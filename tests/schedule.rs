@@ -1,7 +1,10 @@
 //! Scheduled (cron) workflow tests. The scheduled workflow below is
 //! auto-registered (via `inventory`) only in this test binary.
 
-use durust::{DurableContext, DurableEngine, InMemoryProvider, ListFilter, Result, StateProvider};
+use durust::{
+    DurableContext, DurableEngine, InMemoryProvider, ListFilter, Result, ScheduleFilter,
+    StateProvider,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,6 +56,17 @@ async fn cron_fires_once_per_tick_across_executors() -> Result<()> {
     );
     // Every scheduled run is keyed by tick time.
     assert!(rows.iter().all(|r| r.id.starts_with("sched-cron_tick-")));
+
+    // A `#[workflow(schedule)]` schedule is ephemeral (decorator-style): it
+    // fires, but nothing is written to `workflow_schedules`. The managed/CRUD
+    // view is empty; only `create_schedule` persists a row.
+    assert!(
+        provider
+            .list_schedules(&ScheduleFilter::default())
+            .await?
+            .is_empty(),
+        "macro schedules must not be persisted to the schedule table"
+    );
     Ok(())
 }
 
