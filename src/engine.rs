@@ -1492,6 +1492,12 @@ async fn schedule_fire_loop(
             }
         }
 
+        // Test hook: simulate the scheduling process dying after the tick was
+        // dispatched but before `last_fired_at` is recorded. The dispatched run
+        // still completes; only the bookkeeping write is skipped. A no-op unless
+        // armed via the `fail` registry. See `tests/schedule_failpoint.rs`.
+        fail::fail_point!("schedule_tick_before_reschedule", |_| {});
+
         let _ = rt
             .provider
             .set_schedule_last_fired(&schedule.schedule_name, next.timestamp_millis())
