@@ -1,8 +1,8 @@
 use crate::error::{Error, Result};
 use crate::provider::{
-    is_terminal, DequeueRequest, ListFilter, StateProvider, StepInfo, WorkflowStatus,
-    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED,
-    STATUS_PENDING,
+    is_terminal, DequeueRequest, ListFilter, StateProvider, StepInfo, WorkflowAggregate,
+    WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
+    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -396,6 +396,88 @@ impl StateProvider for InMemoryProvider {
             }
         }
         Ok(rows)
+    }
+
+    async fn get_workflow_aggregates(
+        &self,
+        query: &WorkflowAggregateQuery,
+    ) -> Result<Vec<WorkflowAggregate>> {
+        let g = self.inner.lock().await;
+        let cols = query.enabled_columns();
+        let mut counts: HashMap<Vec<(String, Option<String>)>, i64> = HashMap::new();
+
+        for w in g.workflows.values() {
+            // Filters (all ANDed).
+            if !query.status.is_empty() && !query.status.contains(&w.status) {
+                continue;
+            }
+            if !query.name.is_empty() && !query.name.contains(&w.name) {
+                continue;
+            }
+            if !query.app_version.is_empty() && !query.app_version.contains(&w.app_version) {
+                continue;
+            }
+            if !query.executor_ids.is_empty() && !query.executor_ids.contains(&w.executor_id) {
+                continue;
+            }
+            if !query.queue_names.is_empty()
+                && !query
+                    .queue_names
+                    .iter()
+                    .any(|q| w.queue_name.as_deref() == Some(q.as_str()))
+            {
+                continue;
+            }
+            if query
+                .workflow_id_prefix
+                .as_ref()
+                .is_some_and(|p| !w.id.starts_with(p))
+            {
+                continue;
+            }
+            let created = w.created_at.timestamp_millis();
+            if query.start_time_ms.is_some_and(|t| created < t) {
+                continue;
+            }
+            if query.end_time_ms.is_some_and(|t| created > t) {
+                continue;
+            }
+
+            // Build this workflow's group key over the enabled dimensions.
+            let mut key: Vec<(String, Option<String>)> = cols
+                .iter()
+                .map(|(dim, _)| {
+                    let val = match *dim {
+                        "status" => Some(w.status.clone()),
+                        "name" => Some(w.name.clone()),
+                        "queue_name" => w.queue_name.clone(),
+                        "executor_id" => Some(w.executor_id.clone()),
+                        "application_version" => Some(w.app_version.clone()),
+                        _ => None,
+                    };
+                    (dim.to_string(), val)
+                })
+                .collect();
+            if let Some(bucket) = query.time_bucket_ms.filter(|b| *b > 0) {
+                let start = (created / bucket) * bucket;
+                key.push(("time_bucket".to_string(), Some(start.to_string())));
+            }
+            *counts.entry(key).or_insert(0) += 1;
+        }
+
+        let mut out: Vec<WorkflowAggregate> = counts
+            .into_iter()
+            .map(|(k, count)| WorkflowAggregate {
+                group: k.into_iter().collect(),
+                count,
+            })
+            .collect();
+        // Stable order so callers (and tests) see a deterministic result.
+        out.sort_by(|a, b| a.group.iter().cmp(b.group.iter()));
+        if let Some(lim) = query.limit {
+            out.truncate(lim.max(0) as usize);
+        }
+        Ok(out)
     }
 
     async fn cancel_workflow(&self, id: &str) -> Result<()> {

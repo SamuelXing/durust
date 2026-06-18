@@ -3,7 +3,8 @@
 
 use durust::{
     DurableContext, DurableEngine, Error, InMemoryProvider, ListFilter, Result, StateProvider,
-    WorkflowOptions, WorkflowStatus, STATUS_CANCELLED, STATUS_PENDING, STATUS_SUCCESS,
+    WorkflowAggregate, WorkflowAggregateQuery, WorkflowOptions, WorkflowStatus, STATUS_CANCELLED,
+    STATUS_PENDING, STATUS_SUCCESS,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -463,6 +464,83 @@ async fn list_filters_completed_and_dequeued_time() -> Result<()> {
         })
         .await?;
     assert_eq!(started.len(), 1);
+    Ok(())
+}
+
+/// Aggregate counts group by status/name and honor filters; an empty query is
+/// rejected.
+#[tokio::test]
+async fn workflow_aggregates_group_and_filter() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("ok", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(())
+    });
+    engine.register("boom", |_ctx: DurableContext, _: ()| async move {
+        Err::<(), _>(Error::app("nope"))
+    });
+
+    // Two successes, one failure.
+    engine.start_typed::<_, ()>("ok", "a", ()).await?;
+    engine.start_typed::<_, ()>("ok", "b", ()).await?;
+    let _ = engine.start_typed::<_, ()>("boom", "c", ()).await;
+
+    let count_for = |rows: &[WorkflowAggregate], key: &str, val: &str| -> i64 {
+        rows.iter()
+            .find(|r| r.group.get(key) == Some(&Some(val.to_string())))
+            .map(|r| r.count)
+            .unwrap_or(0)
+    };
+
+    // Group by status.
+    let by_status = engine
+        .get_workflow_aggregates(&WorkflowAggregateQuery {
+            by_status: true,
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(count_for(&by_status, "status", "SUCCESS"), 2);
+    assert_eq!(count_for(&by_status, "status", "ERROR"), 1);
+
+    // Group by name.
+    let by_name = engine
+        .get_workflow_aggregates(&WorkflowAggregateQuery {
+            by_name: true,
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(count_for(&by_name, "name", "ok"), 2);
+    assert_eq!(count_for(&by_name, "name", "boom"), 1);
+
+    // Filter to one name, group by status → just the two successes.
+    let ok_only = engine
+        .get_workflow_aggregates(&WorkflowAggregateQuery {
+            by_status: true,
+            name: vec!["ok".to_string()],
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(ok_only.len(), 1);
+    assert_eq!(
+        ok_only[0].group.get("status"),
+        Some(&Some("SUCCESS".to_string()))
+    );
+    assert_eq!(ok_only[0].count, 2);
+
+    // Grouping by status and name together yields one row per (status, name).
+    let combined = engine
+        .get_workflow_aggregates(&WorkflowAggregateQuery {
+            by_status: true,
+            by_name: true,
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(combined.len(), 2);
+
+    // A query that groups by nothing is rejected.
+    assert!(engine
+        .get_workflow_aggregates(&WorkflowAggregateQuery::default())
+        .await
+        .is_err());
     Ok(())
 }
 

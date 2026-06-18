@@ -251,6 +251,81 @@ impl Default for ListFilter {
     }
 }
 
+/// Grouping and filters for [`StateProvider::get_workflow_aggregates`]: count
+/// workflows grouped by one or more `workflow_status` columns and/or a
+/// `created_at` time bucket.
+///
+/// At least one `by_*` flag must be set, or `time_bucket_ms` must be `Some`;
+/// the filter fields narrow which workflows are counted before grouping.
+#[derive(Clone, Default)]
+pub struct WorkflowAggregateQuery {
+    pub by_status: bool,
+    pub by_name: bool,
+    pub by_queue_name: bool,
+    pub by_executor_id: bool,
+    pub by_app_version: bool,
+    /// Also group by `created_at` bucket of this size in milliseconds.
+    pub time_bucket_ms: Option<i64>,
+    // Filters (all ANDed; empty/`None` ignored).
+    pub status: Vec<String>,
+    pub name: Vec<String>,
+    pub app_version: Vec<String>,
+    pub executor_ids: Vec<String>,
+    pub queue_names: Vec<String>,
+    pub workflow_id_prefix: Option<String>,
+    pub start_time_ms: Option<i64>,
+    pub end_time_ms: Option<i64>,
+    /// Cap on the number of group rows returned.
+    pub limit: Option<i64>,
+}
+
+/// The grouping-dimension keys used in [`WorkflowAggregate::group`], in a stable
+/// order. Shared identifiers, matching the `workflow_status` column names.
+pub(crate) const AGG_DIMENSIONS: &[(&str, &str)] = &[
+    ("status", "status"),
+    ("name", "name"),
+    ("queue_name", "queue_name"),
+    ("executor_id", "executor_id"),
+    ("application_version", "application_version"),
+];
+
+impl WorkflowAggregateQuery {
+    /// The enabled grouping dimensions as `(group_key, column)` pairs, in stable
+    /// order; the `time_bucket` dimension (if any) is handled separately by each
+    /// backend since it is a computed expression.
+    pub(crate) fn enabled_columns(&self) -> Vec<(&'static str, &'static str)> {
+        let flags = [
+            self.by_status,
+            self.by_name,
+            self.by_queue_name,
+            self.by_executor_id,
+            self.by_app_version,
+        ];
+        AGG_DIMENSIONS
+            .iter()
+            .zip(flags)
+            .filter(|(_, on)| *on)
+            .map(|(d, _)| *d)
+            .collect()
+    }
+
+    /// `true` when nothing to group by — an invalid query.
+    pub fn is_empty(&self) -> bool {
+        self.enabled_columns().is_empty() && self.time_bucket_ms.is_none()
+    }
+}
+
+/// One aggregate group from [`StateProvider::get_workflow_aggregates`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowAggregate {
+    /// Each enabled grouping dimension → its value for this group. `None` is a
+    /// NULL grouped value (e.g. a workflow with no `queue_name`). The
+    /// `time_bucket` value, when present, is the bucket's start in epoch ms.
+    pub group: std::collections::BTreeMap<String, Option<String>>,
+    /// How many workflows fell into this group.
+    pub count: i64,
+}
+
 /// One recorded operation of a workflow.
 ///
 /// Materialized from an `operation_outputs` row by
@@ -404,6 +479,14 @@ pub trait StateProvider: Send + Sync {
     /// List workflows matching `filter`, newest- or oldest-first per
     /// `filter.sort_desc`.
     async fn list_workflows(&self, filter: &ListFilter) -> Result<Vec<WorkflowStatus>>;
+
+    /// Count workflows grouped per `query` (one [`WorkflowAggregate`] per
+    /// non-empty group). The engine validates that the query groups by at least
+    /// one dimension before calling this.
+    async fn get_workflow_aggregates(
+        &self,
+        query: &WorkflowAggregateQuery,
+    ) -> Result<Vec<WorkflowAggregate>>;
 
     /// Cancel a workflow: if it is not already terminal, set it `CANCELLED`,
     /// stamp `completed_at`, and clear queue assignment / dedup so it leaves any

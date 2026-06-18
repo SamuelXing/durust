@@ -1,9 +1,9 @@
 use crate::error::Result;
 use crate::provider::{
     decode_roles, dedup_or, encode_roles, is_terminal, nonexistent_or, DequeueRequest, ListFilter,
-    StateProvider, StepInfo, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
-    STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
-    STREAM_CLOSED_SENTINEL,
+    StateProvider, StepInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
+    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STREAM_CLOSED_SENTINEL,
 };
 use crate::serialize::{self, Serializer};
 use async_trait::async_trait;
@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::{QueryBuilder, Row};
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, executor_id, \
@@ -517,6 +518,52 @@ impl StateProvider for SqliteProvider {
         Ok(rows.iter().map(row_to_status).collect())
     }
 
+    async fn get_workflow_aggregates(
+        &self,
+        query: &WorkflowAggregateQuery,
+    ) -> Result<Vec<WorkflowAggregate>> {
+        let cols = query.enabled_columns();
+        let bucket = query.time_bucket_ms.filter(|b| *b > 0);
+
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("SELECT ");
+        for (_, col) in &cols {
+            qb.push(*col).push(", ");
+        }
+        if let Some(b) = bucket {
+            qb.push("(created_at / ")
+                .push_bind(b)
+                .push(") * ")
+                .push_bind(b)
+                .push(" AS time_bucket, ");
+        }
+        qb.push("COUNT(*) AS cnt FROM workflow_status");
+        push_agg_filters(&mut qb, query);
+        qb.push(" GROUP BY ");
+        let mut first = true;
+        for (_, col) in &cols {
+            if !first {
+                qb.push(", ");
+            }
+            first = false;
+            qb.push(*col);
+        }
+        if bucket.is_some() {
+            if !first {
+                qb.push(", ");
+            }
+            qb.push("time_bucket");
+        }
+        if let Some(lim) = query.limit {
+            qb.push(" LIMIT ").push_bind(lim);
+        }
+
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        Ok(rows
+            .iter()
+            .map(|r| row_to_aggregate(r, &cols, bucket.is_some()))
+            .collect())
+    }
+
     async fn cancel_workflow(&self, id: &str) -> Result<()> {
         let now = Utc::now().timestamp_millis();
         sqlx::query(
@@ -1008,6 +1055,67 @@ fn push_list_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a ListFilt
     if filter.queues_only {
         clause(qb);
         qb.push("queue_name IS NOT NULL");
+    }
+}
+
+/// Append the WHERE clause for `get_workflow_aggregates` (SQLite dialect).
+fn push_agg_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, q: &'a WorkflowAggregateQuery) {
+    let mut sep = " WHERE ";
+    let mut clause = |qb: &mut QueryBuilder<'a, Sqlite>| {
+        qb.push(sep);
+        sep = " AND ";
+    };
+    let mut push_in = |qb: &mut QueryBuilder<'a, Sqlite>, col: &str, vals: &'a [String]| {
+        if vals.is_empty() {
+            return;
+        }
+        clause(qb);
+        qb.push(col).push(" IN (");
+        let mut sebs = qb.separated(", ");
+        for v in vals {
+            sebs.push_bind(v.as_str());
+        }
+        sebs.push_unseparated(")");
+    };
+    push_in(qb, "status", &q.status);
+    push_in(qb, "name", &q.name);
+    push_in(qb, "application_version", &q.app_version);
+    push_in(qb, "executor_id", &q.executor_ids);
+    push_in(qb, "queue_name", &q.queue_names);
+    if let Some(prefix) = &q.workflow_id_prefix {
+        clause(qb);
+        qb.push("workflow_uuid LIKE ")
+            .push_bind(format!("{prefix}%"));
+    }
+    if let Some(t) = q.start_time_ms {
+        clause(qb);
+        qb.push("created_at >= ").push_bind(t);
+    }
+    if let Some(t) = q.end_time_ms {
+        clause(qb);
+        qb.push("created_at <= ").push_bind(t);
+    }
+}
+
+/// Materialize one `get_workflow_aggregates` group row: read each enabled
+/// dimension column (and the computed `time_bucket`) plus the `cnt`.
+fn row_to_aggregate(
+    row: &sqlx::sqlite::SqliteRow,
+    cols: &[(&str, &str)],
+    has_bucket: bool,
+) -> WorkflowAggregate {
+    let mut group: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for (key, col) in cols {
+        let v: Option<String> = row.try_get(*col).ok().flatten();
+        group.insert(key.to_string(), v);
+    }
+    if has_bucket {
+        let b: Option<i64> = row.try_get("time_bucket").ok().flatten();
+        group.insert("time_bucket".to_string(), b.map(|x| x.to_string()));
+    }
+    WorkflowAggregate {
+        group,
+        count: row.try_get("cnt").unwrap_or(0),
     }
 }
 

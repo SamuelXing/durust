@@ -901,3 +901,49 @@ async fn sqlite_list_filters_extended() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// get_workflow_aggregates groups in SQL: by status, by name, and with a
+/// created_at time bucket.
+#[tokio::test]
+async fn sqlite_workflow_aggregates() -> Result<()> {
+    use durust::WorkflowAggregateQuery;
+    let (url, path) = temp_db_url("aggregates");
+
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("ok", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(())
+    });
+    engine.register("boom", |_ctx: DurableContext, _: ()| async move {
+        Err::<(), _>(Error::app("nope"))
+    });
+    engine.start_typed::<_, ()>("ok", "a", ()).await?;
+    engine.start_typed::<_, ()>("ok", "b", ()).await?;
+    let _ = engine.start_typed::<_, ()>("boom", "c", ()).await;
+
+    // Group by status.
+    let by_status = engine
+        .get_workflow_aggregates(&WorkflowAggregateQuery {
+            by_status: true,
+            ..Default::default()
+        })
+        .await?;
+    let success = by_status
+        .iter()
+        .find(|r| r.group.get("status") == Some(&Some(STATUS_SUCCESS.to_string())))
+        .expect("a SUCCESS group");
+    assert_eq!(success.count, 2);
+
+    // A one-hour time bucket collapses everything into a single group.
+    let bucketed = engine
+        .get_workflow_aggregates(&WorkflowAggregateQuery {
+            time_bucket_ms: Some(3_600_000),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(bucketed.len(), 1);
+    assert_eq!(bucketed[0].count, 3);
+    assert!(bucketed[0].group.contains_key("time_bucket"));
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}

@@ -662,3 +662,57 @@ async fn pg_list_filters_extended() -> Result<()> {
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
+
+/// get_workflow_aggregates groups through Postgres (by status, with a time
+/// bucket).
+#[tokio::test]
+async fn pg_workflow_aggregates() -> Result<()> {
+    use durust::{WorkflowAggregateQuery, STATUS_SUCCESS};
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_workflow_aggregates: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+
+    let provider = PostgresProvider::connect(&url).await?;
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    engine.register("agg_ok", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(())
+    });
+    let prefix = format!("agg-{tag}-");
+    for i in 0..3 {
+        engine
+            .start_typed::<_, ()>("agg_ok", &format!("{prefix}{i}"), ())
+            .await?;
+    }
+
+    // Group by status, scoped to this run's id prefix.
+    let by_status = engine
+        .get_workflow_aggregates(&WorkflowAggregateQuery {
+            by_status: true,
+            workflow_id_prefix: Some(prefix.clone()),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(by_status.len(), 1);
+    assert_eq!(
+        by_status[0].group.get("status"),
+        Some(&Some(STATUS_SUCCESS.to_string()))
+    );
+    assert_eq!(by_status[0].count, 3);
+
+    // A wide time bucket collapses them into one group with a time_bucket key.
+    let bucketed = engine
+        .get_workflow_aggregates(&WorkflowAggregateQuery {
+            time_bucket_ms: Some(3_600_000),
+            workflow_id_prefix: Some(prefix),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(bucketed.len(), 1);
+    assert_eq!(bucketed[0].count, 3);
+    assert!(bucketed[0].group.contains_key("time_bucket"));
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}

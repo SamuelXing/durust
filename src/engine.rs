@@ -2,9 +2,9 @@ use crate::context::{AuthContext, DurableContext};
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{
-    is_terminal, DequeueRequest, ListFilter, StateProvider, StepInfo, WorkflowStatus,
-    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_PENDING,
-    STATUS_SUCCESS,
+    is_terminal, DequeueRequest, ListFilter, StateProvider, StepInfo, WorkflowAggregate,
+    WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
+    STATUS_ERROR, STATUS_PENDING, STATUS_SUCCESS,
 };
 use crate::queue::WorkflowQueue;
 use serde::{de::DeserializeOwned, Serialize};
@@ -544,6 +544,24 @@ impl DurableEngine {
     /// List workflows matching `filter`.
     pub async fn list_workflows(&self, filter: &ListFilter) -> Result<Vec<WorkflowStatus>> {
         self.provider.list_workflows(filter).await
+    }
+
+    /// Count workflows grouped by one or more `workflow_status` columns and/or a
+    /// `created_at` time bucket, after applying `query`'s filters. Returns one
+    /// [`WorkflowAggregate`](crate::WorkflowAggregate) per non-empty group.
+    ///
+    /// Errors if `query` groups by nothing (no `by_*` flag and no
+    /// `time_bucket_ms`).
+    pub async fn get_workflow_aggregates(
+        &self,
+        query: &WorkflowAggregateQuery,
+    ) -> Result<Vec<WorkflowAggregate>> {
+        if query.is_empty() {
+            return Err(Error::app(
+                "get_workflow_aggregates requires at least one grouping dimension",
+            ));
+        }
+        self.provider.get_workflow_aggregates(query).await
     }
 
     /// List a workflow's recorded operations. Returns each durable step / sleep /
