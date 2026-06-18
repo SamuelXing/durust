@@ -180,9 +180,11 @@ impl WorkflowStatus {
 }
 
 /// Filter for [`StateProvider::list_workflows`]. All fields are ANDed;
-/// empty/`None` fields are ignored. Times are epoch milliseconds, matched
-/// against `created_at`.
-#[derive(Clone, Default)]
+/// empty/`None` fields are ignored. Times are epoch milliseconds.
+///
+/// `start_time_ms`/`end_time_ms` bound `created_at`; the dedicated
+/// `completed_*`/`dequeued_*` bounds match `completed_at`/`started_at`.
+#[derive(Clone)]
 pub struct ListFilter {
     pub workflow_ids: Vec<String>,
     pub workflow_id_prefix: Option<String>,
@@ -195,6 +197,16 @@ pub struct ListFilter {
     pub forked_from: Option<String>,
     pub start_time_ms: Option<i64>,
     pub end_time_ms: Option<i64>,
+    /// Lower/upper bound on `completed_at` (epoch ms).
+    pub completed_after_ms: Option<i64>,
+    pub completed_before_ms: Option<i64>,
+    /// Lower/upper bound on `started_at` — when the workflow was dequeued/started
+    /// (epoch ms).
+    pub dequeued_after_ms: Option<i64>,
+    pub dequeued_before_ms: Option<i64>,
+    /// `Some(true)` keeps only workflows that have a parent; `Some(false)` only
+    /// those that don't; `None` does not filter on parentage.
+    pub has_parent: Option<bool>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     /// Sort by `created_at` descending instead of ascending.
@@ -202,6 +214,41 @@ pub struct ListFilter {
     /// Return only workflows that are (or were) on a queue — those with a
     /// non-null `queue_name`.
     pub queues_only: bool,
+    /// When `false`, the `input` field is omitted from results (returned as
+    /// `Null`) and not read from the database. Defaults to `true`.
+    pub load_input: bool,
+    /// When `false`, the `output` field is omitted from results (returned as
+    /// `None`) and not read from the database. Defaults to `true`.
+    pub load_output: bool,
+}
+
+impl Default for ListFilter {
+    fn default() -> Self {
+        Self {
+            workflow_ids: Vec::new(),
+            workflow_id_prefix: None,
+            name: None,
+            status: Vec::new(),
+            queue_name: None,
+            app_version: None,
+            executor_ids: Vec::new(),
+            forked_from: None,
+            start_time_ms: None,
+            end_time_ms: None,
+            completed_after_ms: None,
+            completed_before_ms: None,
+            dequeued_after_ms: None,
+            dequeued_before_ms: None,
+            has_parent: None,
+            limit: None,
+            offset: None,
+            sort_desc: false,
+            queues_only: false,
+            // Loading input/output is the default; callers opt out for cheaper scans.
+            load_input: true,
+            load_output: true,
+        }
+    }
 }
 
 /// One recorded operation of a workflow.

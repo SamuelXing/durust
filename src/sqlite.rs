@@ -498,8 +498,9 @@ impl StateProvider for SqliteProvider {
     }
 
     async fn list_workflows(&self, filter: &ListFilter) -> Result<Vec<WorkflowStatus>> {
+        let cols = list_select_cols(filter);
         let mut qb: QueryBuilder<Sqlite> =
-            QueryBuilder::new(format!("SELECT {SELECT_COLS} FROM workflow_status"));
+            QueryBuilder::new(format!("SELECT {cols} FROM workflow_status"));
         push_list_filters(&mut qb, filter);
         qb.push(if filter.sort_desc {
             " ORDER BY created_at DESC"
@@ -980,8 +981,48 @@ fn push_list_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a ListFilt
         clause(qb);
         qb.push("created_at <= ").push_bind(t);
     }
+    if let Some(t) = filter.completed_after_ms {
+        clause(qb);
+        qb.push("completed_at >= ").push_bind(t);
+    }
+    if let Some(t) = filter.completed_before_ms {
+        clause(qb);
+        qb.push("completed_at <= ").push_bind(t);
+    }
+    if let Some(t) = filter.dequeued_after_ms {
+        clause(qb);
+        qb.push("started_at_epoch_ms >= ").push_bind(t);
+    }
+    if let Some(t) = filter.dequeued_before_ms {
+        clause(qb);
+        qb.push("started_at_epoch_ms <= ").push_bind(t);
+    }
+    if let Some(hp) = filter.has_parent {
+        clause(qb);
+        qb.push(if hp {
+            "parent_workflow_id IS NOT NULL"
+        } else {
+            "parent_workflow_id IS NULL"
+        });
+    }
     if filter.queues_only {
         clause(qb);
         qb.push("queue_name IS NOT NULL");
     }
+}
+
+/// The column list for `list_workflows`, substituting `NULL` for `inputs` /
+/// `output` the caller opted out of loading, so those payloads are never read.
+fn list_select_cols(filter: &ListFilter) -> std::borrow::Cow<'static, str> {
+    if filter.load_input && filter.load_output {
+        return std::borrow::Cow::Borrowed(SELECT_COLS);
+    }
+    let mut cols = SELECT_COLS.to_string();
+    if !filter.load_input {
+        cols = cols.replacen("inputs,", "NULL AS inputs,", 1);
+    }
+    if !filter.load_output {
+        cols = cols.replacen("output,", "NULL AS output,", 1);
+    }
+    std::borrow::Cow::Owned(cols)
 }

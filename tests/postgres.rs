@@ -4,8 +4,8 @@
 //!   createdb durust_test && DATABASE_URL=postgres://localhost/durust_test cargo test --test postgres
 
 use durust::{
-    DurableContext, DurableEngine, Error, ErrorCode, PostgresProvider, Result, Serializer,
-    StateProvider, WorkflowOptions, WorkflowQueue, WorkflowStatus, STATUS_PENDING,
+    DurableContext, DurableEngine, Error, ErrorCode, ListFilter, PostgresProvider, Result,
+    Serializer, StateProvider, WorkflowOptions, WorkflowQueue, WorkflowStatus, STATUS_PENDING,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -606,6 +606,58 @@ async fn pg_set_workflow_delay() -> Result<()> {
 
     // Completed → no longer DELAYED → silent no-op.
     assert!(!engine.set_workflow_delay(&wid, Duration::ZERO).await?);
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// The extended list filters work through Postgres: has_parent and the
+/// load_input/load_output column substitution.
+#[tokio::test]
+async fn pg_list_filters_extended() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_list_filters_extended: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+
+    let provider = PostgresProvider::connect(&url).await?;
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    engine.register("child", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n * 10)
+    });
+    engine.register("parent", |ctx: DurableContext, _: ()| async move {
+        let mut h = ctx
+            .start_workflow::<i64, i64>("child", 5_i64, WorkflowOptions::default())
+            .await?;
+        h.get_result().await
+    });
+    let pid = format!("parent-{tag}");
+    let out: i64 = engine.start_typed("parent", &pid, ()).await?;
+    assert_eq!(out, 50);
+
+    let child_id = format!("{pid}-0");
+    let lean = engine
+        .list_workflows(&ListFilter {
+            workflow_ids: vec![child_id.clone()],
+            has_parent: Some(true),
+            load_input: false,
+            load_output: false,
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(lean.len(), 1);
+    assert_eq!(lean[0].id, child_id);
+    assert_eq!(lean[0].input, serde_json::Value::Null);
+    assert!(lean[0].output.is_none());
+
+    let full = engine
+        .list_workflows(&ListFilter {
+            workflow_ids: vec![child_id],
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(full[0].output, Some(serde_json::json!(50)));
 
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())

@@ -363,6 +363,109 @@ async fn bulk_delete_with_children() -> Result<()> {
     Ok(())
 }
 
+/// `has_parent` splits children from roots, and the load flags drop the heavy
+/// input/output fields from results.
+#[tokio::test]
+async fn list_filters_parentage_and_load_flags() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("child", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n * 10)
+    });
+    engine.register("parent", |ctx: DurableContext, _: ()| async move {
+        let mut h = ctx
+            .start_workflow::<i64, i64>("child", 5_i64, WorkflowOptions::default())
+            .await?;
+        h.get_result().await
+    });
+    let out: i64 = engine.start_typed("parent", "p", ()).await?;
+    assert_eq!(out, 50);
+
+    // has_parent = true keeps only the child; false only the root.
+    let children = engine
+        .list_workflows(&ListFilter {
+            has_parent: Some(true),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].name, "child");
+    let child_id = children[0].id.clone();
+
+    let roots = engine
+        .list_workflows(&ListFilter {
+            has_parent: Some(false),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].id, "p");
+
+    // Opting out of input/output omits them...
+    let lean = engine
+        .list_workflows(&ListFilter {
+            workflow_ids: vec![child_id.clone()],
+            load_input: false,
+            load_output: false,
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(lean[0].input, serde_json::Value::Null);
+    assert!(lean[0].output.is_none());
+
+    // ...while the default loads them.
+    let full = engine
+        .list_workflows(&ListFilter {
+            workflow_ids: vec![child_id],
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(full[0].input, serde_json::json!(5));
+    assert_eq!(full[0].output, Some(serde_json::json!(50)));
+    Ok(())
+}
+
+/// `completed_*` / `dequeued_*` bound the result by completion and start time.
+#[tokio::test]
+async fn list_filters_completed_and_dequeued_time() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(())
+    });
+    engine.start_typed::<_, ()>("noop", "w", ()).await?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let hour = 3_600_000;
+
+    // Completed within the last hour.
+    let recent = engine
+        .list_workflows(&ListFilter {
+            completed_after_ms: Some(now - hour),
+            completed_before_ms: Some(now + hour),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(recent.len(), 1);
+
+    // Completed only in the future → none.
+    let future = engine
+        .list_workflows(&ListFilter {
+            completed_after_ms: Some(now + hour),
+            ..Default::default()
+        })
+        .await?;
+    assert!(future.is_empty());
+
+    // Dequeued (started) within the last hour — a direct run stamps started_at.
+    let started = engine
+        .list_workflows(&ListFilter {
+            dequeued_after_ms: Some(now - hour),
+            dequeued_before_ms: Some(now + hour),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(started.len(), 1);
+    Ok(())
+}
+
 async fn status_of(provider: &Arc<InMemoryProvider>, id: &str) -> String {
     provider
         .get_workflow_status(id)

@@ -838,3 +838,66 @@ async fn sqlite_partitioned_queue_dispatch() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// The new list filters work through SQL: has_parent splits child from root, the
+/// load flags blank input/output, and the completed/dequeued time bounds apply.
+#[tokio::test]
+async fn sqlite_list_filters_extended() -> Result<()> {
+    let (url, path) = temp_db_url("list-filters");
+
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("child", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n * 10)
+    });
+    engine.register("parent", |ctx: DurableContext, _: ()| async move {
+        let mut h = ctx
+            .start_workflow::<i64, i64>("child", 5_i64, WorkflowOptions::default())
+            .await?;
+        h.get_result().await
+    });
+    let out: i64 = engine.start_typed("parent", "p", ()).await?;
+    assert_eq!(out, 50);
+
+    // has_parent isolates the child.
+    let children = engine
+        .list_workflows(&ListFilter {
+            has_parent: Some(true),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].name, "child");
+    let child_id = children[0].id.clone();
+
+    // Load flags blank the heavy columns (NULL AS inputs/output).
+    let lean = engine
+        .list_workflows(&ListFilter {
+            workflow_ids: vec![child_id.clone()],
+            load_input: false,
+            load_output: false,
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(lean[0].input, serde_json::Value::Null);
+    assert!(lean[0].output.is_none());
+    let full = engine
+        .list_workflows(&ListFilter {
+            workflow_ids: vec![child_id],
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(full[0].output, Some(serde_json::json!(50)));
+
+    // Completion time bound: a far-future lower bound excludes everything.
+    let now = chrono::Utc::now().timestamp_millis();
+    let future = engine
+        .list_workflows(&ListFilter {
+            completed_after_ms: Some(now + 3_600_000),
+            ..Default::default()
+        })
+        .await?;
+    assert!(future.is_empty());
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}

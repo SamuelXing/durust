@@ -354,6 +354,21 @@ impl StateProvider for InMemoryProvider {
                     && filter
                         .end_time_ms
                         .is_none_or(|t| w.created_at.timestamp_millis() <= t)
+                    && filter
+                        .completed_after_ms
+                        .is_none_or(|t| w.completed_at_ms.is_some_and(|c| c >= t))
+                    && filter
+                        .completed_before_ms
+                        .is_none_or(|t| w.completed_at_ms.is_some_and(|c| c <= t))
+                    && filter
+                        .dequeued_after_ms
+                        .is_none_or(|t| w.started_at_ms.is_some_and(|s| s >= t))
+                    && filter
+                        .dequeued_before_ms
+                        .is_none_or(|t| w.started_at_ms.is_some_and(|s| s <= t))
+                    && filter
+                        .has_parent
+                        .is_none_or(|hp| w.parent_workflow_id.is_some() == hp)
                     && (!filter.queues_only || w.queue_name.is_some())
             })
             .cloned()
@@ -368,6 +383,17 @@ impl StateProvider for InMemoryProvider {
         }
         if let Some(lim) = filter.limit {
             rows.truncate(lim.max(0) as usize);
+        }
+        // Honor load flags by dropping the heavy fields the caller opted out of.
+        if !filter.load_input || !filter.load_output {
+            for w in &mut rows {
+                if !filter.load_input {
+                    w.input = Value::Null;
+                }
+                if !filter.load_output {
+                    w.output = None;
+                }
+            }
         }
         Ok(rows)
     }
