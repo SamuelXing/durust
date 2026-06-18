@@ -230,11 +230,13 @@ impl StateProvider for PostgresProvider {
         seq: i32,
         name: &str,
         value: Value,
+        started_at_ms: Option<i64>,
     ) -> Result<Value> {
         sqlx::query(
             "INSERT INTO operation_outputs
-                 (workflow_uuid, function_id, function_name, output, serialization)
-             VALUES ($1, $2, $3, $4, $5)
+                 (workflow_uuid, function_id, function_name, output, serialization,
+                  started_at_epoch_ms, completed_at_epoch_ms)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
         )
         .bind(workflow_id)
@@ -242,6 +244,8 @@ impl StateProvider for PostgresProvider {
         .bind(name)
         .bind(self.serializer.encode(&value)?)
         .bind(self.serializer.name())
+        .bind(started_at_ms)
+        .bind(Utc::now().timestamp_millis())
         .execute(&self.pool)
         .await?;
 

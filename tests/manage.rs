@@ -90,7 +90,7 @@ async fn cancel_then_resume() -> Result<()> {
         ))
         .await?;
     provider
-        .record_step_result("wf-cancel", 0, "first", serde_json::json!(1))
+        .record_step_result("wf-cancel", 0, "first", serde_json::json!(1), None)
         .await?;
     engine.cancel_workflow("wf-cancel").await?;
     assert_eq!(

@@ -89,6 +89,19 @@ async fn workflow_steps_introspection_in_memory() -> Result<()> {
     assert_eq!(steps[0].output, Some(serde_json::json!(7)));
     assert_eq!(steps[1].name, "kid");
     assert_eq!(steps[1].child_workflow_id.as_deref(), Some("w-1"));
+
+    // The durable step records start/finish timing (start no later than finish);
+    // the child-invocation marker has no step timing.
+    let compute = &steps[0];
+    let (start, end) = (
+        compute.started_at.expect("step records started_at"),
+        compute.completed_at.expect("step records completed_at"),
+    );
+    assert!(start <= end);
+    assert!(
+        steps[1].started_at.is_none() && steps[1].completed_at.is_none(),
+        "a child-invocation marker carries no step timing"
+    );
     Ok(())
 }
 

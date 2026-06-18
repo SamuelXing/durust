@@ -233,7 +233,7 @@ async fn pg_patch() -> Result<()> {
         ))
         .await?;
     provider2
-        .record_step_result(&old, 0, "legacy_step", serde_json::json!(1))
+        .record_step_result(&old, 0, "legacy_step", serde_json::json!(1), None)
         .await?;
     let patched: bool = engine
         .run_workflow::<_, bool>("wf", (), WorkflowOptions::with_id(&old))

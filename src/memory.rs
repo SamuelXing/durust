@@ -5,7 +5,7 @@ use crate::provider::{
     STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
 };
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
 use tokio::sync::Mutex;
@@ -19,12 +19,15 @@ struct NotificationRow {
 }
 
 /// One recorded operation, mirroring an `operation_outputs` row: it holds either
-/// a step `output` or a `child_workflow_id` (a started child workflow).
+/// a step `output` or a `child_workflow_id` (a started child workflow), plus
+/// optional start/finish timestamps (epoch ms).
 #[derive(Clone, Default)]
 struct StepRow {
     name: String,
     output: Option<Value>,
     child_workflow_id: Option<String>,
+    started_at_ms: Option<i64>,
+    completed_at_ms: Option<i64>,
 }
 
 #[derive(Default)]
@@ -127,6 +130,7 @@ impl StateProvider for InMemoryProvider {
         seq: i32,
         name: &str,
         value: Value,
+        started_at_ms: Option<i64>,
     ) -> Result<Value> {
         let mut g = self.inner.lock().await;
         let canonical = g
@@ -136,6 +140,8 @@ impl StateProvider for InMemoryProvider {
                 name: name.to_string(),
                 output: Some(value),
                 child_workflow_id: None,
+                started_at_ms,
+                completed_at_ms: Some(Utc::now().timestamp_millis()),
             })
             .output
             .clone()
@@ -300,6 +306,7 @@ impl StateProvider for InMemoryProvider {
                 name: step_name.to_string(),
                 output: Some(message),
                 child_workflow_id: None,
+                ..Default::default()
             })
             .output
             .clone()
@@ -666,6 +673,7 @@ impl StateProvider for InMemoryProvider {
                 name: name.to_string(),
                 output: None,
                 child_workflow_id: Some(child_id.to_string()),
+                ..Default::default()
             });
         Ok(())
     }
@@ -689,8 +697,10 @@ impl StateProvider for InMemoryProvider {
                 output: row.output.clone(),
                 error: None,
                 child_workflow_id: row.child_workflow_id.clone(),
-                started_at: None,
-                completed_at: None,
+                started_at: row.started_at_ms.and_then(DateTime::from_timestamp_millis),
+                completed_at: row
+                    .completed_at_ms
+                    .and_then(DateTime::from_timestamp_millis),
             })
             .collect();
         steps.sort_by_key(|s| s.step_id);
@@ -712,6 +722,7 @@ impl StateProvider for InMemoryProvider {
                 name: name.to_string(),
                 output: None,
                 child_workflow_id: None,
+                ..Default::default()
             });
         Ok(())
     }

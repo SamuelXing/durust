@@ -228,11 +228,13 @@ impl StateProvider for SqliteProvider {
         seq: i32,
         name: &str,
         value: Value,
+        started_at_ms: Option<i64>,
     ) -> Result<Value> {
         sqlx::query(
             "INSERT INTO operation_outputs
-                 (workflow_uuid, function_id, function_name, output, serialization)
-             VALUES (?, ?, ?, ?, ?)
+                 (workflow_uuid, function_id, function_name, output, serialization,
+                  started_at_epoch_ms, completed_at_epoch_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
         )
         .bind(workflow_id)
@@ -240,6 +242,8 @@ impl StateProvider for SqliteProvider {
         .bind(name)
         .bind(self.serializer.encode(&value)?)
         .bind(self.serializer.name())
+        .bind(started_at_ms)
+        .bind(Utc::now().timestamp_millis())
         .execute(&self.pool)
         .await?;
 
