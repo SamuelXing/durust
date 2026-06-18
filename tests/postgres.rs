@@ -828,3 +828,80 @@ async fn pg_schedule_crud() -> Result<()> {
     assert!(engine.get_schedule(&name).await?.is_none());
     Ok(())
 }
+
+/// Through Postgres: `apply_schedules` creates/replaces a schedule,
+/// `backfill_schedule` persists one run per past tick (idempotently), and
+/// `trigger_schedule` runs it once now. A uuid-suffixed name isolates the test.
+#[tokio::test]
+async fn pg_schedule_backfill_apply_trigger() -> Result<()> {
+    use chrono::{TimeZone, Utc};
+    use durust::{ApplySchedule, ScheduleOptions, WorkflowHandle};
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_schedule_backfill_apply_trigger: DATABASE_URL unset");
+        return Ok(());
+    };
+
+    let mut engine = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
+    engine.register(
+        "nightly_job",
+        |_ctx: DurableContext, _: String| async move { Ok::<_, Error>(()) },
+    );
+
+    let name = format!("bf-{}", uuid::Uuid::new_v4());
+    engine
+        .apply_schedules(vec![ApplySchedule::new(
+            &name,
+            "nightly_job",
+            "0 0 12 * * *",
+        )])
+        .await?;
+    let created = engine.get_schedule(&name).await?.expect("applied");
+    assert_eq!(created.schedule, "0 0 12 * * *");
+
+    // Re-apply with a new spec: replaced with a fresh schedule_id.
+    engine
+        .apply_schedules(vec![ApplySchedule::new(
+            &name,
+            "nightly_job",
+            "0 0 6 * * *",
+        )
+        .options(ScheduleOptions::new())])
+        .await?;
+    let replaced = engine.get_schedule(&name).await?.expect("replaced");
+    assert_ne!(replaced.schedule_id, created.schedule_id);
+    assert_eq!(replaced.schedule, "0 0 6 * * *");
+
+    // Backfill three past ticks (06:00 daily).
+    let start = Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap();
+    let end = Utc.with_ymd_and_hms(2026, 3, 4, 0, 0, 0).unwrap();
+    let ids = engine.backfill_schedule(&name, start, end).await?;
+    assert_eq!(ids.len(), 3, "one tick per day");
+
+    let prefix = format!("sched-{name}-");
+    let filter = ListFilter {
+        workflow_id_prefix: Some(prefix.clone()),
+        ..Default::default()
+    };
+    for _ in 0..100 {
+        let rows = engine.list_workflows(&filter).await?;
+        if rows.len() == 3 && rows.iter().all(|r| r.status == "SUCCESS") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let rows = engine.list_workflows(&filter).await?;
+    assert_eq!(rows.len(), 3, "one persisted row per backfilled tick");
+
+    // Re-backfill is idempotent.
+    assert_eq!(engine.backfill_schedule(&name, start, end).await?, ids);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(engine.list_workflows(&filter).await?.len(), 3);
+
+    // Trigger runs once now, under a distinct -trigger- id.
+    let mut handle: WorkflowHandle<()> = engine.trigger_schedule(&name).await?;
+    assert!(handle.id().starts_with(&format!("sched-{name}-trigger-")));
+    handle.get_result().await?;
+
+    engine.delete_schedule(&name).await?;
+    Ok(())
+}

@@ -7,7 +7,10 @@ use crate::provider::{
     STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_PENDING, STATUS_SUCCESS,
 };
 use crate::queue::WorkflowQueue;
-use crate::schedule::{ScheduleFilter, ScheduleOptions, ScheduleStatus, WorkflowSchedule};
+use crate::schedule::{
+    ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus, WorkflowSchedule,
+};
+use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -349,8 +352,9 @@ impl DurableEngine {
         if schedule_name.is_empty() {
             return Err(Error::app("schedule_name is required"));
         }
-        if cron::Schedule::from_str(cron).is_err() {
-            return Err(Error::app(format!("invalid cron schedule `{cron}`")));
+        parse_cron(cron)?;
+        if let Some(tz) = &opts.cron_timezone {
+            parse_timezone(tz)?;
         }
         if !self.workflows.contains_key(workflow_name) {
             return Err(Error::UnknownWorkflow(workflow_name.to_string()));
@@ -407,6 +411,83 @@ impl DurableEngine {
     /// Delete a schedule. Returns whether a schedule was removed.
     pub async fn delete_schedule(&self, schedule_name: &str) -> Result<bool> {
         self.provider.delete_schedule(schedule_name).await
+    }
+
+    /// Create or replace each schedule by name, in one call. Useful for declaring
+    /// a fixed set of schedules at startup: an existing schedule of the same name
+    /// is replaced (a fresh `schedule_id`, so the reconciler re-seats its firing
+    /// loop). Every entry is validated (cron, timezone, workflow registered)
+    /// before any write, so a bad entry rejects the whole batch.
+    pub async fn apply_schedules(&self, schedules: Vec<ApplySchedule>) -> Result<()> {
+        for req in &schedules {
+            if req.schedule_name.is_empty() {
+                return Err(Error::app("schedule_name is required"));
+            }
+            parse_cron(&req.schedule)?;
+            if let Some(tz) = &req.options.cron_timezone {
+                parse_timezone(tz)?;
+            }
+            if !self.workflows.contains_key(&req.workflow_name) {
+                return Err(Error::UnknownWorkflow(req.workflow_name.clone()));
+            }
+        }
+        for req in schedules {
+            self.provider.delete_schedule(&req.schedule_name).await?;
+            let schedule = WorkflowSchedule {
+                schedule_id: uuid::Uuid::new_v4().to_string(),
+                schedule_name: req.schedule_name,
+                workflow_name: req.workflow_name,
+                schedule: req.schedule,
+                status: ScheduleStatus::Active,
+                context: req.options.context,
+                last_fired_at: None,
+                automatic_backfill: req.options.automatic_backfill,
+                cron_timezone: req.options.cron_timezone,
+                queue_name: req.options.queue_name,
+            };
+            self.provider.create_schedule(&schedule).await?;
+        }
+        Ok(())
+    }
+
+    /// Fire a schedule's ticks for every cron instant in `(start, end)` (start
+    /// exclusive, end exclusive), under the same deterministic per-tick ids the
+    /// live loop uses — so a tick that already ran is skipped, not duplicated.
+    /// Returns the id of every tick in the range (including skipped ones).
+    pub async fn backfill_schedule(
+        &self,
+        schedule_name: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<String>> {
+        let schedule = self
+            .get_schedule(schedule_name)
+            .await?
+            .ok_or_else(|| Error::app(format!("schedule not found: {schedule_name}")))?;
+        backfill_ticks(&self.runtime(), &schedule, start, end).await
+    }
+
+    /// Fire a schedule's workflow immediately, once, returning a handle to the
+    /// run. The tick uses a distinct `sched-{name}-trigger-{time}` id (it does
+    /// not collide with or replace a regular cron tick) and the schedule's queue
+    /// if it has one.
+    pub async fn trigger_schedule<O>(&self, schedule_name: &str) -> Result<WorkflowHandle<O>>
+    where
+        O: DeserializeOwned,
+    {
+        let schedule = self
+            .get_schedule(schedule_name)
+            .await?
+            .ok_or_else(|| Error::app(format!("schedule not found: {schedule_name}")))?;
+        let now = Utc::now();
+        let stamp = now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let opts = WorkflowOptions {
+            workflow_id: Some(format!("sched-{schedule_name}-trigger-{stamp}")),
+            queue: schedule.queue_name.clone(),
+            ..Default::default()
+        };
+        self.run_workflow(&schedule.workflow_name, stamp, opts)
+            .await
     }
 
     /// Start background processing: one dispatcher task per registered queue and
@@ -1071,6 +1152,60 @@ impl Runtime {
         drop(join);
     }
 
+    /// Persist one scheduled tick at `instant` under the deterministic
+    /// `sched-{name}-{time}` id (idempotent, so the tick is created at most once
+    /// across executors). Returns the canonical row, whether it is queued, and
+    /// the id. Pairs with [`launch_scheduled_tick`](Self::launch_scheduled_tick).
+    async fn persist_scheduled_tick(
+        &self,
+        schedule: &WorkflowSchedule,
+        instant: DateTime<Utc>,
+    ) -> Result<(WorkflowStatus, bool, String)> {
+        let stamp = instant.to_rfc3339();
+        let wf_id = format!("sched-{}-{}", schedule.schedule_name, stamp);
+        let opts = WorkflowOptions {
+            workflow_id: Some(wf_id.clone()),
+            queue: schedule.queue_name.clone(),
+            ..Default::default()
+        };
+        let auth = AuthContext::default();
+        let (canonical, queued) = self
+            .insert_run(
+                &wf_id,
+                &schedule.workflow_name,
+                Value::String(stamp),
+                &opts,
+                None,
+                &auth,
+            )
+            .await?;
+        Ok((canonical, queued, wf_id))
+    }
+
+    /// Run a freshly-persisted tick now if it is a direct (unqueued) run this
+    /// executor owns and has not finished. A queued tick is left for a dispatcher
+    /// to claim.
+    fn launch_scheduled_tick(
+        self: &Arc<Self>,
+        schedule: &WorkflowSchedule,
+        canonical: WorkflowStatus,
+        queued: bool,
+        id: &str,
+    ) {
+        if queued || canonical.executor_id != self.executor_id || is_terminal(&canonical.status) {
+            return;
+        }
+        if let Some(handler) = self.workflows.get(&schedule.workflow_name).cloned() {
+            self.spawn_detached(
+                id.to_string(),
+                handler,
+                canonical.input,
+                canonical.deadline_ms,
+                AuthContext::default(),
+            );
+        }
+    }
+
     /// Start a child workflow under the deterministic `child_id`, stamping the
     /// parent link and the inherited identity. A queued or already-terminal
     /// child is left for polling; otherwise it runs now on a detached task.
@@ -1322,6 +1457,76 @@ struct InstalledSchedule {
     stop: Arc<AtomicBool>,
 }
 
+/// Parse a 6-field (second-precision) cron spec, mapping the parse error to an
+/// application error.
+fn parse_cron(spec: &str) -> Result<cron::Schedule> {
+    cron::Schedule::from_str(spec)
+        .map_err(|e| Error::app(format!("invalid cron schedule `{spec}`: {e}")))
+}
+
+/// Validate an IANA timezone name (e.g. `America/New_York`).
+fn parse_timezone(tz: &str) -> Result<chrono_tz::Tz> {
+    tz.parse::<chrono_tz::Tz>()
+        .map_err(|_| Error::app(format!("invalid cron timezone `{tz}`")))
+}
+
+/// The next cron instant strictly after `after`, interpreting the spec in `tz`
+/// (an IANA name; `None` is UTC) but always returned in UTC. `None` if the
+/// schedule has no further ticks or the timezone is invalid.
+fn next_cron_instant(
+    cron: &cron::Schedule,
+    tz: Option<&str>,
+    after: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    match tz {
+        Some(name) => {
+            let zone = name.parse::<chrono_tz::Tz>().ok()?;
+            cron.after(&after.with_timezone(&zone))
+                .next()
+                .map(|t| t.with_timezone(&Utc))
+        }
+        None => cron.after(&after).next(),
+    }
+}
+
+/// Every cron instant in `(start, end)` (start exclusive, end exclusive), in UTC.
+fn cron_ticks_between(
+    cron: &cron::Schedule,
+    tz: Option<&str>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Vec<DateTime<Utc>> {
+    let mut out = Vec::new();
+    let mut cursor = start;
+    while let Some(next) = next_cron_instant(cron, tz, cursor) {
+        if next >= end {
+            break;
+        }
+        out.push(next);
+        cursor = next;
+    }
+    out
+}
+
+/// Fire every cron tick of `schedule` in `(start, end)` under the deterministic
+/// per-tick id; an already-persisted tick is skipped (the idempotent insert
+/// dedups). Returns the id of every tick in the range, in order.
+async fn backfill_ticks(
+    rt: &Arc<Runtime>,
+    schedule: &WorkflowSchedule,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Vec<String>> {
+    let cron = parse_cron(&schedule.schedule)?;
+    let mut ids = Vec::new();
+    for instant in cron_ticks_between(&cron, schedule.cron_timezone.as_deref(), start, end) {
+        let (canonical, queued, id) = rt.persist_scheduled_tick(schedule, instant).await?;
+        rt.launch_scheduled_tick(schedule, canonical, queued, &id);
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
 /// Reconciles the desired set of schedules with running firing loops. Each pass
 /// the desired set is the persisted `ACTIVE` schedules plus the in-memory
 /// `macro_schedules` (the `#[workflow(schedule)]` ones, re-seeded every launch),
@@ -1386,6 +1591,22 @@ async fn schedule_reconciler(
             if installed.contains_key(&schedule.schedule_name) {
                 continue;
             }
+            // Catch up missed ticks before this loop starts firing live: from
+            // just after the last fired tick to now. Opt-in per schedule.
+            if schedule.automatic_backfill {
+                if let Some(last) = schedule.last_fired_at {
+                    let start = last + chrono::Duration::seconds(1);
+                    let end = Utc::now();
+                    if start < end {
+                        if let Err(e) = backfill_ticks(&rt, &schedule, start, end).await {
+                            tracing::error!(
+                                schedule = %schedule.schedule_name, error = %e,
+                                "automatic backfill failed"
+                            );
+                        }
+                    }
+                }
+            }
             let stop = Arc::new(AtomicBool::new(false));
             installed.insert(
                 schedule.schedule_name.clone(),
@@ -1417,7 +1638,7 @@ async fn schedule_fire_loop(
     stop: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
 ) {
-    let cron = match cron::Schedule::from_str(&schedule.schedule) {
+    let cron = match parse_cron(&schedule.schedule) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(
@@ -1427,35 +1648,22 @@ async fn schedule_fire_loop(
             return;
         }
     };
+    let tz = schedule.cron_timezone.as_deref();
 
     loop {
         if stop.load(Ordering::Relaxed) || shutting_down.load(Ordering::Relaxed) {
             return;
         }
-        let Some(next) = cron.after(&chrono::Utc::now()).next() else {
+        let Some(next) = next_cron_instant(&cron, tz, Utc::now()) else {
             return;
         };
-        let wait = (next - chrono::Utc::now())
-            .to_std()
-            .unwrap_or(Duration::ZERO);
+        let wait = (next - Utc::now()).to_std().unwrap_or(Duration::ZERO);
         if !sleep_until_or_stop(wait, &stop, &shutting_down).await {
             return;
         }
 
-        // Deterministic per-tick id; the scheduled time is the workflow input.
-        let wf_id = format!("sched-{}-{}", schedule.schedule_name, next.to_rfc3339());
-        let input = Value::String(next.to_rfc3339());
-        let opts = WorkflowOptions {
-            workflow_id: Some(wf_id.clone()),
-            queue: schedule.queue_name.clone(),
-            ..Default::default()
-        };
-        let auth = AuthContext::default();
-        match rt
-            .insert_run(&wf_id, &schedule.workflow_name, input, &opts, None, &auth)
-            .await
-        {
-            Ok((canonical, queued)) => {
+        match rt.persist_scheduled_tick(&schedule, next).await {
+            Ok((canonical, queued, id)) => {
                 // Test hook: simulate an abrupt failure of the scheduling
                 // process right after the tick is persisted but before it runs
                 // (and before `last_fired_at` is stamped). Recovery must then
@@ -1463,23 +1671,7 @@ async fn schedule_fire_loop(
                 // armed via the `fail` registry. See `tests/schedule_failpoint.rs`.
                 fail::fail_point!("schedule_tick_after_persist", |_| {});
 
-                // A queued tick is left for a dispatcher to claim. A direct tick
-                // runs here only if our idempotent insert created the row (its
-                // executor is ours) and it is not already finished.
-                if !queued
-                    && canonical.executor_id == rt.executor_id
-                    && !is_terminal(&canonical.status)
-                {
-                    if let Some(handler) = rt.workflows.get(&schedule.workflow_name).cloned() {
-                        rt.spawn_detached(
-                            wf_id,
-                            handler,
-                            canonical.input,
-                            canonical.deadline_ms,
-                            auth,
-                        );
-                    }
-                }
+                rt.launch_scheduled_tick(&schedule, canonical, queued, &id);
             }
             Err(e) => {
                 tracing::warn!(
