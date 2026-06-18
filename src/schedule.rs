@@ -96,6 +96,40 @@ impl ScheduleOptions {
     }
 }
 
+/// One entry for [`DurableEngine::apply_schedules`](crate::DurableEngine::apply_schedules),
+/// which creates each schedule or replaces an existing one of the same name.
+#[derive(Clone)]
+pub struct ApplySchedule {
+    pub(crate) schedule_name: String,
+    pub(crate) workflow_name: String,
+    pub(crate) schedule: String,
+    pub(crate) options: ScheduleOptions,
+}
+
+impl ApplySchedule {
+    /// A schedule named `schedule_name` firing `workflow_name` on the `cron`
+    /// spec (6-field, second precision).
+    pub fn new(
+        schedule_name: impl Into<String>,
+        workflow_name: impl Into<String>,
+        cron: impl Into<String>,
+    ) -> Self {
+        Self {
+            schedule_name: schedule_name.into(),
+            workflow_name: workflow_name.into(),
+            schedule: cron.into(),
+            options: ScheduleOptions::new(),
+        }
+    }
+
+    /// Attach the same options a [`create_schedule`](crate::DurableEngine::create_schedule)
+    /// call would take (context, backfill, timezone, queue).
+    pub fn options(mut self, options: ScheduleOptions) -> Self {
+        self.options = options;
+        self
+    }
+}
+
 /// Filters for [`DurableEngine::list_schedules`](crate::DurableEngine::list_schedules).
 /// An empty filter returns every schedule.
 #[derive(Clone, Default)]

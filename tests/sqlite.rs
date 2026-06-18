@@ -1103,3 +1103,63 @@ async fn sqlite_schedule_persists_across_restart() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// Backfilling a past range through SQLite persists one workflow row per cron
+/// tick under the deterministic id; re-running the same range is idempotent (no
+/// duplicate rows), and the backfilled runs complete.
+#[tokio::test]
+async fn sqlite_backfill_persists_each_tick_once() -> Result<()> {
+    use chrono::{TimeZone, Utc};
+    use durust::{ScheduleOptions, StateProvider};
+    let (url, path) = temp_db_url("schedule-backfill");
+
+    let provider = Arc::new(SqliteProvider::connect(&url).await?);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register(
+        "nightly_job",
+        |_ctx: DurableContext, _: String| async move { Ok::<_, Error>(()) },
+    );
+    engine
+        .create_schedule(
+            "daily",
+            "nightly_job",
+            "0 0 12 * * *",
+            ScheduleOptions::new(),
+        )
+        .await?;
+
+    let start = Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap();
+    let end = Utc.with_ymd_and_hms(2026, 3, 4, 0, 0, 0).unwrap();
+    let ids = engine.backfill_schedule("daily", start, end).await?;
+    assert_eq!(ids.len(), 3, "one tick per day");
+
+    let filter = ListFilter {
+        workflow_id_prefix: Some("sched-daily-".to_string()),
+        ..Default::default()
+    };
+
+    // Wait for the backfilled direct runs to complete.
+    for _ in 0..100 {
+        let rows = provider.list_workflows(&filter).await?;
+        if rows.len() == 3 && rows.iter().all(|r| r.status == STATUS_SUCCESS) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let rows = provider.list_workflows(&filter).await?;
+    assert_eq!(rows.len(), 3, "one persisted row per tick");
+    assert!(rows.iter().all(|r| r.status == STATUS_SUCCESS));
+
+    // Re-backfilling the same range creates no new rows.
+    let again = engine.backfill_schedule("daily", start, end).await?;
+    assert_eq!(again, ids, "same deterministic ids");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        provider.list_workflows(&filter).await?.len(),
+        3,
+        "no duplicate rows"
+    );
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}

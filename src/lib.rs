@@ -61,7 +61,9 @@ pub use provider::{
     STATUS_PENDING, STATUS_SUCCESS,
 };
 pub use queue::{RateLimiter, WorkflowQueue};
-pub use schedule::{ScheduleFilter, ScheduleOptions, ScheduleStatus, WorkflowSchedule};
+pub use schedule::{
+    ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus, WorkflowSchedule,
+};
 pub use serialize::Serializer;
 pub use sqlite::SqliteProvider;
 
