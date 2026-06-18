@@ -20,11 +20,16 @@ base64 = "0.21"
 durust-macros = { path = "durust-macros", version = "0.1" }
 # Postgres backend. If your sqlx version complains about features, see README.
 sqlx = { version = "0.7", features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "json", "chrono", "migrate"] }
+# Crash-injection hooks (e.g. in the schedule fire loop). Without the
+# `failpoints` feature every `fail_point!` compiles to a no-op, so this is
+# zero-cost in normal builds; tests/examples turn the feature on (below).
+fail = "0.5"
 
 [dev-dependencies]
 tracing-subscriber = "0.3"
-# Failpoints for the `order` example's crash-recovery demo. The `failpoints`
-# feature makes `fail_point!` active; it is compiled out otherwise.
+# Arm the failpoints above during tests and the `order` crash-recovery demo.
+# Cargo unifies features within a build, so this enables `fail/failpoints` for
+# the library too — making the `fail_point!` hooks active under test.
 fail = { version = "0.5", features = ["failpoints"] }
 
 [[example]]

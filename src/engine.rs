@@ -7,11 +7,13 @@ use crate::provider::{
     STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_PENDING, STATUS_SUCCESS,
 };
 use crate::queue::WorkflowQueue;
+use crate::schedule::{ScheduleFilter, ScheduleOptions, ScheduleStatus, WorkflowSchedule};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +22,11 @@ use tokio::task::JoinHandle;
 /// How often a blocking [`DurableEngine::read_stream`] re-checks the backend for
 /// newly written stream entries while the producer is still active.
 const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// How often the schedule reconciler lists persisted schedules and installs or
+/// retires per-schedule firing loops. Short so a freshly created or paused
+/// schedule takes effect promptly.
+const SCHEDULE_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A type-erased workflow handler: takes a context + JSON input, returns JSON output.
 pub type WorkflowFn = Arc<
@@ -327,6 +334,81 @@ impl DurableEngine {
         out
     }
 
+    /// Create a durable cron schedule that fires `workflow_name` on each tick of
+    /// `cron` (a 6-field, second-precision spec). The reconciler started by
+    /// [`launch`](Self::launch) installs it on its next pass. Errors if the cron
+    /// spec is invalid, the workflow is not registered here, or a schedule with
+    /// this name already exists.
+    pub async fn create_schedule(
+        &self,
+        schedule_name: &str,
+        workflow_name: &str,
+        cron: &str,
+        opts: ScheduleOptions,
+    ) -> Result<()> {
+        if schedule_name.is_empty() {
+            return Err(Error::app("schedule_name is required"));
+        }
+        if cron::Schedule::from_str(cron).is_err() {
+            return Err(Error::app(format!("invalid cron schedule `{cron}`")));
+        }
+        if !self.workflows.contains_key(workflow_name) {
+            return Err(Error::UnknownWorkflow(workflow_name.to_string()));
+        }
+        let schedule = WorkflowSchedule {
+            schedule_id: uuid::Uuid::new_v4().to_string(),
+            schedule_name: schedule_name.to_string(),
+            workflow_name: workflow_name.to_string(),
+            schedule: cron.to_string(),
+            status: ScheduleStatus::Active,
+            context: opts.context,
+            last_fired_at: None,
+            automatic_backfill: opts.automatic_backfill,
+            cron_timezone: opts.cron_timezone,
+            queue_name: opts.queue_name,
+        };
+        self.provider.create_schedule(&schedule).await
+    }
+
+    /// The schedule named `schedule_name`, or `None` if there is none.
+    pub async fn get_schedule(&self, schedule_name: &str) -> Result<Option<WorkflowSchedule>> {
+        let schedules = self
+            .provider
+            .list_schedules(&ScheduleFilter {
+                name_prefixes: vec![schedule_name.to_string()],
+                ..Default::default()
+            })
+            .await?;
+        Ok(schedules
+            .into_iter()
+            .find(|s| s.schedule_name == schedule_name))
+    }
+
+    /// All schedules matching `filter` (a default filter returns every
+    /// schedule), ordered by name.
+    pub async fn list_schedules(&self, filter: &ScheduleFilter) -> Result<Vec<WorkflowSchedule>> {
+        self.provider.list_schedules(filter).await
+    }
+
+    /// Pause a schedule so it stops firing. Returns whether a schedule matched.
+    pub async fn pause_schedule(&self, schedule_name: &str) -> Result<bool> {
+        self.provider
+            .set_schedule_status(schedule_name, ScheduleStatus::Paused)
+            .await
+    }
+
+    /// Resume a paused schedule. Returns whether a schedule matched.
+    pub async fn resume_schedule(&self, schedule_name: &str) -> Result<bool> {
+        self.provider
+            .set_schedule_status(schedule_name, ScheduleStatus::Active)
+            .await
+    }
+
+    /// Delete a schedule. Returns whether a schedule was removed.
+    pub async fn delete_schedule(&self, schedule_name: &str) -> Result<bool> {
+        self.provider.delete_schedule(schedule_name).await
+    }
+
     /// Start background processing: one dispatcher task per registered queue and
     /// one scheduler task per `#[workflow(schedule = …)]` workflow. Workflow
     /// timeouts are enforced inline per run, so they need no separate sweep. Call
@@ -334,6 +416,7 @@ impl DurableEngine {
     pub async fn launch(&self) -> Result<()> {
         self.shutting_down.store(false, Ordering::Relaxed);
         let rt = self.runtime();
+
         let mut tasks = self.dispatchers.lock().expect("dispatcher lock poisoned");
         for queue in self.queues.values() {
             // Skip queues this process is configured not to listen to.
@@ -348,19 +431,37 @@ impl DurableEngine {
                 self.shutting_down.clone(),
             )));
         }
-        for (name, spec) in &self.scheduled {
-            let Some(handler) = rt.workflows.get(name).cloned() else {
-                continue;
-            };
-            tasks.push(tokio::spawn(schedule_loop(
-                name.clone(),
-                spec.clone(),
-                handler,
-                rt.clone(),
-                self.shutting_down.clone(),
-            )));
-        }
+        tasks.push(tokio::spawn(schedule_reconciler(
+            rt.clone(),
+            self.shutting_down.clone(),
+            self.macro_schedules(),
+        )));
         Ok(())
+    }
+
+    /// In-memory schedules for the `#[workflow(schedule = …)]` workflows, named
+    /// after the workflow. These are *not* persisted: a decorator-style schedule
+    /// is pure code, so it is re-seeded from the registry each launch and stops
+    /// firing the moment the attribute is removed. Persisted, manageable
+    /// schedules come from [`create_schedule`](Self::create_schedule) instead.
+    /// The synthetic `macro:` id lets the reconciler tell them apart and re-seat
+    /// a loop only when the cron spec changes.
+    fn macro_schedules(&self) -> Vec<WorkflowSchedule> {
+        self.scheduled
+            .iter()
+            .map(|(name, spec)| WorkflowSchedule {
+                schedule_id: format!("macro:{name}:{spec}"),
+                schedule_name: name.clone(),
+                workflow_name: name.clone(),
+                schedule: spec.clone(),
+                status: ScheduleStatus::Active,
+                context: None,
+                last_fired_at: None,
+                automatic_backfill: false,
+                cron_timezone: None,
+                queue_name: None,
+            })
+            .collect()
     }
 
     /// Stop the queue dispatchers and wait for in-flight workflow tasks started
@@ -1212,89 +1313,218 @@ async fn run_to_completion(
     }
 }
 
+/// A firing loop the reconciler has installed for one schedule.
+struct InstalledSchedule {
+    /// The schedule row's id when installed; a change means it was recreated, so
+    /// the loop is retired and replaced.
+    schedule_id: String,
+    /// Set to stop the firing loop (schedule paused, deleted, or recreated).
+    stop: Arc<AtomicBool>,
+}
+
+/// Reconciles the desired set of schedules with running firing loops. Each pass
+/// the desired set is the persisted `ACTIVE` schedules plus the in-memory
+/// `macro_schedules` (the `#[workflow(schedule)]` ones, re-seeded every launch),
+/// with a persisted schedule shadowing a macro one of the same name. It installs
+/// a [`schedule_fire_loop`] for any newly desired schedule and retires loops
+/// whose schedule was paused, deleted, recreated, or (for a macro) removed from
+/// the code.
+async fn schedule_reconciler(
+    rt: Arc<Runtime>,
+    shutting_down: Arc<AtomicBool>,
+    macro_schedules: Vec<WorkflowSchedule>,
+) {
+    let mut installed: HashMap<String, InstalledSchedule> = HashMap::new();
+
+    loop {
+        if shutting_down.load(Ordering::Relaxed) {
+            for entry in installed.values() {
+                entry.stop.store(true, Ordering::Relaxed);
+            }
+            return;
+        }
+
+        let mut desired = match rt
+            .provider
+            .list_schedules(&ScheduleFilter {
+                statuses: vec![ScheduleStatus::Active],
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "schedule reconciler: failed to list schedules");
+                sleep_until_or_shutdown(SCHEDULE_RECONCILE_INTERVAL, &shutting_down).await;
+                continue;
+            }
+        };
+
+        // Add macro schedules not shadowed by a persisted one of the same name.
+        let persisted: std::collections::HashSet<&str> =
+            desired.iter().map(|s| s.schedule_name.as_str()).collect();
+        let extra: Vec<WorkflowSchedule> = macro_schedules
+            .iter()
+            .filter(|m| !persisted.contains(m.schedule_name.as_str()))
+            .cloned()
+            .collect();
+        desired.extend(extra);
+
+        // Retire loops whose schedule is gone, no longer desired, or recreated.
+        installed.retain(|name, entry| {
+            let keep = desired
+                .iter()
+                .any(|s| s.schedule_name == *name && s.schedule_id == entry.schedule_id);
+            if !keep {
+                entry.stop.store(true, Ordering::Relaxed);
+            }
+            keep
+        });
+
+        // Install loops for newly desired schedules.
+        for schedule in desired {
+            if installed.contains_key(&schedule.schedule_name) {
+                continue;
+            }
+            let stop = Arc::new(AtomicBool::new(false));
+            installed.insert(
+                schedule.schedule_name.clone(),
+                InstalledSchedule {
+                    schedule_id: schedule.schedule_id.clone(),
+                    stop: stop.clone(),
+                },
+            );
+            tokio::spawn(schedule_fire_loop(
+                schedule,
+                rt.clone(),
+                stop,
+                shutting_down.clone(),
+            ));
+        }
+
+        sleep_until_or_shutdown(SCHEDULE_RECONCILE_INTERVAL, &shutting_down).await;
+    }
+}
+
 /// Per-schedule cron loop: at each tick, start the workflow under a
 /// deterministic id derived from the tick time, so the run happens exactly once
 /// even across multiple executors (the idempotent status insert is the
-/// arbiter). The per-tick id has the form `sched-{name}-{time}`.
-async fn schedule_loop(
-    name: String,
-    spec: String,
-    handler: WorkflowFn,
+/// arbiter). The per-tick id has the form `sched-{name}-{time}`. Exits when the
+/// reconciler sets `stop` or the engine is shutting down.
+async fn schedule_fire_loop(
+    schedule: WorkflowSchedule,
     rt: Arc<Runtime>,
+    stop: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
 ) {
-    let provider = rt.provider.clone();
-    let executor_id = rt.executor_id.clone();
-    let app_version = rt.app_version.clone();
-    let inflight = rt.inflight.clone();
-    use std::str::FromStr;
-    let schedule = match cron::Schedule::from_str(&spec) {
+    let cron = match cron::Schedule::from_str(&schedule.schedule) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(
-                workflow = %name, schedule = %spec, error = %e,
-                "invalid cron schedule; scheduler not started for this workflow"
+                schedule = %schedule.schedule_name, spec = %schedule.schedule, error = %e,
+                "invalid cron schedule; not firing"
             );
             return;
         }
     };
 
     loop {
-        if shutting_down.load(Ordering::Relaxed) {
+        if stop.load(Ordering::Relaxed) || shutting_down.load(Ordering::Relaxed) {
             return;
         }
-        let Some(next) = schedule.after(&chrono::Utc::now()).next() else {
+        let Some(next) = cron.after(&chrono::Utc::now()).next() else {
             return;
         };
         let wait = (next - chrono::Utc::now())
             .to_std()
             .unwrap_or(Duration::ZERO);
-        tokio::time::sleep(wait).await;
-        if shutting_down.load(Ordering::Relaxed) {
+        if !sleep_until_or_stop(wait, &stop, &shutting_down).await {
             return;
         }
 
         // Deterministic per-tick id; the scheduled time is the workflow input.
-        let wf_id = format!("sched-{name}-{}", next.to_rfc3339());
+        let wf_id = format!("sched-{}-{}", schedule.schedule_name, next.to_rfc3339());
         let input = Value::String(next.to_rfc3339());
-        let mut row = WorkflowStatus::new(
-            &wf_id,
-            &name,
-            input,
-            STATUS_PENDING,
-            &executor_id,
-            &app_version,
-        );
-        row.started_at_ms = Some(chrono::Utc::now().timestamp_millis());
+        let opts = WorkflowOptions {
+            workflow_id: Some(wf_id.clone()),
+            queue: schedule.queue_name.clone(),
+            ..Default::default()
+        };
+        let auth = AuthContext::default();
+        match rt
+            .insert_run(&wf_id, &schedule.workflow_name, input, &opts, None, &auth)
+            .await
+        {
+            Ok((canonical, queued)) => {
+                // Test hook: simulate an abrupt failure of the scheduling
+                // process right after the tick is persisted but before it runs
+                // (and before `last_fired_at` is stamped). Recovery must then
+                // complete the orphaned PENDING tick exactly once. A no-op unless
+                // armed via the `fail` registry. See `tests/schedule_failpoint.rs`.
+                fail::fail_point!("schedule_tick_after_persist", |_| {});
 
-        match provider.insert_workflow_status(row).await {
-            Ok(canonical) => {
-                // We run the tick only if our insert created the row (its
-                // executor_id is ours) and it is not already finished. A
-                // different executor that won the insert runs it instead.
-                if canonical.executor_id == executor_id && !is_terminal(&canonical.status) {
-                    inflight.fetch_add(1, Ordering::Relaxed);
-                    let rt = rt.clone();
-                    let handler = handler.clone();
-                    let guard = InflightGuard(inflight.clone());
-                    let auth = AuthContext::from_status(&canonical);
-                    tokio::spawn(async move {
-                        let _guard = guard;
-                        let _ = run_to_completion(
-                            rt,
-                            handler,
+                // A queued tick is left for a dispatcher to claim. A direct tick
+                // runs here only if our idempotent insert created the row (its
+                // executor is ours) and it is not already finished.
+                if !queued
+                    && canonical.executor_id == rt.executor_id
+                    && !is_terminal(&canonical.status)
+                {
+                    if let Some(handler) = rt.workflows.get(&schedule.workflow_name).cloned() {
+                        rt.spawn_detached(
                             wf_id,
+                            handler,
                             canonical.input,
                             canonical.deadline_ms,
                             auth,
-                        )
-                        .await;
-                    });
+                        );
+                    }
                 }
             }
             Err(e) => {
-                tracing::warn!(workflow = %name, error = %e, "failed to persist scheduled tick");
+                tracing::warn!(
+                    schedule = %schedule.schedule_name, error = %e,
+                    "failed to persist scheduled tick"
+                );
             }
         }
+
+        // Test hook: simulate the scheduling process dying after the tick was
+        // dispatched but before `last_fired_at` is recorded. The dispatched run
+        // still completes; only the bookkeeping write is skipped. A no-op unless
+        // armed via the `fail` registry. See `tests/schedule_failpoint.rs`.
+        fail::fail_point!("schedule_tick_before_reschedule", |_| {});
+
+        let _ = rt
+            .provider
+            .set_schedule_last_fired(&schedule.schedule_name, next.timestamp_millis())
+            .await;
+    }
+}
+
+/// Sleep up to `dur`, returning early if the engine starts shutting down. Used
+/// by the reconciler between passes.
+async fn sleep_until_or_shutdown(dur: Duration, shutting_down: &Arc<AtomicBool>) {
+    sleep_until_or_stop(dur, &Arc::new(AtomicBool::new(false)), shutting_down).await;
+}
+
+/// Sleep up to `dur` in short slices so `stop`/`shutting_down` are observed
+/// promptly. Returns `true` if the full duration elapsed, `false` if it was cut
+/// short by a stop/shutdown signal.
+async fn sleep_until_or_stop(
+    dur: Duration,
+    stop: &Arc<AtomicBool>,
+    shutting_down: &Arc<AtomicBool>,
+) -> bool {
+    let deadline = std::time::Instant::now() + dur;
+    loop {
+        if stop.load(Ordering::Relaxed) || shutting_down.load(Ordering::Relaxed) {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        tokio::time::sleep((deadline - now).min(Duration::from_millis(100))).await;
     }
 }

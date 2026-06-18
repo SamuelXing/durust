@@ -4,6 +4,7 @@ use crate::provider::{
     StepInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED,
     STATUS_DELAYED, STATUS_ENQUEUED, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
 };
+use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -41,6 +42,8 @@ struct Inner {
     /// Append-only streams keyed by `(workflow_id, key)`. Each entry's offset is
     /// its index; `None` is the close sentinel sealing the stream.
     streams: HashMap<(String, String), Vec<Option<Value>>>,
+    /// Persisted cron schedules keyed by `schedule_name`.
+    schedules: HashMap<String, WorkflowSchedule>,
 }
 
 /// In-memory [`StateProvider`] for tests and quick starts (no database needed).
@@ -844,5 +847,64 @@ impl StateProvider for InMemoryProvider {
             }
         }
         Ok((values, closed))
+    }
+
+    async fn create_schedule(&self, schedule: &WorkflowSchedule) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        if g.schedules.contains_key(&schedule.schedule_name) {
+            return Err(Error::app(format!(
+                "schedule `{}` already exists",
+                schedule.schedule_name
+            )));
+        }
+        g.schedules
+            .insert(schedule.schedule_name.clone(), schedule.clone());
+        Ok(())
+    }
+
+    async fn list_schedules(&self, filter: &ScheduleFilter) -> Result<Vec<WorkflowSchedule>> {
+        let g = self.inner.lock().await;
+        let mut out: Vec<WorkflowSchedule> = g
+            .schedules
+            .values()
+            .filter(|s| filter.statuses.is_empty() || filter.statuses.contains(&s.status))
+            .filter(|s| {
+                filter.workflow_names.is_empty() || filter.workflow_names.contains(&s.workflow_name)
+            })
+            .filter(|s| {
+                filter.name_prefixes.is_empty()
+                    || filter
+                        .name_prefixes
+                        .iter()
+                        .any(|p| s.schedule_name.starts_with(p))
+            })
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.schedule_name.cmp(&b.schedule_name));
+        Ok(out)
+    }
+
+    async fn set_schedule_status(&self, name: &str, status: ScheduleStatus) -> Result<bool> {
+        let mut g = self.inner.lock().await;
+        match g.schedules.get_mut(name) {
+            Some(s) => {
+                s.status = status;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn set_schedule_last_fired(&self, name: &str, at_ms: i64) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        if let Some(s) = g.schedules.get_mut(name) {
+            s.last_fired_at = DateTime::from_timestamp_millis(at_ms);
+        }
+        Ok(())
+    }
+
+    async fn delete_schedule(&self, name: &str) -> Result<bool> {
+        let mut g = self.inner.lock().await;
+        Ok(g.schedules.remove(name).is_some())
     }
 }

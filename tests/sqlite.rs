@@ -1038,3 +1038,68 @@ async fn sqlite_step_aggregates() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// A schedule created on one engine survives a "restart" (a fresh engine over the
+/// same database file): its row, status, and context come back, a pause persists,
+/// and a delete removes it.
+#[tokio::test]
+async fn sqlite_schedule_persists_across_restart() -> Result<()> {
+    use durust::{ScheduleFilter, ScheduleOptions, ScheduleStatus};
+    let (url, path) = temp_db_url("schedule-crud");
+
+    // Engine A creates the schedule.
+    {
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        engine.register(
+            "nightly_job",
+            |_ctx: DurableContext, _: String| async move { Ok::<_, Error>(()) },
+        );
+        engine
+            .create_schedule(
+                "nightly",
+                "nightly_job",
+                "0 0 0 * * *",
+                ScheduleOptions::new()
+                    .context(&serde_json::json!({"region": "us"}))
+                    .queue_name("internal"),
+            )
+            .await?;
+    }
+
+    // Engine B reads it back, with context and queue intact, then pauses it.
+    {
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        engine.register(
+            "nightly_job",
+            |_ctx: DurableContext, _: String| async move { Ok::<_, Error>(()) },
+        );
+        let got = engine.get_schedule("nightly").await?.expect("persisted");
+        assert_eq!(got.workflow_name, "nightly_job");
+        assert_eq!(got.status, ScheduleStatus::Active);
+        assert_eq!(got.queue_name.as_deref(), Some("internal"));
+        assert_eq!(
+            got.context.as_ref().and_then(|v| v.get("region")),
+            Some(&serde_json::json!("us"))
+        );
+        assert!(engine.pause_schedule("nightly").await?);
+    }
+
+    // Engine C sees the pause and deletes the schedule.
+    {
+        let engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        let paused = engine.get_schedule("nightly").await?.expect("persisted");
+        assert_eq!(paused.status, ScheduleStatus::Paused);
+        assert!(engine
+            .list_schedules(&ScheduleFilter {
+                statuses: vec![ScheduleStatus::Active],
+                ..Default::default()
+            })
+            .await?
+            .is_empty());
+        assert!(engine.delete_schedule("nightly").await?);
+        assert!(engine.get_schedule("nightly").await?.is_none());
+    }
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
