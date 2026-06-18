@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -685,6 +686,23 @@ pub trait StateProvider: Send + Sync {
         key: &str,
         from_offset: i32,
     ) -> Result<(Vec<Value>, bool)>;
+
+    /// Insert a schedule row. The `schedule_name` is unique, so creating one that
+    /// already exists is a unique violation.
+    async fn create_schedule(&self, schedule: &WorkflowSchedule) -> Result<()>;
+
+    /// All schedules matching `filter` (empty filter returns every schedule),
+    /// ordered by `schedule_name`.
+    async fn list_schedules(&self, filter: &ScheduleFilter) -> Result<Vec<WorkflowSchedule>>;
+
+    /// Set a schedule's status. Returns whether a row matched.
+    async fn set_schedule_status(&self, name: &str, status: ScheduleStatus) -> Result<bool>;
+
+    /// Stamp `last_fired_at` (epoch ms) on a schedule. A no-op if it is gone.
+    async fn set_schedule_last_fired(&self, name: &str, at_ms: i64) -> Result<()>;
+
+    /// Delete a schedule by name. Returns whether a row was removed.
+    async fn delete_schedule(&self, name: &str) -> Result<bool>;
 }
 
 #[cfg(test)]

@@ -766,3 +766,65 @@ async fn pg_step_aggregates() -> Result<()> {
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
+
+/// Schedule CRUD round-trips through Postgres: create with context + queue, read
+/// it back, pause (reflected in a status filter), and delete. A uuid-suffixed
+/// name keeps it isolated from other tests sharing the database.
+#[tokio::test]
+async fn pg_schedule_crud() -> Result<()> {
+    use durust::{ScheduleFilter, ScheduleOptions, ScheduleStatus};
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_schedule_crud: DATABASE_URL unset");
+        return Ok(());
+    };
+
+    let mut engine = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
+    engine.register(
+        "nightly_job",
+        |_ctx: DurableContext, _: String| async move { Ok::<_, Error>(()) },
+    );
+
+    let name = format!("nightly-{}", uuid::Uuid::new_v4());
+    engine
+        .create_schedule(
+            &name,
+            "nightly_job",
+            "0 0 0 * * *",
+            ScheduleOptions::new()
+                .context(&serde_json::json!({"region": "us"}))
+                .queue_name("internal"),
+        )
+        .await?;
+
+    let got = engine.get_schedule(&name).await?.expect("persisted");
+    assert_eq!(got.workflow_name, "nightly_job");
+    assert_eq!(got.status, ScheduleStatus::Active);
+    assert_eq!(got.queue_name.as_deref(), Some("internal"));
+    assert_eq!(
+        got.context.as_ref().and_then(|v| v.get("region")),
+        Some(&serde_json::json!("us"))
+    );
+
+    // A duplicate name is rejected.
+    assert!(engine
+        .create_schedule(&name, "nightly_job", "0 0 0 * * *", ScheduleOptions::new())
+        .await
+        .is_err());
+
+    assert!(engine.pause_schedule(&name).await?);
+    let active = engine
+        .list_schedules(&ScheduleFilter {
+            statuses: vec![ScheduleStatus::Active],
+            name_prefixes: vec![name.clone()],
+            ..Default::default()
+        })
+        .await?;
+    assert!(
+        active.is_empty(),
+        "paused schedule drops out of the active filter"
+    );
+
+    assert!(engine.delete_schedule(&name).await?);
+    assert!(engine.get_schedule(&name).await?.is_none());
+    Ok(())
+}

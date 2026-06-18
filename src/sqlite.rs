@@ -6,6 +6,7 @@ use crate::provider::{
     STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
     STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL,
 };
+use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -998,6 +999,135 @@ impl StateProvider for SqliteProvider {
         }
         Ok((values, closed))
     }
+
+    async fn create_schedule(&self, schedule: &WorkflowSchedule) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO workflow_schedules (
+                 schedule_id, schedule_name, workflow_name, schedule, status, context,
+                 last_fired_at, automatic_backfill, cron_timezone, queue_name
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&schedule.schedule_id)
+        .bind(&schedule.schedule_name)
+        .bind(&schedule.workflow_name)
+        .bind(&schedule.schedule)
+        .bind(schedule.status.as_str())
+        .bind(encode_schedule_context(&schedule.context))
+        .bind(schedule.last_fired_at.map(|t| t.to_rfc3339()))
+        .bind(schedule.automatic_backfill)
+        .bind(&schedule.cron_timezone)
+        .bind(&schedule.queue_name)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_schedules(&self, filter: &ScheduleFilter) -> Result<Vec<WorkflowSchedule>> {
+        let mut qb = QueryBuilder::new(
+            "SELECT schedule_id, schedule_name, workflow_name, schedule, status, context, \
+             last_fired_at, automatic_backfill, cron_timezone, queue_name FROM workflow_schedules",
+        );
+        let mut sep = " WHERE ";
+        if !filter.statuses.is_empty() {
+            qb.push(sep).push("status IN (");
+            let mut list = qb.separated(", ");
+            for st in &filter.statuses {
+                list.push_bind(st.as_str());
+            }
+            qb.push(")");
+            sep = " AND ";
+        }
+        if !filter.workflow_names.is_empty() {
+            qb.push(sep).push("workflow_name IN (");
+            let mut list = qb.separated(", ");
+            for n in &filter.workflow_names {
+                list.push_bind(n);
+            }
+            qb.push(")");
+            sep = " AND ";
+        }
+        if !filter.name_prefixes.is_empty() {
+            qb.push(sep).push("(");
+            let mut sub = " ";
+            for p in &filter.name_prefixes {
+                qb.push(sub).push("schedule_name LIKE ");
+                qb.push_bind(format!("{p}%"));
+                sub = " OR ";
+            }
+            qb.push(")");
+        }
+        qb.push(" ORDER BY schedule_name ASC");
+
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        rows.iter().map(row_to_schedule).collect()
+    }
+
+    async fn set_schedule_status(&self, name: &str, status: ScheduleStatus) -> Result<bool> {
+        let res = sqlx::query("UPDATE workflow_schedules SET status = ? WHERE schedule_name = ?")
+            .bind(status.as_str())
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn set_schedule_last_fired(&self, name: &str, at_ms: i64) -> Result<()> {
+        let at = DateTime::from_timestamp_millis(at_ms).map(|t| t.to_rfc3339());
+        sqlx::query("UPDATE workflow_schedules SET last_fired_at = ? WHERE schedule_name = ?")
+            .bind(at)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_schedule(&self, name: &str) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM workflow_schedules WHERE schedule_name = ?")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+}
+
+/// Encode a schedule's optional context as the stored JSON text (`null` when
+/// absent, matching the cross-SDK `context TEXT NOT NULL` column).
+fn encode_schedule_context(context: &Option<Value>) -> String {
+    context
+        .as_ref()
+        .and_then(|v| serde_json::to_string(v).ok())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+/// Decode the stored context text back to an optional value (`null` -> `None`).
+fn decode_schedule_context(text: &str) -> Option<Value> {
+    match serde_json::from_str::<Value>(text) {
+        Ok(Value::Null) => None,
+        Ok(v) => Some(v),
+        Err(_) => None,
+    }
+}
+
+/// Map a `workflow_schedules` row to a [`WorkflowSchedule`].
+fn row_to_schedule(row: &sqlx::sqlite::SqliteRow) -> Result<WorkflowSchedule> {
+    let context: String = row
+        .try_get("context")
+        .unwrap_or_else(|_| "null".to_string());
+    let last_fired: Option<String> = row.try_get("last_fired_at").ok().flatten();
+    Ok(WorkflowSchedule {
+        schedule_id: row.get("schedule_id"),
+        schedule_name: row.get("schedule_name"),
+        workflow_name: row.get("workflow_name"),
+        schedule: row.get("schedule"),
+        status: ScheduleStatus::parse(&row.get::<String, _>("status")),
+        context: decode_schedule_context(&context),
+        last_fired_at: last_fired
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|t| t.with_timezone(&Utc)),
+        automatic_backfill: row.try_get("automatic_backfill").unwrap_or(false),
+        cron_timezone: row.try_get("cron_timezone").ok().flatten(),
+        queue_name: row.try_get("queue_name").ok().flatten(),
+    })
 }
 
 /// Map an `operation_outputs` row to a [`StepInfo`], decoding `output` per the
