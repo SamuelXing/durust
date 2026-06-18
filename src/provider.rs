@@ -415,6 +415,12 @@ pub trait StateProvider: Send + Sync {
     /// execution already wrote this step, the previously-stored value wins and is
     /// returned, guaranteeing every caller observes the same result.
     ///
+    /// `started_at_ms` is when the step's work began (epoch ms); the
+    /// implementation stamps `completed_at` itself as the time of the write.
+    /// `None` records no start time — used for instantaneous operations (sends,
+    /// event sets, sleep markers) that have no duration; such rows are excluded
+    /// from step duration aggregates.
+    ///
     /// Durable sleep is built on this too: the wake instant is recorded as an
     /// ordinary step (`DBOS.sleep`) in `operation_outputs` — there is no
     /// separate timers table.
@@ -424,6 +430,7 @@ pub trait StateProvider: Send + Sync {
         seq: i32,
         name: &str,
         value: Value,
+        started_at_ms: Option<i64>,
     ) -> Result<Value>;
 
     /// Atomically claim up to `req.max_tasks` `ENQUEUED` workflows from a queue,

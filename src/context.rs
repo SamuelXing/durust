@@ -309,8 +309,9 @@ impl DurableContext {
         if let Some(stored) = self.replay_or_guard::<T>(seq).await? {
             return Ok(stored);
         }
+        let started = chrono::Utc::now().timestamp_millis();
         let result = f().await?;
-        self.checkpoint(seq, name, result).await
+        self.checkpoint(seq, name, result, Some(started)).await
     }
 
     /// Run a durable step with an explicit retry [`StepOptions`] policy.
@@ -332,8 +333,10 @@ impl DurableContext {
             return Ok(stored);
         }
         // Run with retries; only the final result/error is observed.
+        let started = chrono::Utc::now().timestamp_millis();
         let result = self.run_with_retries(&opts, &mut f).await?;
-        self.checkpoint(seq, &opts.name, result).await
+        self.checkpoint(seq, &opts.name, result, Some(started))
+            .await
     }
 
     /// Race several async `branches` and return the `(index, value)` of the first
@@ -371,6 +374,7 @@ impl DurableContext {
         if let Some(stored) = self.replay_or_guard::<(usize, T)>(seq).await? {
             return Ok(stored);
         }
+        let started = chrono::Utc::now().timestamp_millis();
 
         // Poll the branches in index order on this one task; the first ready wins
         // (lowest index on a tie). The losers are dropped — and so cancelled —
@@ -386,7 +390,8 @@ impl DurableContext {
         })
         .await;
 
-        self.checkpoint(seq, "DBOS.select", (index, value)).await
+        self.checkpoint(seq, "DBOS.select", (index, value), Some(started))
+            .await
     }
 
     /// Shared step preamble: serve a replayed checkpoint if present, otherwise
@@ -410,16 +415,18 @@ impl DurableContext {
 
     /// Durably record `result` under `(workflow_id, seq)` and return the
     /// canonical stored value (a racing writer's value wins if there is one).
+    /// `started_at_ms` is when the step's work began, for duration introspection.
     async fn checkpoint<T: Serialize + DeserializeOwned>(
         &self,
         seq: i32,
         name: &str,
         result: T,
+        started_at_ms: Option<i64>,
     ) -> Result<T> {
         let json = serde_json::to_value(&result)?;
         let canonical = self
             .provider
-            .record_step_result(&self.workflow_id, seq, name, json)
+            .record_step_result(&self.workflow_id, seq, name, json, started_at_ms)
             .await?;
         Ok(serde_json::from_value(canonical)?)
     }
@@ -497,6 +504,7 @@ impl DurableContext {
                         seq,
                         "DBOS.sleep",
                         serde_json::to_value(proposed)?,
+                        None,
                     )
                     .await?;
                 Ok(serde_json::from_value(canonical)?)
@@ -524,7 +532,7 @@ impl DurableContext {
             .insert_notification(destination_id, topic, serde_json::to_value(message)?)
             .await?;
         self.provider
-            .record_step_result(&self.workflow_id, seq, "DBOS.send", Value::Null)
+            .record_step_result(&self.workflow_id, seq, "DBOS.send", Value::Null, None)
             .await?;
         Ok(())
     }
@@ -567,7 +575,7 @@ impl DurableContext {
             let now = chrono::Utc::now();
             if now >= deadline {
                 self.provider
-                    .record_step_result(&self.workflow_id, seq, "DBOS.recv", Value::Null)
+                    .record_step_result(&self.workflow_id, seq, "DBOS.recv", Value::Null, None)
                     .await?;
                 return Ok(None);
             }
@@ -588,7 +596,7 @@ impl DurableContext {
             .upsert_event(&self.workflow_id, key, serde_json::to_value(value)?)
             .await?;
         self.provider
-            .record_step_result(&self.workflow_id, seq, "DBOS.setEvent", Value::Null)
+            .record_step_result(&self.workflow_id, seq, "DBOS.setEvent", Value::Null, None)
             .await?;
         Ok(())
     }
@@ -619,7 +627,7 @@ impl DurableContext {
             {
                 let canonical = self
                     .provider
-                    .record_step_result(&self.workflow_id, seq, "DBOS.getEvent", value)
+                    .record_step_result(&self.workflow_id, seq, "DBOS.getEvent", value, None)
                     .await?;
                 return Ok(Some(serde_json::from_value(canonical)?));
             }
@@ -631,7 +639,7 @@ impl DurableContext {
             let now = chrono::Utc::now();
             if now >= deadline {
                 self.provider
-                    .record_step_result(&self.workflow_id, seq, "DBOS.getEvent", Value::Null)
+                    .record_step_result(&self.workflow_id, seq, "DBOS.getEvent", Value::Null, None)
                     .await?;
                 return Ok(None);
             }
@@ -663,7 +671,13 @@ impl DurableContext {
             )
             .await?;
         self.provider
-            .record_step_result(&self.workflow_id, seq, "DBOS.writeStream", Value::Null)
+            .record_step_result(
+                &self.workflow_id,
+                seq,
+                "DBOS.writeStream",
+                Value::Null,
+                None,
+            )
             .await?;
         Ok(())
     }
@@ -681,7 +695,13 @@ impl DurableContext {
             .write_stream(&self.workflow_id, key, None, seq)
             .await?;
         self.provider
-            .record_step_result(&self.workflow_id, seq, "DBOS.closeStream", Value::Null)
+            .record_step_result(
+                &self.workflow_id,
+                seq,
+                "DBOS.closeStream",
+                Value::Null,
+                None,
+            )
             .await?;
         Ok(())
     }
