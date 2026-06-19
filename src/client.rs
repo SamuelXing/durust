@@ -6,12 +6,15 @@
 //!
 //! [`DurableEngine`]: crate::DurableEngine
 
-use crate::engine::WorkflowOptions;
+use crate::engine::{parse_cron, parse_timezone, WorkflowOptions};
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{
     ListFilter, StateProvider, StepInfo, VersionInfo, WorkflowStatus, STATUS_DELAYED,
     STATUS_ENQUEUED, STATUS_PENDING,
+};
+use crate::schedule::{
+    ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus, WorkflowSchedule,
 };
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Serialize};
@@ -290,5 +293,109 @@ impl Client {
         self.provider
             .set_latest_application_version(version_name)
             .await
+    }
+
+    /// Create a durable cron schedule firing `workflow_name` on each tick of
+    /// `cron`. Validates the cron and timezone, but — unlike the engine — does
+    /// not require the workflow to be registered here: the executor that runs the
+    /// schedule owns that. Errors on an invalid spec or a duplicate name.
+    pub async fn create_schedule(
+        &self,
+        schedule_name: &str,
+        workflow_name: &str,
+        cron: &str,
+        opts: ScheduleOptions,
+    ) -> Result<()> {
+        if schedule_name.is_empty() {
+            return Err(Error::app("schedule_name is required"));
+        }
+        parse_cron(cron)?;
+        if let Some(tz) = &opts.cron_timezone {
+            parse_timezone(tz)?;
+        }
+        let schedule = WorkflowSchedule {
+            schedule_id: uuid::Uuid::new_v4().to_string(),
+            schedule_name: schedule_name.to_string(),
+            workflow_name: workflow_name.to_string(),
+            schedule: cron.to_string(),
+            status: ScheduleStatus::Active,
+            context: opts.context,
+            last_fired_at: None,
+            automatic_backfill: opts.automatic_backfill,
+            cron_timezone: opts.cron_timezone,
+            queue_name: opts.queue_name,
+        };
+        self.provider.create_schedule(&schedule).await
+    }
+
+    /// Create or replace each schedule by name, in one call (validated whole
+    /// before any write). Like [`create_schedule`](Self::create_schedule), the
+    /// workflow need not be registered here.
+    pub async fn apply_schedules(&self, schedules: Vec<ApplySchedule>) -> Result<()> {
+        for req in &schedules {
+            if req.schedule_name.is_empty() {
+                return Err(Error::app("schedule_name is required"));
+            }
+            parse_cron(&req.schedule)?;
+            if let Some(tz) = &req.options.cron_timezone {
+                parse_timezone(tz)?;
+            }
+        }
+        for req in schedules {
+            self.provider.delete_schedule(&req.schedule_name).await?;
+            let schedule = WorkflowSchedule {
+                schedule_id: uuid::Uuid::new_v4().to_string(),
+                schedule_name: req.schedule_name,
+                workflow_name: req.workflow_name,
+                schedule: req.schedule,
+                status: ScheduleStatus::Active,
+                context: req.options.context,
+                last_fired_at: None,
+                automatic_backfill: req.options.automatic_backfill,
+                cron_timezone: req.options.cron_timezone,
+                queue_name: req.options.queue_name,
+            };
+            self.provider.create_schedule(&schedule).await?;
+        }
+        Ok(())
+    }
+
+    /// The schedule named `schedule_name`, or `None` if there is none.
+    pub async fn get_schedule(&self, schedule_name: &str) -> Result<Option<WorkflowSchedule>> {
+        let schedules = self
+            .provider
+            .list_schedules(&ScheduleFilter {
+                name_prefixes: vec![schedule_name.to_string()],
+                ..Default::default()
+            })
+            .await?;
+        Ok(schedules
+            .into_iter()
+            .find(|s| s.schedule_name == schedule_name))
+    }
+
+    /// All schedules matching `filter` (a default filter returns every
+    /// schedule), ordered by name.
+    pub async fn list_schedules(&self, filter: &ScheduleFilter) -> Result<Vec<WorkflowSchedule>> {
+        self.provider.list_schedules(filter).await
+    }
+
+    /// Pause a schedule so it stops firing. Returns whether a schedule matched.
+    pub async fn pause_schedule(&self, schedule_name: &str) -> Result<bool> {
+        self.provider
+            .set_schedule_status(schedule_name, ScheduleStatus::Paused)
+            .await
+    }
+
+    /// Resume a paused schedule. Returns whether a schedule matched.
+    pub async fn resume_schedule(&self, schedule_name: &str) -> Result<bool> {
+        self.provider
+            .set_schedule_status(schedule_name, ScheduleStatus::Active)
+            .await
+    }
+
+    /// Delete a schedule. Returns whether a schedule was removed.
+    pub async fn delete_schedule(&self, schedule_name: &str) -> Result<bool> {
+        self.provider.delete_schedule(schedule_name).await
     }
 }

@@ -247,3 +247,104 @@ async fn client_reads_version_registry() -> Result<()> {
     assert!(client.set_latest_application_version("").await.is_err());
     Ok(())
 }
+
+/// The client manages schedules (no local registry needed): create/get/list,
+/// pause/resume, apply (create-or-replace), delete, with validation.
+#[tokio::test]
+async fn client_manages_schedules() -> Result<()> {
+    use durust::{ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus};
+    let client = Client::new(Arc::new(InMemoryProvider::new()));
+
+    client
+        .create_schedule("nightly", "report", "0 0 0 * * *", ScheduleOptions::new())
+        .await?;
+    let got = client.get_schedule("nightly").await?.expect("created");
+    assert_eq!(got.workflow_name, "report");
+    assert_eq!(got.status, ScheduleStatus::Active);
+
+    // Validation: bad cron, empty name, duplicate name.
+    assert!(client
+        .create_schedule("bad", "report", "not a cron", ScheduleOptions::new())
+        .await
+        .is_err());
+    assert!(client
+        .create_schedule("", "report", "0 0 0 * * *", ScheduleOptions::new())
+        .await
+        .is_err());
+    assert!(client
+        .create_schedule("nightly", "report", "0 0 0 * * *", ScheduleOptions::new())
+        .await
+        .is_err());
+
+    // Pause drops it from the ACTIVE filter; resume restores it.
+    assert!(client.pause_schedule("nightly").await?);
+    assert!(client
+        .list_schedules(&ScheduleFilter {
+            statuses: vec![ScheduleStatus::Active],
+            ..Default::default()
+        })
+        .await?
+        .is_empty());
+    assert!(client.resume_schedule("nightly").await?);
+
+    // apply replaces by name (fresh schedule_id) and adds new ones.
+    let before = client.get_schedule("nightly").await?.unwrap().schedule_id;
+    client
+        .apply_schedules(vec![
+            ApplySchedule::new("nightly", "report", "0 0 1 * * *"),
+            ApplySchedule::new("hourly", "report", "0 0 * * * *"),
+        ])
+        .await?;
+    let after = client.get_schedule("nightly").await?.unwrap();
+    assert_ne!(after.schedule_id, before, "replaced with a fresh id");
+    assert_eq!(after.schedule, "0 0 1 * * *");
+    assert_eq!(
+        client
+            .list_schedules(&ScheduleFilter::default())
+            .await?
+            .len(),
+        2
+    );
+
+    assert!(client.delete_schedule("nightly").await?);
+    assert!(client.get_schedule("nightly").await?.is_none());
+    Ok(())
+}
+
+/// A schedule a client creates is picked up and fired by a running engine whose
+/// reconciler discovers it — the cross-process scheduling path.
+#[tokio::test]
+async fn client_created_schedule_fires_on_engine() -> Result<()> {
+    use durust::ScheduleOptions;
+    static FIRED: AtomicUsize = AtomicUsize::new(0);
+    let provider = Arc::new(InMemoryProvider::new());
+
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("tick_job", |_ctx: DurableContext, _at: String| async move {
+        FIRED.fetch_add(1, Ordering::SeqCst);
+        Ok::<_, Error>(())
+    });
+    engine.launch().await?;
+
+    // The client declares the schedule; the engine's reconciler installs it.
+    let client = Client::new(provider.clone());
+    client
+        .create_schedule("tick", "tick_job", "* * * * * *", ScheduleOptions::new())
+        .await?;
+
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    engine.shutdown(Duration::from_secs(1)).await?;
+
+    assert!(
+        FIRED.load(Ordering::SeqCst) >= 1,
+        "engine fired the client-created schedule"
+    );
+    let rows = client
+        .list_workflows(&ListFilter {
+            workflow_id_prefix: Some("sched-tick-".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    assert!(!rows.is_empty(), "scheduled ticks were persisted");
+    Ok(())
+}

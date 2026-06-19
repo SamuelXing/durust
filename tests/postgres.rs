@@ -1083,3 +1083,60 @@ async fn pg_client_manages_workflows() -> Result<()> {
     engine.shutdown(Duration::from_secs(2)).await?;
     Ok(())
 }
+
+/// Client schedule management persists through Postgres: create with context +
+/// queue, read back, pause (drops from the active filter), apply (replace), and
+/// delete. A uuid-suffixed name isolates it; no engine runs, so nothing fires.
+#[tokio::test]
+async fn pg_client_manages_schedules() -> Result<()> {
+    use durust::{ApplySchedule, Client, ScheduleFilter, ScheduleOptions, ScheduleStatus};
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_client_manages_schedules: DATABASE_URL unset");
+        return Ok(());
+    };
+    let name = format!("nightly-{}", uuid::Uuid::new_v4());
+    let client = Client::new(Arc::new(PostgresProvider::connect(&url).await?));
+
+    client
+        .create_schedule(
+            &name,
+            "report",
+            "0 0 0 * * *",
+            ScheduleOptions::new()
+                .context(&serde_json::json!({"region": "us"}))
+                .queue_name("internal"),
+        )
+        .await?;
+    let got = client.get_schedule(&name).await?.expect("created");
+    assert_eq!(got.workflow_name, "report");
+    assert_eq!(got.queue_name.as_deref(), Some("internal"));
+
+    // Duplicate rejected.
+    assert!(client
+        .create_schedule(&name, "report", "0 0 0 * * *", ScheduleOptions::new())
+        .await
+        .is_err());
+
+    assert!(client.pause_schedule(&name).await?);
+    assert!(client
+        .list_schedules(&ScheduleFilter {
+            statuses: vec![ScheduleStatus::Active],
+            name_prefixes: vec![name.clone()],
+            ..Default::default()
+        })
+        .await?
+        .is_empty());
+
+    // apply replaces it with a fresh id.
+    let before = got.schedule_id;
+    client
+        .apply_schedules(vec![ApplySchedule::new(&name, "report", "0 0 1 * * *")])
+        .await?;
+    let after = client.get_schedule(&name).await?.expect("replaced");
+    assert_ne!(after.schedule_id, before);
+    assert_eq!(after.schedule, "0 0 1 * * *");
+
+    assert!(client.delete_schedule(&name).await?);
+    assert!(client.get_schedule(&name).await?.is_none());
+    Ok(())
+}

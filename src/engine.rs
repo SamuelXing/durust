@@ -1500,13 +1500,13 @@ struct InstalledSchedule {
 
 /// Parse a 6-field (second-precision) cron spec, mapping the parse error to an
 /// application error.
-fn parse_cron(spec: &str) -> Result<cron::Schedule> {
+pub(crate) fn parse_cron(spec: &str) -> Result<cron::Schedule> {
     cron::Schedule::from_str(spec)
         .map_err(|e| Error::app(format!("invalid cron schedule `{spec}`: {e}")))
 }
 
 /// Validate an IANA timezone name (e.g. `America/New_York`).
-fn parse_timezone(tz: &str) -> Result<chrono_tz::Tz> {
+pub(crate) fn parse_timezone(tz: &str) -> Result<chrono_tz::Tz> {
     tz.parse::<chrono_tz::Tz>()
         .map_err(|_| Error::app(format!("invalid cron timezone `{tz}`")))
 }
