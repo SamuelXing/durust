@@ -1003,3 +1003,83 @@ async fn pg_client_enqueues_work_an_engine_runs() -> Result<()> {
     engine.shutdown(Duration::from_secs(2)).await?;
     Ok(())
 }
+
+/// Client management over Postgres: reschedule a DELAYED workflow so the engine
+/// runs it, and cancel + delete another. Names are uuid-scoped for isolation.
+#[tokio::test]
+async fn pg_client_manages_workflows() -> Result<()> {
+    use durust::WorkflowQueue;
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_client_manages_workflows: DATABASE_URL unset");
+        return Ok(());
+    };
+    let wf = format!("ping-{}", uuid::Uuid::new_v4());
+    let queue = format!("q-{}", uuid::Uuid::new_v4());
+    let run_id = format!("run-{}", uuid::Uuid::new_v4());
+    let cancel_id = format!("cancel-{}", uuid::Uuid::new_v4());
+
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register(&wf, |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(())
+    });
+    engine.register_queue(WorkflowQueue::new(&queue));
+    engine.launch().await?;
+    let client = durust::Client::new(provider.clone());
+
+    // Enqueue far in the future, then pull it in: the engine runs it.
+    let mut run = client
+        .enqueue::<_, ()>(
+            &queue,
+            &wf,
+            (),
+            WorkflowOptions {
+                workflow_id: Some(run_id.clone()),
+                delay: Some(Duration::from_secs(60)),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(
+        client
+            .set_workflow_delay(&run_id, Duration::from_millis(10))
+            .await?
+    );
+    run.get_result().await?;
+
+    // Enqueue another, cancel it, then delete it.
+    client
+        .enqueue::<_, ()>(
+            &queue,
+            &wf,
+            (),
+            WorkflowOptions {
+                workflow_id: Some(cancel_id.clone()),
+                delay: Some(Duration::from_secs(60)),
+                ..Default::default()
+            },
+        )
+        .await?;
+    client.cancel_workflow(&cancel_id).await?;
+    let one = client
+        .list_workflows(&ListFilter {
+            workflow_id_prefix: Some(cancel_id.clone()),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].status, "CANCELLED");
+    client
+        .delete_workflows(std::slice::from_ref(&cancel_id), false)
+        .await?;
+    assert!(client
+        .list_workflows(&ListFilter {
+            workflow_id_prefix: Some(cancel_id),
+            ..Default::default()
+        })
+        .await?
+        .is_empty());
+
+    engine.shutdown(Duration::from_secs(2)).await?;
+    Ok(())
+}

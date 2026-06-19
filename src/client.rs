@@ -10,12 +10,17 @@ use crate::engine::WorkflowOptions;
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{
-    ListFilter, StateProvider, StepInfo, WorkflowStatus, STATUS_DELAYED, STATUS_ENQUEUED,
+    ListFilter, StateProvider, StepInfo, VersionInfo, WorkflowStatus, STATUS_DELAYED,
+    STATUS_ENQUEUED, STATUS_PENDING,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// How often [`Client::read_stream`] re-checks for new stream entries while the
+/// producing workflow is still active.
+const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// A registry-less, out-of-process handle over the system database.
 ///
@@ -178,5 +183,112 @@ impl Client {
     /// The recorded steps of a workflow, ordered by step id.
     pub async fn get_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepInfo>> {
         self.provider.get_workflow_steps(workflow_id).await
+    }
+
+    /// Cancel a workflow: a non-terminal one is set `CANCELLED` and removed from
+    /// its queue; a running workflow stops at its next step.
+    pub async fn cancel_workflow(&self, id: &str) -> Result<()> {
+        self.provider.cancel_workflow(id).await
+    }
+
+    /// Cancel many workflows in one round-trip. Missing or already-terminal ids
+    /// are skipped; an empty slice is a no-op.
+    pub async fn cancel_workflows(&self, ids: &[String]) -> Result<()> {
+        self.provider.cancel_workflows(ids).await
+    }
+
+    /// Delete many workflows and (via `ON DELETE CASCADE`) their step / event /
+    /// stream rows. When `delete_children`, every descendant by
+    /// `parent_workflow_id` is removed too. Missing ids are skipped.
+    pub async fn delete_workflows(&self, ids: &[String], delete_children: bool) -> Result<()> {
+        self.provider.delete_workflows(ids, delete_children).await
+    }
+
+    /// Reschedule a `DELAYED` workflow to become eligible `delay` from now. A
+    /// running executor's dispatcher promotes it once due. Returns `false` (no
+    /// error) if no `DELAYED` row matched.
+    pub async fn set_workflow_delay(&self, id: &str, delay: Duration) -> Result<bool> {
+        let until = Utc::now().timestamp_millis() + delay.as_millis() as i64;
+        self.provider.set_workflow_delay(id, until).await
+    }
+
+    /// Like [`set_workflow_delay`](Self::set_workflow_delay) but with an absolute
+    /// instant rather than an offset from now.
+    pub async fn set_workflow_delay_until(&self, id: &str, at: DateTime<Utc>) -> Result<bool> {
+        self.provider
+            .set_workflow_delay(id, at.timestamp_millis())
+            .await
+    }
+
+    /// Read a workflow's stream `key` in order, blocking until the stream closes
+    /// or the producing workflow goes inactive. Returns the values and whether
+    /// the stream is closed.
+    pub async fn read_stream<T: DeserializeOwned>(
+        &self,
+        workflow_id: &str,
+        key: &str,
+    ) -> Result<(Vec<T>, bool)> {
+        let mut all = Vec::new();
+        let mut offset = 0_i32;
+        loop {
+            let (values, closed) = self.provider.read_stream(workflow_id, key, offset).await?;
+            offset += values.len() as i32;
+            for v in values {
+                all.push(serde_json::from_value(v)?);
+            }
+            if closed {
+                return Ok((all, true));
+            }
+            match self.provider.get_workflow_status(workflow_id).await? {
+                None => return Err(Error::nonexistent_workflow(workflow_id)),
+                Some(s) if s.status != STATUS_PENDING && s.status != STATUS_ENQUEUED => {
+                    return Ok((all, true));
+                }
+                _ => {}
+            }
+            tokio::time::sleep(STREAM_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Read the currently-available values of stream `key` from `from_offset`
+    /// without blocking. Returns the values in order and whether the stream is
+    /// closed. Pass the count read so far as the next `from_offset` to poll.
+    pub async fn read_stream_snapshot<T: DeserializeOwned>(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        from_offset: i32,
+    ) -> Result<(Vec<T>, bool)> {
+        let (values, closed) = self
+            .provider
+            .read_stream(workflow_id, key, from_offset)
+            .await?;
+        let out = values
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<std::result::Result<Vec<T>, _>>()?;
+        Ok((out, closed))
+    }
+
+    /// Every registered application version, newest first.
+    pub async fn list_application_versions(&self) -> Result<Vec<VersionInfo>> {
+        self.provider.list_application_versions().await
+    }
+
+    /// The latest registered application version, or `None` if none are
+    /// registered.
+    pub async fn get_latest_application_version(&self) -> Result<Option<VersionInfo>> {
+        self.provider.get_latest_application_version().await
+    }
+
+    /// Mark a registered version as latest (bumps its `version_timestamp`).
+    /// Returns whether a matching version existed; rejects an empty name.
+    pub async fn set_latest_application_version(&self, version_name: &str) -> Result<bool> {
+        if version_name.is_empty() {
+            return Err(Error::app("version_name is required"));
+        }
+        self.provider
+            .set_latest_application_version(version_name)
+            .await
     }
 }
