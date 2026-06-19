@@ -905,3 +905,62 @@ async fn pg_schedule_backfill_apply_trigger() -> Result<()> {
     engine.delete_schedule(&name).await?;
     Ok(())
 }
+
+/// Application version registry through Postgres. The DB is shared and tests run
+/// in parallel, so versions are uuid-suffixed and only the *relative* order of
+/// this test's own two versions is asserted (global "latest" would be racy).
+#[tokio::test]
+async fn pg_application_versions() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_application_versions: DATABASE_URL unset");
+        return Ok(());
+    };
+    let v_a = format!("va-{}", uuid::Uuid::new_v4());
+    let v_b = format!("vb-{}", uuid::Uuid::new_v4());
+
+    // Index of a version_name within the (newest-first) list.
+    async fn index_of(engine: &DurableEngine, name: &str) -> Result<usize> {
+        let versions = engine.list_application_versions().await?;
+        Ok(versions
+            .iter()
+            .position(|v| v.version_name == name)
+            .expect("version present"))
+    }
+
+    // Register v_a, then v_b later, so v_b sorts ahead of v_a.
+    let a = DurableEngine::new_with_version(
+        Arc::new(PostgresProvider::connect(&url).await?),
+        v_a.clone(),
+    )
+    .await?;
+    a.launch().await?;
+    a.shutdown(Duration::from_secs(1)).await?;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let b = DurableEngine::new_with_version(
+        Arc::new(PostgresProvider::connect(&url).await?),
+        v_b.clone(),
+    )
+    .await?;
+    b.launch().await?;
+    b.shutdown(Duration::from_secs(1)).await?;
+
+    assert!(
+        index_of(&a, &v_b).await? < index_of(&a, &v_a).await?,
+        "newer version sorts first"
+    );
+
+    // Promote v_a: it now sorts ahead of v_b.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert!(a.set_latest_application_version(&v_a).await?);
+    assert!(
+        index_of(&a, &v_a).await? < index_of(&a, &v_b).await?,
+        "promoted version sorts first"
+    );
+
+    // Unknown version is a no-op.
+    assert!(
+        !a.set_latest_application_version(&format!("nope-{}", uuid::Uuid::new_v4()))
+            .await?
+    );
+    Ok(())
+}

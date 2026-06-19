@@ -3,8 +3,9 @@ use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{
     is_terminal, DequeueRequest, ListFilter, StateProvider, StepAggregate, StepAggregateQuery,
-    StepInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED,
-    STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_PENDING, STATUS_SUCCESS,
+    StepInfo, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
+    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_PENDING,
+    STATUS_SUCCESS,
 };
 use crate::queue::WorkflowQueue;
 use crate::schedule::{
@@ -490,6 +491,29 @@ impl DurableEngine {
             .await
     }
 
+    /// Every registered application version, newest first. Versions are recorded
+    /// in `application_versions` when an engine of that version launches.
+    pub async fn list_application_versions(&self) -> Result<Vec<VersionInfo>> {
+        self.provider.list_application_versions().await
+    }
+
+    /// The latest registered application version (most recent `version_timestamp`),
+    /// or `None` if none are registered.
+    pub async fn get_latest_application_version(&self) -> Result<Option<VersionInfo>> {
+        self.provider.get_latest_application_version().await
+    }
+
+    /// Mark a registered version as latest (bumps its `version_timestamp` to now).
+    /// Returns whether a matching version existed.
+    pub async fn set_latest_application_version(&self, version_name: &str) -> Result<bool> {
+        if version_name.is_empty() {
+            return Err(Error::app("version_name is required"));
+        }
+        self.provider
+            .set_latest_application_version(version_name)
+            .await
+    }
+
     /// Start background processing: one dispatcher task per registered queue and
     /// one scheduler task per `#[workflow(schedule = …)]` workflow. Workflow
     /// timeouts are enforced inline per run, so they need no separate sweep. Call
@@ -497,6 +521,23 @@ impl DurableEngine {
     pub async fn launch(&self) -> Result<()> {
         self.shutting_down.store(false, Ordering::Relaxed);
         let rt = self.runtime();
+
+        // Register this process's application version and warn if it is not the
+        // latest (a newer deploy has registered a higher version).
+        if let Err(e) = self
+            .provider
+            .create_application_version(&self.app_version)
+            .await
+        {
+            tracing::warn!(version = %self.app_version, error = %e, "failed to register application version");
+        } else if let Ok(Some(latest)) = self.provider.get_latest_application_version().await {
+            if latest.version_name != self.app_version {
+                tracing::warn!(
+                    current = %self.app_version, latest = %latest.version_name,
+                    "current application version is not the latest"
+                );
+            }
+        }
 
         let mut tasks = self.dispatchers.lock().expect("dispatcher lock poisoned");
         for queue in self.queues.values() {

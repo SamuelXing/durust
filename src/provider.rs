@@ -424,6 +424,21 @@ pub struct StepInfo {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
+/// A registered application version (a row of `application_versions`). The
+/// "latest" version is the one with the most recent [`version_timestamp`](Self::version_timestamp).
+#[derive(Clone, Debug)]
+pub struct VersionInfo {
+    /// Stable unique id for this version row.
+    pub version_id: String,
+    /// The application version string (e.g. `0.1.0`).
+    pub version_name: String,
+    /// Recency marker; bumped by `set_latest_application_version` so the version
+    /// sorts to the top. Versions are ordered newest-first by this.
+    pub version_timestamp: DateTime<Utc>,
+    /// When the version was first registered.
+    pub created_at: DateTime<Utc>,
+}
+
 /// Parameters for one dequeue iteration, computed by the engine's dispatcher
 /// from a [`crate::WorkflowQueue`]'s configuration. Plain scalars so the storage
 /// layer stays decoupled from the queue type.
@@ -703,6 +718,21 @@ pub trait StateProvider: Send + Sync {
 
     /// Delete a schedule by name. Returns whether a row was removed.
     async fn delete_schedule(&self, name: &str) -> Result<bool>;
+
+    /// Register an application version, idempotently (no-op if `version_name`
+    /// already exists). Stamps both timestamps with now.
+    async fn create_application_version(&self, version_name: &str) -> Result<()>;
+
+    /// All registered application versions, newest `version_timestamp` first.
+    async fn list_application_versions(&self) -> Result<Vec<VersionInfo>>;
+
+    /// The version with the most recent `version_timestamp`, or `None` if none
+    /// are registered.
+    async fn get_latest_application_version(&self) -> Result<Option<VersionInfo>>;
+
+    /// Mark a version as latest by bumping its `version_timestamp` to now.
+    /// Returns whether a row matched (no-op if the name is unknown).
+    async fn set_latest_application_version(&self, version_name: &str) -> Result<bool>;
 }
 
 #[cfg(test)]

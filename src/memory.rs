@@ -1,8 +1,9 @@
 use crate::error::{Error, Result};
 use crate::provider::{
     is_terminal, DequeueRequest, ListFilter, StateProvider, StepAggregate, StepAggregateQuery,
-    StepInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED,
-    STATUS_DELAYED, STATUS_ENQUEUED, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
+    StepInfo, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
+    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED,
+    STATUS_PENDING,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use async_trait::async_trait;
@@ -44,6 +45,8 @@ struct Inner {
     streams: HashMap<(String, String), Vec<Option<Value>>>,
     /// Persisted cron schedules keyed by `schedule_name`.
     schedules: HashMap<String, WorkflowSchedule>,
+    /// Registered application versions keyed by `version_name`.
+    versions: HashMap<String, VersionInfo>,
 }
 
 /// In-memory [`StateProvider`] for tests and quick starts (no database needed).
@@ -906,5 +909,45 @@ impl StateProvider for InMemoryProvider {
     async fn delete_schedule(&self, name: &str) -> Result<bool> {
         let mut g = self.inner.lock().await;
         Ok(g.schedules.remove(name).is_some())
+    }
+
+    async fn create_application_version(&self, version_name: &str) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        let now = Utc::now();
+        g.versions
+            .entry(version_name.to_string())
+            .or_insert_with(|| VersionInfo {
+                version_id: uuid::Uuid::new_v4().to_string(),
+                version_name: version_name.to_string(),
+                version_timestamp: now,
+                created_at: now,
+            });
+        Ok(())
+    }
+
+    async fn list_application_versions(&self) -> Result<Vec<VersionInfo>> {
+        let g = self.inner.lock().await;
+        let mut out: Vec<VersionInfo> = g.versions.values().cloned().collect();
+        out.sort_by(|a, b| b.version_timestamp.cmp(&a.version_timestamp));
+        Ok(out)
+    }
+
+    async fn get_latest_application_version(&self) -> Result<Option<VersionInfo>> {
+        let g = self.inner.lock().await;
+        Ok(g.versions
+            .values()
+            .max_by_key(|v| v.version_timestamp)
+            .cloned())
+    }
+
+    async fn set_latest_application_version(&self, version_name: &str) -> Result<bool> {
+        let mut g = self.inner.lock().await;
+        match g.versions.get_mut(version_name) {
+            Some(v) => {
+                v.version_timestamp = Utc::now();
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 }
