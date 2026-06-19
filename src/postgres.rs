@@ -1,7 +1,7 @@
 use crate::error::Result;
 use crate::provider::{
     decode_roles, dedup_or, encode_roles, is_terminal, nonexistent_or, DequeueRequest, ListFilter,
-    StateProvider, StepAggregate, StepAggregateQuery, StepInfo, WorkflowAggregate,
+    StateProvider, StepAggregate, StepAggregateQuery, StepInfo, VersionInfo, WorkflowAggregate,
     WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
     STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
     STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL,
@@ -1102,6 +1102,62 @@ impl StateProvider for PostgresProvider {
             .execute(&self.pool)
             .await?;
         Ok(res.rows_affected() > 0)
+    }
+
+    async fn create_application_version(&self, version_name: &str) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO application_versions \
+             (version_id, version_name, version_timestamp, created_at) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (version_name) DO NOTHING",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(version_name)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_application_versions(&self) -> Result<Vec<VersionInfo>> {
+        let rows = sqlx::query(
+            "SELECT version_id, version_name, version_timestamp, created_at \
+             FROM application_versions ORDER BY version_timestamp DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row_to_version).collect())
+    }
+
+    async fn get_latest_application_version(&self) -> Result<Option<VersionInfo>> {
+        let row = sqlx::query(
+            "SELECT version_id, version_name, version_timestamp, created_at \
+             FROM application_versions ORDER BY version_timestamp DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.as_ref().map(row_to_version))
+    }
+
+    async fn set_latest_application_version(&self, version_name: &str) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE application_versions SET version_timestamp = $1 WHERE version_name = $2",
+        )
+        .bind(Utc::now().timestamp_millis())
+        .bind(version_name)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+}
+
+fn row_to_version(row: &sqlx::postgres::PgRow) -> VersionInfo {
+    VersionInfo {
+        version_id: row.get("version_id"),
+        version_name: row.get("version_name"),
+        version_timestamp: ms_to_dt(row.get("version_timestamp")),
+        created_at: ms_to_dt(row.get("created_at")),
     }
 }
 

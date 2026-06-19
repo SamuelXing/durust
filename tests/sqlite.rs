@@ -1163,3 +1163,64 @@ async fn sqlite_backfill_persists_each_tick_once() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// Application versions persist across "restarts": versions registered on launch
+/// survive into a fresh engine over the same file, `set_latest` promotes one,
+/// and the promotion is durable.
+#[tokio::test]
+async fn sqlite_application_versions_persist() -> Result<()> {
+    let (url, path) = temp_db_url("app-versions");
+
+    // Two launches over the same file register two versions; 2.0.0 is latest.
+    {
+        let a = DurableEngine::new_with_version(
+            Arc::new(SqliteProvider::connect(&url).await?),
+            "1.0.0",
+        )
+        .await?;
+        a.launch().await?;
+        a.shutdown(Duration::from_secs(1)).await?;
+    }
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    {
+        let b = DurableEngine::new_with_version(
+            Arc::new(SqliteProvider::connect(&url).await?),
+            "2.0.0",
+        )
+        .await?;
+        b.launch().await?;
+        b.shutdown(Duration::from_secs(1)).await?;
+    }
+
+    // A fresh engine sees both, newest first, and promotes 1.0.0.
+    {
+        let c = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        let versions = c.list_application_versions().await?;
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].version_name, "2.0.0");
+        assert_eq!(
+            c.get_latest_application_version()
+                .await?
+                .unwrap()
+                .version_name,
+            "2.0.0"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(c.set_latest_application_version("1.0.0").await?);
+    }
+
+    // The promotion survived the restart.
+    {
+        let d = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        assert_eq!(
+            d.get_latest_application_version()
+                .await?
+                .unwrap()
+                .version_name,
+            "1.0.0"
+        );
+    }
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
