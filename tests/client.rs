@@ -447,7 +447,11 @@ async fn client_resume_runs_via_internal_queue_not_own_queue() -> Result<()> {
     client.cancel_workflow("j1").await?;
     let mut h: WorkflowHandle<()> = client.resume_workflow("j1").await?;
     h.get_result().await?;
-    assert_eq!(RAN.load(Ordering::SeqCst), 1, "resume ran it via the internal queue");
+    assert_eq!(
+        RAN.load(Ordering::SeqCst),
+        1,
+        "resume ran it via the internal queue"
+    );
 
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
@@ -493,5 +497,90 @@ async fn client_forks_a_workflow() -> Result<()> {
     assert_eq!(SECOND.load(Ordering::SeqCst), 2, "fork re-ran step 1");
 
     engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// The client triggers a one-off run of a schedule; because the schedule is
+/// direct (no queue of its own), the run is routed to the internal queue and a
+/// live engine's always-on internal dispatcher executes it.
+#[tokio::test]
+async fn client_triggers_a_schedule_run_on_an_engine() -> Result<()> {
+    use durust::{ScheduleOptions, WorkflowHandle};
+    static FIRED: AtomicUsize = AtomicUsize::new(0);
+    let provider = Arc::new(InMemoryProvider::new());
+
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("tick_job", |_ctx: DurableContext, at: String| async move {
+        FIRED.fetch_add(1, Ordering::SeqCst);
+        Ok::<_, Error>(at)
+    });
+    engine.launch().await?;
+
+    // A cron far in the future so the reconciler never fires it on its own —
+    // only the explicit trigger runs.
+    let client = Client::new(provider.clone());
+    client
+        .create_schedule("yearly", "tick_job", "0 0 0 1 1 *", ScheduleOptions::new())
+        .await?;
+
+    let mut h: WorkflowHandle<String> = client.trigger_schedule("yearly").await?;
+    let id = h.id().to_string();
+    assert!(
+        id.starts_with("sched-yearly-trigger-"),
+        "distinct trigger id, not a regular tick"
+    );
+    let out = h.get_result().await?;
+    assert_eq!(
+        out,
+        id.strip_prefix("sched-yearly-trigger-").unwrap(),
+        "the tick instant is passed through to the workflow as its input"
+    );
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    assert_eq!(FIRED.load(Ordering::SeqCst), 1, "triggered exactly once");
+
+    // Triggering an unknown schedule errors.
+    assert!(client.trigger_schedule::<String>("nope").await.is_err());
+    Ok(())
+}
+
+/// The client backfills a direct schedule's past ticks: each lands ENQUEUED on
+/// the internal queue under the same deterministic per-tick id the live loop
+/// uses, so re-running the same window is idempotent (no duplicate ticks).
+#[tokio::test]
+async fn client_backfills_a_schedule_onto_the_internal_queue() -> Result<()> {
+    use chrono::{TimeZone, Utc};
+    use durust::ScheduleOptions;
+    let provider = Arc::new(InMemoryProvider::new());
+    let client = Client::new(provider.clone());
+
+    // A direct (queue-less) daily schedule; the client runs nothing itself.
+    client
+        .create_schedule("daily", "report", "0 0 12 * * *", ScheduleOptions::new())
+        .await?;
+
+    let start = Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap();
+    let end = Utc.with_ymd_and_hms(2026, 3, 4, 0, 0, 0).unwrap();
+    let ids = client.backfill_schedule("daily", start, end).await?;
+    assert_eq!(ids.len(), 3, "one tick per day in the window");
+
+    let prefix = || ListFilter {
+        workflow_id_prefix: Some("sched-daily-".to_string()),
+        ..Default::default()
+    };
+    let rows = client.list_workflows(&prefix()).await?;
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|r| r.name == "report"));
+    assert!(rows.iter().all(|r| r.status == "ENQUEUED"));
+    assert!(rows
+        .iter()
+        .all(|r| r.queue_name.as_deref() == Some("_dbos_internal_queue")));
+
+    // Same window again: same ids, no new rows.
+    assert_eq!(client.backfill_schedule("daily", start, end).await?, ids);
+    assert_eq!(client.list_workflows(&prefix()).await?.len(), 3);
+
+    // Backfilling an unknown schedule errors.
+    assert!(client.backfill_schedule("nope", start, end).await.is_err());
     Ok(())
 }

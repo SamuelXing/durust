@@ -1262,3 +1262,46 @@ async fn sqlite_client_enqueues_work_an_engine_runs() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// A client backfills a direct schedule on SQLite: each tick lands ENQUEUED on
+/// the internal queue, and re-running the same window is idempotent.
+#[tokio::test]
+async fn sqlite_client_backfills_a_schedule() -> Result<()> {
+    use chrono::{TimeZone, Utc};
+    use durust::{Client, ScheduleOptions, StateProvider};
+    let (url, path) = temp_db_url("client-backfill");
+    let provider = Arc::new(SqliteProvider::connect(&url).await?);
+    // A client runs no engine, so initialize the schema directly (the engine's
+    // constructor does this otherwise).
+    provider.init().await?;
+    let client = Client::new(provider.clone());
+
+    client
+        .create_schedule("daily", "report", "0 0 12 * * *", ScheduleOptions::new())
+        .await?;
+
+    let start = Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap();
+    let end = Utc.with_ymd_and_hms(2026, 3, 4, 0, 0, 0).unwrap();
+    let ids = client.backfill_schedule("daily", start, end).await?;
+    assert_eq!(ids.len(), 3);
+
+    let prefix = || ListFilter {
+        workflow_id_prefix: Some("sched-daily-".to_string()),
+        ..Default::default()
+    };
+    let rows = client.list_workflows(&prefix()).await?;
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|r| r.status == "ENQUEUED"));
+    assert!(rows
+        .iter()
+        .all(|r| r.queue_name.as_deref() == Some("_dbos_internal_queue")));
+
+    // Idempotent re-backfill: same ids, no duplicate rows.
+    assert_eq!(client.backfill_schedule("daily", start, end).await?, ids);
+    assert_eq!(client.list_workflows(&prefix()).await?.len(), 3);
+
+    drop(client);
+    drop(provider);
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
