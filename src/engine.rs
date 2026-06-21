@@ -1526,7 +1526,7 @@ fn next_cron_instant(
 }
 
 /// Every cron instant in `(start, end)` (start exclusive, end exclusive), in UTC.
-fn cron_ticks_between(
+pub(crate) fn cron_ticks_between(
     cron: &cron::Schedule,
     tz: Option<&str>,
     start: DateTime<Utc>,

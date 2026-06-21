@@ -6,7 +6,9 @@
 //!
 //! [`DurableEngine`]: crate::DurableEngine
 
-use crate::engine::{parse_cron, parse_timezone, WorkflowOptions, INTERNAL_QUEUE};
+use crate::engine::{
+    cron_ticks_between, parse_cron, parse_timezone, WorkflowOptions, INTERNAL_QUEUE,
+};
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{
@@ -454,5 +456,66 @@ impl Client {
     /// Delete a schedule. Returns whether a schedule was removed.
     pub async fn delete_schedule(&self, schedule_name: &str) -> Result<bool> {
         self.provider.delete_schedule(schedule_name).await
+    }
+
+    /// Fire a schedule's workflow once, immediately, for an engine to run.
+    /// Returns a polling [`WorkflowHandle`] over the run. The tick uses a
+    /// distinct `sched-{name}-trigger-{time}` id, so it never collides with or
+    /// replaces a regular cron tick.
+    ///
+    /// A schedule with a queue routes the run there; a direct (queue-less)
+    /// schedule routes to the internal queue — the client runs nothing, so a
+    /// live engine's always-on internal dispatcher executes it.
+    pub async fn trigger_schedule<O>(&self, schedule_name: &str) -> Result<WorkflowHandle<O>> {
+        let schedule = self
+            .get_schedule(schedule_name)
+            .await?
+            .ok_or_else(|| Error::app(format!("schedule not found: {schedule_name}")))?;
+        let stamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let id = format!("sched-{schedule_name}-trigger-{stamp}");
+        let queue = schedule.queue_name.as_deref().unwrap_or(INTERNAL_QUEUE);
+        self.enqueue(
+            queue,
+            &schedule.workflow_name,
+            stamp,
+            WorkflowOptions::with_id(id),
+        )
+        .await
+    }
+
+    /// Enqueue a schedule's ticks for every cron instant in `(start, end)` (both
+    /// bounds exclusive) for an engine to run, under the same deterministic
+    /// per-tick ids the live loop uses — so a tick that already ran is skipped,
+    /// not duplicated. Returns the id of every tick in the range, in order
+    /// (including skipped ones).
+    ///
+    /// Like [`trigger_schedule`](Self::trigger_schedule), a direct (queue-less)
+    /// schedule routes its ticks to the internal queue.
+    pub async fn backfill_schedule(
+        &self,
+        schedule_name: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<String>> {
+        let schedule = self
+            .get_schedule(schedule_name)
+            .await?
+            .ok_or_else(|| Error::app(format!("schedule not found: {schedule_name}")))?;
+        let cron = parse_cron(&schedule.schedule)?;
+        let queue = schedule.queue_name.as_deref().unwrap_or(INTERNAL_QUEUE);
+        let mut ids = Vec::new();
+        for instant in cron_ticks_between(&cron, schedule.cron_timezone.as_deref(), start, end) {
+            let stamp = instant.to_rfc3339();
+            let id = format!("sched-{schedule_name}-{stamp}");
+            self.enqueue::<_, serde_json::Value>(
+                queue,
+                &schedule.workflow_name,
+                stamp,
+                WorkflowOptions::with_id(id.clone()),
+            )
+            .await?;
+            ids.push(id);
+        }
+        Ok(ids)
     }
 }

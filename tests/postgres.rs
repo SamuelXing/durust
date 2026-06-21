@@ -1145,3 +1145,60 @@ async fn pg_client_manages_schedules() -> Result<()> {
     assert!(client.get_schedule(&name).await?.is_none());
     Ok(())
 }
+
+/// A client backfills and triggers a direct schedule on Postgres: backfilled
+/// ticks and the trigger land ENQUEUED on the internal queue under their
+/// deterministic ids, and re-backfilling the same window is idempotent. The
+/// client pins a unique application version so the dequeue version gate keeps
+/// any other test's running engine from claiming these ticks off the shared
+/// internal queue — the rows stay enqueued, as asserted.
+#[tokio::test]
+async fn pg_client_backfills_and_triggers_a_schedule() -> Result<()> {
+    use chrono::{TimeZone, Utc};
+    use durust::{Client, ScheduleOptions};
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_client_backfills_and_triggers_a_schedule: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let name = format!("bf-{tag}");
+    let client = Client::new(Arc::new(PostgresProvider::connect(&url).await?))
+        .with_app_version(format!("v-{tag}"));
+
+    client
+        .create_schedule(&name, "report", "0 0 12 * * *", ScheduleOptions::new())
+        .await?;
+
+    let start = Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap();
+    let end = Utc.with_ymd_and_hms(2026, 3, 4, 0, 0, 0).unwrap();
+    let ids = client.backfill_schedule(&name, start, end).await?;
+    assert_eq!(ids.len(), 3, "one tick per day");
+
+    let backfilled = ListFilter {
+        workflow_id_prefix: Some(format!("sched-{name}-")),
+        ..Default::default()
+    };
+    let rows = client.list_workflows(&backfilled).await?;
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|r| r.status == "ENQUEUED"));
+    assert!(rows
+        .iter()
+        .all(|r| r.queue_name.as_deref() == Some("_dbos_internal_queue")));
+
+    // Idempotent re-backfill: same ids, no new rows.
+    assert_eq!(client.backfill_schedule(&name, start, end).await?, ids);
+
+    // Trigger enqueues one more run under a distinct `-trigger-` id.
+    let h: durust::WorkflowHandle<()> = client.trigger_schedule(&name).await?;
+    assert!(h.id().starts_with(&format!("sched-{name}-trigger-")));
+    let trig = client
+        .list_workflows(&ListFilter {
+            workflow_id_prefix: Some(format!("sched-{name}-trigger-")),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(trig.len(), 1, "trigger enqueued exactly one run");
+
+    client.delete_schedule(&name).await?;
+    Ok(())
+}
