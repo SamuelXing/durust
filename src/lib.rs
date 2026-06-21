@@ -66,7 +66,7 @@ pub use queue::{RateLimiter, WorkflowQueue};
 pub use schedule::{
     ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus, WorkflowSchedule,
 };
-pub use serialize::Serializer;
+pub use serialize::{PortableWorkflowArgs, Serializer};
 pub use sqlite::SqliteProvider;
 
 /// The `#[workflow]` attribute macro. Annotate an

@@ -76,7 +76,7 @@ fn row_to_status(row: &sqlx::postgres::PgRow) -> WorkflowStatus {
         id: row.get("workflow_uuid"),
         name: row.get("name"),
         status: row.get("status"),
-        input: serialize::decode_opt(fmt, inputs.as_deref())
+        input: serialize::decode_input_opt(fmt, inputs.as_deref())
             .ok()
             .flatten()
             .unwrap_or(Value::Null),
@@ -137,7 +137,7 @@ impl StateProvider for PostgresProvider {
         )
         .bind(&s.id)
         .bind(&s.name)
-        .bind(self.serializer.encode(&s.input)?)
+        .bind(serialize::encode_input(self.serializer, &s.input)?)
         .bind(&s.status)
         .bind(&s.executor_id)
         .bind(&s.app_version)

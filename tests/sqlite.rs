@@ -1305,3 +1305,49 @@ async fn sqlite_client_backfills_a_schedule() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// Portable mode stores a workflow's input in the cross-language args envelope
+/// on SQLite, and reads it back unwrapped to the bare input.
+#[tokio::test]
+async fn sqlite_portable_input_envelope() -> Result<()> {
+    use durust::Serializer;
+    let (url, path) = temp_db_url("portable-input");
+    let provider = SqliteProvider::connect(&url)
+        .await?
+        .with_serializer(Serializer::Portable);
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    engine.register("echo", |_ctx: DurableContext, name: String| async move {
+        Ok::<_, Error>(format!("echo:{name}"))
+    });
+    let out: String = engine
+        .run_workflow::<_, String>(
+            "echo",
+            "ada".to_string(),
+            WorkflowOptions::with_id("wf-env"),
+        )
+        .await?
+        .get_result()
+        .await?;
+    assert_eq!(out, "echo:ada");
+
+    // The raw input column holds the args envelope.
+    let pool = sqlx::SqlitePool::connect(&url).await?;
+    let raw_inputs: String =
+        sqlx::query_scalar("SELECT inputs FROM workflow_status WHERE workflow_uuid = ?")
+            .bind("wf-env")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(raw_inputs, r#"{"positionalArgs":["ada"],"namedArgs":{}}"#);
+
+    // Through the provider, the input reads back unwrapped.
+    let status = engine
+        .retrieve_workflow::<String>("wf-env")
+        .await?
+        .get_status()
+        .await?;
+    assert_eq!(status.input, serde_json::json!("ada"));
+
+    drop(pool);
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}

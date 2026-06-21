@@ -1202,3 +1202,51 @@ async fn pg_client_backfills_and_triggers_a_schedule() -> Result<()> {
     client.delete_schedule(&name).await?;
     Ok(())
 }
+
+/// Portable mode stores a workflow's input in the cross-language args envelope
+/// `{"positionalArgs":[…],"namedArgs":{}}` (so a DBOS app in another language can
+/// run it), while the output stays a bare portable value; the input reads back
+/// unwrapped to what the workflow receives.
+#[tokio::test]
+async fn pg_portable_input_envelope() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_portable_input_envelope: DATABASE_URL unset");
+        return Ok(());
+    };
+    let id = format!("wf-env-{}", uuid::Uuid::new_v4());
+
+    let engine = engine_with(&url, Serializer::Portable).await?;
+    let out: String = engine
+        .run_workflow::<_, String>("greet", "ada".to_string(), WorkflowOptions::with_id(&id))
+        .await?
+        .get_result()
+        .await?;
+    assert_eq!(out, "hi ada");
+
+    // Read the raw columns: input is the args envelope, output is a bare value.
+    let pool = sqlx::PgPool::connect(&url).await?;
+    let raw_inputs: String =
+        sqlx::query_scalar("SELECT inputs FROM workflow_status WHERE workflow_uuid = $1")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(raw_inputs, r#"{"positionalArgs":["ada"],"namedArgs":{}}"#);
+    let raw_output: String =
+        sqlx::query_scalar("SELECT output FROM workflow_status WHERE workflow_uuid = $1")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        raw_output, r#""hi ada""#,
+        "output is a bare portable value, not enveloped"
+    );
+
+    // Through the provider, the envelope is unwrapped to the bare input.
+    let status = engine
+        .retrieve_workflow::<String>(&id)
+        .await?
+        .get_status()
+        .await?;
+    assert_eq!(status.input, serde_json::json!("ada"));
+    Ok(())
+}

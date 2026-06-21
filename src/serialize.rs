@@ -18,7 +18,8 @@
 
 use crate::error::{Error, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 /// Cross-language wire format: plain JSON, readable by any DBOS SDK.
 pub const PORTABLE: &str = "portable_json";
@@ -102,6 +103,99 @@ pub fn decode_opt(format: Option<&str>, stored: Option<&str>) -> Result<Option<V
     }
 }
 
+/// The cross-language workflow-input envelope: `{"positionalArgs":[…],"namedArgs":{…}}`.
+///
+/// In [`Serializer::Portable`] mode a workflow's input is stored in this shape so
+/// a DBOS app in another language (Go, Python, TypeScript, …) can run it: a Rust
+/// workflow's single input becomes the one positional arg. Pass this type *as*
+/// the input to target a workflow elsewhere that takes several positional or
+/// named arguments (e.g. a Python `def wf(a, b, *, key)`); it is stored verbatim.
+///
+/// Field order matters: `positionalArgs` serializes first, then `namedArgs`
+/// (always present, `{}` when empty) — the byte form Go and Python both emit.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PortableWorkflowArgs {
+    #[serde(rename = "positionalArgs", default)]
+    pub positional_args: Vec<Value>,
+    #[serde(rename = "namedArgs", default)]
+    pub named_args: Map<String, Value>,
+}
+
+impl PortableWorkflowArgs {
+    /// Wrap a single value as the one positional arg (no named args) — how a
+    /// one-input workflow's input is stored for cross-language execution.
+    pub fn single(arg: Value) -> Self {
+        Self {
+            positional_args: vec![arg],
+            named_args: Map::new(),
+        }
+    }
+}
+
+/// Read a value as the args envelope: it must be an object with an array
+/// `positionalArgs`; `namedArgs` is optional (absent/null ⇒ empty). Anything
+/// else is not an envelope (so a plain workflow input is wrapped, not mistaken
+/// for one).
+fn as_envelope(value: &Value) -> Option<PortableWorkflowArgs> {
+    let obj = value.as_object()?;
+    let positional_args = obj.get("positionalArgs")?.as_array()?.clone();
+    let named_args = match obj.get("namedArgs") {
+        Some(Value::Object(m)) => m.clone(),
+        None | Some(Value::Null) => Map::new(),
+        Some(_) => return None,
+    };
+    Some(PortableWorkflowArgs {
+        positional_args,
+        named_args,
+    })
+}
+
+/// Encode a workflow **input** for storage. In [`Serializer::Portable`] mode the
+/// value is wrapped in the cross-language args envelope (a plain value becomes
+/// the single positional arg; a value already shaped like the envelope — e.g. a
+/// [`PortableWorkflowArgs`] — is kept as-is). Other formats store it directly,
+/// exactly like [`Serializer::encode`]. The envelope struct is serialized
+/// directly so its bytes are `positionalArgs`-first.
+pub fn encode_input(serializer: Serializer, value: &Value) -> Result<String> {
+    if serializer == Serializer::Portable {
+        let envelope =
+            as_envelope(value).unwrap_or_else(|| PortableWorkflowArgs::single(value.clone()));
+        return Ok(serde_json::to_string(&envelope)?);
+    }
+    serializer.encode(value)
+}
+
+/// Decode a stored workflow **input**. For a `portable_json` row the args
+/// envelope is unwrapped to its first positional arg — what a single-input
+/// workflow receives — tolerating a missing/empty `namedArgs` or `positionalArgs`
+/// (⇒ `Null`). Other formats decode exactly like [`decode`].
+pub fn decode_input(format: Option<&str>, stored: &str) -> Result<Value> {
+    let value = decode(format, stored)?;
+    if format == Some(PORTABLE) {
+        Ok(first_positional(value))
+    } else {
+        Ok(value)
+    }
+}
+
+/// `decode_input` over an optional column (mirrors [`decode_opt`]).
+pub fn decode_input_opt(format: Option<&str>, stored: Option<&str>) -> Result<Option<Value>> {
+    match stored {
+        Some(s) => Ok(Some(decode_input(format, s)?)),
+        None => Ok(None),
+    }
+}
+
+/// The first positional arg of an args envelope (`Null` if empty); a value that
+/// is not an envelope is returned unchanged.
+fn first_positional(value: Value) -> Value {
+    match as_envelope(&value) {
+        Some(mut env) if !env.positional_args.is_empty() => env.positional_args.swap_remove(0),
+        Some(_) => Value::Null,
+        None => value,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,5 +232,85 @@ mod tests {
     fn unknown_format_errors() {
         assert!(decode(Some("DBOS_PICKLE"), "abc").is_err());
         assert!(decode(Some("some_other_format"), "abc").is_err());
+    }
+
+    #[test]
+    fn portable_input_wraps_single_value() {
+        // A plain workflow input becomes the single positional arg —
+        // positionalArgs first, then namedArgs (`{}` when empty).
+        let enc = encode_input(Serializer::Portable, &json!("hello")).unwrap();
+        assert_eq!(enc, r#"{"positionalArgs":["hello"],"namedArgs":{}}"#);
+        // Decoding returns the bare value a single-input workflow receives.
+        assert_eq!(decode_input(Some(PORTABLE), &enc).unwrap(), json!("hello"));
+    }
+
+    #[test]
+    fn portable_input_matches_cross_language_canonical() {
+        // The canonical interop input set, wrapped as positional args, must
+        // produce the exact cross-language bytes (positionalArgs first).
+        let args = PortableWorkflowArgs {
+            positional_args: vec![
+                json!("hello-interop"),
+                json!(42),
+                json!("2025-06-15T10:30:00.000Z"),
+                json!(["alpha", "beta", "gamma"]),
+                json!({"key1": "value1", "key2": 99, "nested": {"deep": true}}),
+                json!(true),
+                json!(null),
+            ],
+            named_args: Map::new(),
+        };
+        let enc =
+            encode_input(Serializer::Portable, &serde_json::to_value(&args).unwrap()).unwrap();
+        assert_eq!(
+            enc,
+            r#"{"positionalArgs":["hello-interop",42,"2025-06-15T10:30:00.000Z",["alpha","beta","gamma"],{"key1":"value1","key2":99,"nested":{"deep":true}},true,null],"namedArgs":{}}"#
+        );
+    }
+
+    #[test]
+    fn portable_input_keeps_explicit_named_args() {
+        // Passing PortableWorkflowArgs (e.g. to call a Python `def wf(a, *, name)`)
+        // is normalized to positionalArgs-first and stored verbatim, not re-wrapped.
+        let mut named = Map::new();
+        named.insert("name".to_string(), json!("test"));
+        let args = PortableWorkflowArgs {
+            positional_args: vec![json!(1)],
+            named_args: named,
+        };
+        let enc =
+            encode_input(Serializer::Portable, &serde_json::to_value(&args).unwrap()).unwrap();
+        assert_eq!(enc, r#"{"positionalArgs":[1],"namedArgs":{"name":"test"}}"#);
+    }
+
+    #[test]
+    fn portable_input_reads_either_field_order() {
+        // Readers parse by key, so a producer that writes namedArgs first (Python)
+        // decodes the same as positionalArgs first (Go).
+        for stored in [
+            r#"{"positionalArgs":["x"],"namedArgs":{}}"#,
+            r#"{"namedArgs":{},"positionalArgs":["x"]}"#,
+            r#"{"positionalArgs":["x"]}"#, // minimal: no namedArgs
+        ] {
+            assert_eq!(decode_input(Some(PORTABLE), stored).unwrap(), json!("x"));
+        }
+        // Empty positional args ⇒ null (a no-arg call).
+        assert_eq!(
+            decode_input(Some(PORTABLE), r#"{"positionalArgs":[],"namedArgs":{}}"#).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn json_input_is_not_enveloped() {
+        // Default (non-portable) mode stores the input directly — no envelope —
+        // and decodes it back unchanged.
+        let enc = encode_input(Serializer::Json, &json!("hello")).unwrap();
+        assert_eq!(enc, Serializer::Json.encode(&json!("hello")).unwrap());
+        assert_eq!(decode_input(Some(DBOS_JSON), &enc).unwrap(), json!("hello"));
+        // An envelope-shaped value is left intact in JSON mode (never unwrapped).
+        let shaped = json!({"positionalArgs": ["x"], "namedArgs": {}});
+        let enc2 = encode_input(Serializer::Json, &shaped).unwrap();
+        assert_eq!(decode_input(Some(DBOS_JSON), &enc2).unwrap(), shaped);
     }
 }
