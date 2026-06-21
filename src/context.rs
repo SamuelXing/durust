@@ -268,6 +268,9 @@ impl DurableContext {
         let child_id = opts
             .workflow_id
             .clone()
+            // An explicit empty id means "assign one for me": fall through to the
+            // deterministic `{parent}-{seq}` so an empty id is never persisted.
+            .filter(|s| !s.is_empty())
             .unwrap_or_else(|| format!("{}-{}", self.workflow_id, seq));
         let mut opts = opts;
         opts.workflow_id = Some(child_id.clone());

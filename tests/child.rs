@@ -141,3 +141,41 @@ async fn child_workflow_can_be_queued() -> Result<()> {
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
+
+/// An explicit empty `workflow_id` means "assign one for me", not a literal
+/// empty id. A top-level workflow regenerates a fresh id and a child
+/// regenerates its deterministic `{parent}-{seq}` — so an empty id is never
+/// persisted (an empty id is not a valid key and would wedge recovery).
+#[tokio::test]
+async fn empty_workflow_id_is_regenerated() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("noop", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n)
+    });
+    engine.register("parent", |ctx: DurableContext, n: i64| async move {
+        // A child started with an explicit empty id must get the deterministic
+        // `{parent}-{seq}` id, not an empty one.
+        let mut child = ctx
+            .start_workflow::<_, i64>("noop", n, WorkflowOptions::with_id(""))
+            .await?;
+        child.get_result().await
+    });
+
+    // Top-level: an empty id regenerates a fresh, non-empty id.
+    let mut handle = engine
+        .run_workflow::<_, i64>("noop", 5_i64, WorkflowOptions::with_id(""))
+        .await?;
+    assert!(!handle.id().is_empty(), "top-level id must be regenerated");
+    assert_eq!(handle.get_result().await?, 5);
+
+    // Child: an empty id regenerates the deterministic `{parent}-{seq}`, linked home.
+    let out: i64 = engine.start_typed("parent", "p1", 7_i64).await?;
+    assert_eq!(out, 7);
+    let child = engine.retrieve_workflow::<i64>("p1-0").await?;
+    assert_eq!(
+        child.get_status().await?.parent_workflow_id.as_deref(),
+        Some("p1")
+    );
+
+    Ok(())
+}
