@@ -93,6 +93,21 @@ impl StateProvider for InMemoryProvider {
         Ok(row)
     }
 
+    async fn get_deduplicated_workflow(
+        &self,
+        queue_name: &str,
+        dedup_id: &str,
+    ) -> Result<Option<String>> {
+        let g = self.inner.lock().await;
+        Ok(g.workflows
+            .values()
+            .find(|w| {
+                w.queue_name.as_deref() == Some(queue_name)
+                    && w.dedup_id.as_deref() == Some(dedup_id)
+            })
+            .map(|w| w.id.clone()))
+    }
+
     async fn get_workflow_status(&self, id: &str) -> Result<Option<WorkflowStatus>> {
         let g = self.inner.lock().await;
         Ok(g.workflows.get(id).cloned())

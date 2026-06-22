@@ -242,6 +242,55 @@ async fn dedup_id_rejects_duplicates() -> Result<()> {
     Ok(())
 }
 
+/// With `ReturnExisting`, a colliding deduplication id returns a handle to the
+/// workflow already holding the slot instead of erroring; a non-default policy
+/// without a dedup id is rejected.
+#[tokio::test]
+async fn dedup_return_existing_returns_the_holder() -> Result<()> {
+    use durust::DeduplicationPolicy;
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(())
+    });
+    engine.register_queue(test_queue("dedup"));
+
+    let first = engine
+        .enqueue::<_, ()>(
+            "dedup",
+            "noop",
+            (),
+            WorkflowOptions::with_id("wf-1").dedup_id("once"),
+        )
+        .await?;
+
+    let again = engine
+        .enqueue::<_, ()>(
+            "dedup",
+            "noop",
+            (),
+            WorkflowOptions::with_id("wf-2")
+                .dedup_id("once")
+                .dedup_policy(DeduplicationPolicy::ReturnExisting),
+        )
+        .await?;
+    assert_eq!(again.id(), first.id(), "returned the slot holder");
+    assert_eq!(again.id(), "wf-1");
+
+    assert!(
+        engine
+            .enqueue::<_, ()>(
+                "dedup",
+                "noop",
+                (),
+                WorkflowOptions::with_id("wf-3").dedup_policy(DeduplicationPolicy::ReturnExisting),
+            )
+            .await
+            .is_err(),
+        "a non-default policy requires a dedup id"
+    );
+    Ok(())
+}
+
 /// Sending to a workflow id that does not exist is a typed, classifiable error.
 #[tokio::test]
 async fn send_to_nonexistent_workflow_is_typed() -> Result<()> {

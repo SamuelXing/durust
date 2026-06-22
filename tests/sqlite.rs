@@ -1351,3 +1351,50 @@ async fn sqlite_portable_input_envelope() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// On SQLite, the client's `ReturnExisting` dedup policy returns the workflow
+/// already holding the slot, while the default rejects the collision.
+#[tokio::test]
+async fn sqlite_enqueue_dedup_return_existing() -> Result<()> {
+    use durust::{Client, DeduplicationPolicy, StateProvider, WorkflowHandle};
+    let (url, path) = temp_db_url("dedup");
+    let provider = Arc::new(SqliteProvider::connect(&url).await?);
+    provider.init().await?;
+    let client = Client::new(provider.clone());
+
+    let first: WorkflowHandle<i64> = client
+        .enqueue(
+            "dq",
+            "wf",
+            1i64,
+            WorkflowOptions::with_id("d1").dedup_id("once"),
+        )
+        .await?;
+    // Default policy rejects a colliding dedup id.
+    assert!(client
+        .enqueue::<_, i64>(
+            "dq",
+            "wf",
+            2i64,
+            WorkflowOptions::with_id("d2").dedup_id("once")
+        )
+        .await
+        .is_err());
+    // ReturnExisting hands back the holder.
+    let again: WorkflowHandle<i64> = client
+        .enqueue(
+            "dq",
+            "wf",
+            3i64,
+            WorkflowOptions::with_id("d3")
+                .dedup_id("once")
+                .dedup_policy(DeduplicationPolicy::ReturnExisting),
+        )
+        .await?;
+    assert_eq!(again.id(), first.id());
+
+    drop(client);
+    drop(provider);
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}

@@ -166,6 +166,22 @@ impl StateProvider for SqliteProvider {
         Ok(row_to_status(&row))
     }
 
+    async fn get_deduplicated_workflow(
+        &self,
+        queue_name: &str,
+        dedup_id: &str,
+    ) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT workflow_uuid FROM workflow_status \
+             WHERE queue_name = ? AND deduplication_id = ? LIMIT 1",
+        )
+        .bind(queue_name)
+        .bind(dedup_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get("workflow_uuid")))
+    }
+
     async fn get_workflow_status(&self, id: &str) -> Result<Option<WorkflowStatus>> {
         let row = sqlx::query(&format!(
             "SELECT {SELECT_COLS} FROM workflow_status WHERE workflow_uuid = ?"

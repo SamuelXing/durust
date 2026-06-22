@@ -1250,3 +1250,71 @@ async fn pg_portable_input_envelope() -> Result<()> {
     assert_eq!(status.input, serde_json::json!("ada"));
     Ok(())
 }
+
+/// On Postgres, the client honors a per-enqueue application-version override and
+/// the `ReturnExisting` dedup policy (a colliding dedup id returns the holder).
+#[tokio::test]
+async fn pg_enqueue_dedup_and_app_version() -> Result<()> {
+    use durust::{Client, DeduplicationPolicy, WorkflowHandle};
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_enqueue_dedup_and_app_version: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let queue = format!("dq-{tag}");
+    let dedup = format!("once-{tag}");
+    let client = Client::new(Arc::new(PostgresProvider::connect(&url).await?));
+
+    // Per-enqueue application-version override.
+    let ver_id = format!("wf-ver-{tag}");
+    let _: WorkflowHandle<i64> = client
+        .enqueue(
+            &queue,
+            "wf",
+            1i64,
+            WorkflowOptions::with_id(&ver_id).app_version("v-special"),
+        )
+        .await?;
+    let rows = client
+        .list_workflows(&ListFilter {
+            workflow_id_prefix: Some(ver_id.clone()),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(rows[0].app_version, "v-special");
+
+    // ReturnExisting returns the holder; the default rejects.
+    let first: WorkflowHandle<i64> = client
+        .enqueue(
+            &queue,
+            "wf",
+            1i64,
+            WorkflowOptions::with_id(format!("d1-{tag}")).dedup_id(&dedup),
+        )
+        .await?;
+    assert!(client
+        .enqueue::<_, i64>(
+            &queue,
+            "wf",
+            2i64,
+            WorkflowOptions::with_id(format!("d2-{tag}")).dedup_id(&dedup),
+        )
+        .await
+        .is_err());
+    let again: WorkflowHandle<i64> = client
+        .enqueue(
+            &queue,
+            "wf",
+            3i64,
+            WorkflowOptions::with_id(format!("d3-{tag}"))
+                .dedup_id(&dedup)
+                .dedup_policy(DeduplicationPolicy::ReturnExisting),
+        )
+        .await?;
+    assert_eq!(again.id(), first.id());
+
+    client
+        .delete_workflows(&[first.id().to_string(), ver_id], false)
+        .await?;
+    Ok(())
+}

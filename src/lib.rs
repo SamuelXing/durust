@@ -50,7 +50,8 @@ mod sqlite;
 pub use client::Client;
 pub use context::{AuthContext, DurableContext, StepOptions};
 pub use engine::{
-    erase, DurableEngine, RegisteredWorkflow, WorkflowFn, WorkflowOptions, WorkflowRegistration,
+    erase, DeduplicationPolicy, DurableEngine, RegisteredWorkflow, WorkflowFn, WorkflowOptions,
+    WorkflowRegistration,
 };
 pub use error::{Error, ErrorCode, Result};
 pub use handle::WorkflowHandle;

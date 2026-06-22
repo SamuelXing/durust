@@ -483,6 +483,16 @@ pub trait StateProvider: Send + Sync {
     /// enqueues.
     async fn insert_workflow_status(&self, status: WorkflowStatus) -> Result<WorkflowStatus>;
 
+    /// The id of the workflow currently holding the deduplication slot
+    /// `(queue_name, dedup_id)`, if any. Backs
+    /// [`DeduplicationPolicy::ReturnExisting`](crate::DeduplicationPolicy::ReturnExisting):
+    /// on a dedup collision the enqueue returns a handle to this workflow.
+    async fn get_deduplicated_workflow(
+        &self,
+        queue_name: &str,
+        dedup_id: &str,
+    ) -> Result<Option<String>>;
+
     /// Fetch a workflow row by id, if it exists.
     async fn get_workflow_status(&self, id: &str) -> Result<Option<WorkflowStatus>>;
 
