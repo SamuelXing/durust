@@ -902,6 +902,17 @@ impl StateProvider for InMemoryProvider {
         Ok(())
     }
 
+    async fn apply_schedules(&self, schedules: &[WorkflowSchedule]) -> Result<()> {
+        // The lock is held for the whole batch, so the delete-then-create of
+        // every entry is atomic (all-or-nothing). Schedules are keyed by name,
+        // so inserting replaces any existing row of that name.
+        let mut g = self.inner.lock().await;
+        for s in schedules {
+            g.schedules.insert(s.schedule_name.clone(), s.clone());
+        }
+        Ok(())
+    }
+
     async fn list_schedules(&self, filter: &ScheduleFilter) -> Result<Vec<WorkflowSchedule>> {
         let g = self.inner.lock().await;
         let mut out: Vec<WorkflowSchedule> = g

@@ -1089,6 +1089,36 @@ impl StateProvider for PostgresProvider {
         Ok(())
     }
 
+    async fn apply_schedules(&self, schedules: &[WorkflowSchedule]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for s in schedules {
+            sqlx::query("DELETE FROM workflow_schedules WHERE schedule_name = $1")
+                .bind(&s.schedule_name)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "INSERT INTO workflow_schedules (
+                     schedule_id, schedule_name, workflow_name, schedule, status, context,
+                     last_fired_at, automatic_backfill, cron_timezone, queue_name
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            )
+            .bind(&s.schedule_id)
+            .bind(&s.schedule_name)
+            .bind(&s.workflow_name)
+            .bind(&s.schedule)
+            .bind(s.status.as_str())
+            .bind(encode_schedule_context(&s.context))
+            .bind(s.last_fired_at.map(|t| t.to_rfc3339()))
+            .bind(s.automatic_backfill)
+            .bind(&s.cron_timezone)
+            .bind(&s.queue_name)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn list_schedules(&self, filter: &ScheduleFilter) -> Result<Vec<WorkflowSchedule>> {
         let mut qb = QueryBuilder::new(
             "SELECT schedule_id, schedule_name, workflow_name, schedule, status, context, \

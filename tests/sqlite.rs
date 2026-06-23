@@ -1484,3 +1484,53 @@ async fn sqlite_completion_cannot_overwrite_cancelled() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// `apply_schedules` is atomic: a mid-batch failure rolls the whole batch back,
+/// leaving any schedule it would have replaced at its original value.
+#[tokio::test]
+async fn sqlite_apply_schedules_is_atomic() -> Result<()> {
+    use durust::{ScheduleFilter, ScheduleStatus, StateProvider, WorkflowSchedule};
+    let (url, path) = temp_db_url("applytx");
+    let provider = SqliteProvider::connect(&url).await?;
+    provider.init().await?;
+
+    let make = |id: &str, name: &str, cron: &str| WorkflowSchedule {
+        schedule_id: id.to_string(),
+        schedule_name: name.to_string(),
+        workflow_name: "wf".to_string(),
+        schedule: cron.to_string(),
+        status: ScheduleStatus::Active,
+        context: None,
+        last_fired_at: None,
+        automatic_backfill: false,
+        cron_timezone: None,
+        queue_name: None,
+    };
+
+    // Seed an existing schedule "keep".
+    provider
+        .apply_schedules(&[make("id-keep", "keep", "0 0 1 * * *")])
+        .await?;
+
+    // A batch that would replace "keep" then fails on a duplicate schedule_id:
+    // the second insert violates the PRIMARY KEY, so the whole batch rolls back.
+    let bad = vec![
+        make("dup", "keep", "0 0 2 * * *"),
+        make("dup", "other", "0 0 3 * * *"),
+    ];
+    assert!(
+        provider.apply_schedules(&bad).await.is_err(),
+        "a duplicate schedule_id must fail the batch"
+    );
+
+    // "keep" still has its original id and cron; "other" was never created.
+    let all = provider.list_schedules(&ScheduleFilter::default()).await?;
+    assert_eq!(all.len(), 1, "rollback left exactly the original schedule");
+    assert_eq!(all[0].schedule_name, "keep");
+    assert_eq!(all[0].schedule_id, "id-keep", "original id preserved");
+    assert_eq!(all[0].schedule, "0 0 1 * * *", "original cron preserved");
+
+    drop(provider);
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}

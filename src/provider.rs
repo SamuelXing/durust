@@ -722,6 +722,13 @@ pub trait StateProvider: Send + Sync {
     /// already exists is a unique violation.
     async fn create_schedule(&self, schedule: &WorkflowSchedule) -> Result<()>;
 
+    /// Atomically replace each named schedule (delete-by-name then insert) in a
+    /// single transaction, so the whole batch is all-or-nothing: a failure on
+    /// any entry leaves every prior entry — and any pre-existing rows the batch
+    /// would have replaced — untouched. The caller validates the entries and
+    /// mints a fresh `schedule_id` for each beforehand.
+    async fn apply_schedules(&self, schedules: &[WorkflowSchedule]) -> Result<()>;
+
     /// All schedules matching `filter` (empty filter returns every schedule),
     /// ordered by `schedule_name`.
     async fn list_schedules(&self, filter: &ScheduleFilter) -> Result<Vec<WorkflowSchedule>>;
