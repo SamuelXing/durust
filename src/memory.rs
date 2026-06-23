@@ -2,8 +2,8 @@ use crate::error::{Error, Result};
 use crate::provider::{
     is_terminal, DequeueRequest, ListFilter, StateProvider, StepAggregate, StepAggregateQuery,
     StepInfo, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
-    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED,
-    STATUS_PENDING,
+    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use async_trait::async_trait;
@@ -93,6 +93,21 @@ impl StateProvider for InMemoryProvider {
         Ok(row)
     }
 
+    async fn get_deduplicated_workflow(
+        &self,
+        queue_name: &str,
+        dedup_id: &str,
+    ) -> Result<Option<String>> {
+        let g = self.inner.lock().await;
+        Ok(g.workflows
+            .values()
+            .find(|w| {
+                w.queue_name.as_deref() == Some(queue_name)
+                    && w.dedup_id.as_deref() == Some(dedup_id)
+            })
+            .map(|w| w.id.clone()))
+    }
+
     async fn get_workflow_status(&self, id: &str) -> Result<Option<WorkflowStatus>> {
         let g = self.inner.lock().await;
         Ok(g.workflows.get(id).cloned())
@@ -107,6 +122,12 @@ impl StateProvider for InMemoryProvider {
     ) -> Result<()> {
         let mut g = self.inner.lock().await;
         if let Some(row) = g.workflows.get_mut(id) {
+            // A workflow cancelled during its final step must stay cancelled: a
+            // SUCCESS/ERROR completion is not allowed to overwrite a CANCELLED row.
+            let is_completion = status == STATUS_SUCCESS || status == STATUS_ERROR;
+            if is_completion && row.status == STATUS_CANCELLED {
+                return Err(Error::Cancelled(id.to_string()));
+            }
             row.status = status.to_string();
             if let Some(o) = output {
                 row.output = Some(o.clone());
@@ -117,6 +138,9 @@ impl StateProvider for InMemoryProvider {
             let now = Utc::now();
             if is_terminal(status) {
                 row.completed_at_ms = Some(now.timestamp_millis());
+                // Reaching a terminal state frees the queue-scoped deduplication
+                // slot so the same deduplication id can be enqueued again.
+                row.dedup_id = None;
             }
             row.updated_at = now;
         }
@@ -749,6 +773,7 @@ impl StateProvider for InMemoryProvider {
         let attempts = row.recovery_attempts;
         if attempts > max {
             row.status = STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED.to_string();
+            row.dedup_id = None;
             row.updated_at = Utc::now();
         }
         Ok(attempts)

@@ -584,3 +584,169 @@ async fn client_backfills_a_schedule_onto_the_internal_queue() -> Result<()> {
     assert!(client.backfill_schedule("nope", start, end).await.is_err());
     Ok(())
 }
+
+/// The client honors a per-enqueue application-version override and the
+/// deduplication policy: a colliding dedup id either errors (Reject, the
+/// default) or returns the existing workflow (ReturnExisting).
+#[tokio::test]
+async fn client_enqueue_dedup_and_app_version() -> Result<()> {
+    use durust::{DeduplicationPolicy, WorkflowHandle};
+    let provider = Arc::new(InMemoryProvider::new());
+    let client = Client::new(provider.clone()).with_app_version("v1");
+
+    // Per-enqueue version override; the client default applies otherwise.
+    let _: WorkflowHandle<i64> = client
+        .enqueue(
+            "q",
+            "wf",
+            1i64,
+            WorkflowOptions::with_id("j1").app_version("v2"),
+        )
+        .await?;
+    let _: WorkflowHandle<i64> = client
+        .enqueue("q", "wf", 1i64, WorkflowOptions::with_id("j2"))
+        .await?;
+    let rows = client
+        .list_workflows(&ListFilter {
+            workflow_id_prefix: Some("j".into()),
+            ..Default::default()
+        })
+        .await?;
+    let ver = |id: &str| {
+        rows.iter()
+            .find(|r| r.id == id)
+            .unwrap()
+            .app_version
+            .clone()
+    };
+    assert_eq!(ver("j1"), "v2", "per-enqueue override");
+    assert_eq!(ver("j2"), "v1", "client default");
+
+    // Deduplication: the first enqueue holds the slot.
+    let first: WorkflowHandle<i64> = client
+        .enqueue(
+            "dq",
+            "wf",
+            1i64,
+            WorkflowOptions::with_id("d1").dedup_id("once"),
+        )
+        .await?;
+
+    // Reject (default): a colliding dedup id errors.
+    assert!(client
+        .enqueue::<_, i64>(
+            "dq",
+            "wf",
+            2i64,
+            WorkflowOptions::with_id("d2").dedup_id("once")
+        )
+        .await
+        .is_err());
+
+    // ReturnExisting: a colliding dedup id returns the existing workflow.
+    let again: WorkflowHandle<i64> = client
+        .enqueue(
+            "dq",
+            "wf",
+            3i64,
+            WorkflowOptions::with_id("d3")
+                .dedup_id("once")
+                .dedup_policy(DeduplicationPolicy::ReturnExisting),
+        )
+        .await?;
+    assert_eq!(again.id(), first.id());
+    assert_eq!(again.id(), "d1");
+
+    // Only the first row holds the slot.
+    let dq = client
+        .list_workflows(&ListFilter {
+            queue_name: Some("dq".into()),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(dq.len(), 1);
+
+    // A non-default policy requires a dedup id.
+    assert!(client
+        .enqueue::<_, i64>(
+            "dq",
+            "wf",
+            4i64,
+            WorkflowOptions::with_id("d4").dedup_policy(DeduplicationPolicy::ReturnExisting),
+        )
+        .await
+        .is_err());
+    Ok(())
+}
+
+/// A deduplication id is released once its holder reaches a terminal state, so
+/// the same id can be enqueued again afterward.
+#[tokio::test]
+async fn client_dedup_slot_frees_on_completion() -> Result<()> {
+    use durust::{StateProvider, WorkflowHandle, STATUS_SUCCESS};
+    let provider = Arc::new(InMemoryProvider::new());
+    let client = Client::new(provider.clone());
+
+    // The first enqueue holds the dedup slot.
+    let first: WorkflowHandle<i64> = client
+        .enqueue(
+            "dq",
+            "wf",
+            1i64,
+            WorkflowOptions::with_id("d1").dedup_id("once"),
+        )
+        .await?;
+    // While the holder is active a colliding dedup id is rejected.
+    assert!(client
+        .enqueue::<_, i64>(
+            "dq",
+            "wf",
+            2i64,
+            WorkflowOptions::with_id("d2").dedup_id("once")
+        )
+        .await
+        .is_err());
+
+    // Completing the holder releases the slot.
+    provider
+        .set_workflow_status(first.id(), STATUS_SUCCESS, None, None)
+        .await?;
+
+    // The same dedup id now starts a fresh workflow rather than colliding.
+    let third: WorkflowHandle<i64> = client
+        .enqueue(
+            "dq",
+            "wf",
+            3i64,
+            WorkflowOptions::with_id("d3").dedup_id("once"),
+        )
+        .await?;
+    assert_eq!(third.id(), "d3");
+    Ok(())
+}
+
+/// A workflow cancelled during its final step must stay cancelled: a late
+/// SUCCESS/ERROR completion is rejected and does not overwrite the status.
+#[tokio::test]
+async fn client_completion_cannot_overwrite_cancelled() -> Result<()> {
+    use durust::{StateProvider, WorkflowHandle, STATUS_CANCELLED, STATUS_SUCCESS};
+    let provider = Arc::new(InMemoryProvider::new());
+    let client = Client::new(provider.clone());
+
+    let h: WorkflowHandle<i64> = client
+        .enqueue("q", "wf", 1i64, WorkflowOptions::with_id("c1"))
+        .await?;
+    provider
+        .set_workflow_status(h.id(), STATUS_CANCELLED, None, Some("cancelled"))
+        .await?;
+
+    // A completion racing the cancellation must error, not flip it to SUCCESS.
+    let late = provider
+        .set_workflow_status(h.id(), STATUS_SUCCESS, None, None)
+        .await;
+    assert!(late.is_err(), "completing a cancelled workflow must error");
+
+    let row = provider.get_workflow_status(h.id()).await?.unwrap();
+    assert_eq!(row.status, STATUS_CANCELLED);
+    Ok(())
+}

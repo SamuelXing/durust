@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::provider::{
     decode_roles, dedup_or, encode_roles, is_terminal, nonexistent_or, DequeueRequest, ListFilter,
     StateProvider, StepAggregate, StepAggregateQuery, StepInfo, VersionInfo, WorkflowAggregate,
@@ -166,6 +166,22 @@ impl StateProvider for SqliteProvider {
         Ok(row_to_status(&row))
     }
 
+    async fn get_deduplicated_workflow(
+        &self,
+        queue_name: &str,
+        dedup_id: &str,
+    ) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT workflow_uuid FROM workflow_status \
+             WHERE queue_name = ? AND deduplication_id = ? LIMIT 1",
+        )
+        .bind(queue_name)
+        .bind(dedup_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get("workflow_uuid")))
+    }
+
     async fn get_workflow_status(&self, id: &str) -> Result<Option<WorkflowStatus>> {
         let row = sqlx::query(&format!(
             "SELECT {SELECT_COLS} FROM workflow_status WHERE workflow_uuid = ?"
@@ -185,24 +201,43 @@ impl StateProvider for SqliteProvider {
     ) -> Result<()> {
         let output_str = output.map(|v| self.serializer.encode(v)).transpose()?;
         let now = Utc::now().timestamp_millis();
-        let completed = is_terminal(status).then_some(now);
-        sqlx::query(
+        let terminal = is_terminal(status);
+        let completed = terminal.then_some(now);
+        // A workflow cancelled during its final step must stay cancelled: a
+        // SUCCESS/ERROR completion is not allowed to overwrite a CANCELLED row.
+        let is_completion = status == STATUS_SUCCESS || status == STATUS_ERROR;
+        // Reaching a terminal state frees the queue-scoped deduplication slot so
+        // the same deduplication id can be enqueued again.
+        let res = sqlx::query(
             "UPDATE workflow_status
              SET status = ?,
                  output = COALESCE(?, output),
                  error  = COALESCE(?, error),
                  completed_at = COALESCE(?, completed_at),
+                 deduplication_id = CASE WHEN ? THEN NULL ELSE deduplication_id END,
                  updated_at = ?
-             WHERE workflow_uuid = ?",
+             WHERE workflow_uuid = ? AND NOT (status = ? AND ?)",
         )
         .bind(status)
         .bind(output_str)
         .bind(error)
         .bind(completed)
+        .bind(terminal)
         .bind(now)
         .bind(id)
+        .bind(STATUS_CANCELLED)
+        .bind(is_completion)
         .execute(&self.pool)
         .await?;
+        // If the completion was blocked because the workflow was already
+        // cancelled, surface the cancellation rather than reporting success.
+        if is_completion && res.rows_affected() == 0 {
+            if let Some(w) = self.get_workflow_status(id).await? {
+                if w.status == STATUS_CANCELLED {
+                    return Err(Error::Cancelled(id.to_string()));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -847,11 +882,14 @@ impl StateProvider for SqliteProvider {
         .await?;
         let attempts = attempts.unwrap_or(0) as i32;
         if attempts > max {
-            sqlx::query("UPDATE workflow_status SET status = ? WHERE workflow_uuid = ?")
-                .bind(STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED)
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "UPDATE workflow_status SET status = ?, deduplication_id = NULL \
+                 WHERE workflow_uuid = ?",
+            )
+            .bind(STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(attempts)

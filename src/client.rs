@@ -7,9 +7,10 @@
 //! [`DurableEngine`]: crate::DurableEngine
 
 use crate::engine::{
-    cron_ticks_between, parse_cron, parse_timezone, WorkflowOptions, INTERNAL_QUEUE,
+    cron_ticks_between, parse_cron, parse_timezone, DeduplicationPolicy, WorkflowOptions,
+    INTERNAL_QUEUE,
 };
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{
     ListFilter, StateProvider, StepInfo, VersionInfo, WorkflowStatus, STATUS_DELAYED,
@@ -93,6 +94,11 @@ impl Client {
                 "partition key and deduplication id cannot be used together",
             ));
         }
+        if opts.dedup_policy != DeduplicationPolicy::Reject && opts.dedup_id.is_none() {
+            return Err(Error::app(
+                "a deduplication policy requires a deduplication id",
+            ));
+        }
 
         let id = opts
             .workflow_id
@@ -104,6 +110,9 @@ impl Client {
         } else {
             STATUS_ENQUEUED
         };
+        // A per-enqueue version override, else the client default (empty ⇒ any
+        // executor claims it).
+        let app_version = opts.app_version.as_deref().unwrap_or(&self.app_version);
 
         // Unowned (empty executor) until a dispatcher claims it.
         let mut row = WorkflowStatus::new(
@@ -112,7 +121,7 @@ impl Client {
             serde_json::to_value(input)?,
             status,
             "",
-            &self.app_version,
+            app_version,
         );
         row.queue_name = Some(queue_name.to_string());
         row.priority = opts.priority;
@@ -124,8 +133,29 @@ impl Client {
         row.timeout_ms = opts.timeout.map(|d| d.as_millis() as i64);
         row.delay_until_ms = opts.delay.map(|d| now_ms + d.as_millis() as i64);
 
-        self.provider.insert_workflow_status(row).await?;
-        Ok(WorkflowHandle::polling(id, self.provider.clone()))
+        // On a dedup collision under `ReturnExisting`, return a handle to the
+        // workflow already holding the slot; retry if it was freed in between.
+        loop {
+            match self.provider.insert_workflow_status(row.clone()).await {
+                Ok(_) => return Ok(WorkflowHandle::polling(id, self.provider.clone())),
+                Err(e)
+                    if opts.dedup_policy == DeduplicationPolicy::ReturnExisting
+                        && e.code() == ErrorCode::QueueDeduplicated =>
+                {
+                    if let Some(existing) = self
+                        .provider
+                        .get_deduplicated_workflow(
+                            queue_name,
+                            opts.dedup_id.as_deref().unwrap_or(""),
+                        )
+                        .await?
+                    {
+                        return Ok(WorkflowHandle::polling(existing, self.provider.clone()));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Send a message to a workflow (e.g. to nudge one waiting in

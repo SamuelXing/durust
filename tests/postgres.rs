@@ -1250,3 +1250,165 @@ async fn pg_portable_input_envelope() -> Result<()> {
     assert_eq!(status.input, serde_json::json!("ada"));
     Ok(())
 }
+
+/// On Postgres, the client honors a per-enqueue application-version override and
+/// the `ReturnExisting` dedup policy (a colliding dedup id returns the holder).
+#[tokio::test]
+async fn pg_enqueue_dedup_and_app_version() -> Result<()> {
+    use durust::{Client, DeduplicationPolicy, WorkflowHandle};
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_enqueue_dedup_and_app_version: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let queue = format!("dq-{tag}");
+    let dedup = format!("once-{tag}");
+    let client = Client::new(Arc::new(PostgresProvider::connect(&url).await?));
+
+    // Per-enqueue application-version override.
+    let ver_id = format!("wf-ver-{tag}");
+    let _: WorkflowHandle<i64> = client
+        .enqueue(
+            &queue,
+            "wf",
+            1i64,
+            WorkflowOptions::with_id(&ver_id).app_version("v-special"),
+        )
+        .await?;
+    let rows = client
+        .list_workflows(&ListFilter {
+            workflow_id_prefix: Some(ver_id.clone()),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(rows[0].app_version, "v-special");
+
+    // ReturnExisting returns the holder; the default rejects.
+    let first: WorkflowHandle<i64> = client
+        .enqueue(
+            &queue,
+            "wf",
+            1i64,
+            WorkflowOptions::with_id(format!("d1-{tag}")).dedup_id(&dedup),
+        )
+        .await?;
+    assert!(client
+        .enqueue::<_, i64>(
+            &queue,
+            "wf",
+            2i64,
+            WorkflowOptions::with_id(format!("d2-{tag}")).dedup_id(&dedup),
+        )
+        .await
+        .is_err());
+    let again: WorkflowHandle<i64> = client
+        .enqueue(
+            &queue,
+            "wf",
+            3i64,
+            WorkflowOptions::with_id(format!("d3-{tag}"))
+                .dedup_id(&dedup)
+                .dedup_policy(DeduplicationPolicy::ReturnExisting),
+        )
+        .await?;
+    assert_eq!(again.id(), first.id());
+
+    client
+        .delete_workflows(&[first.id().to_string(), ver_id], false)
+        .await?;
+    Ok(())
+}
+
+/// A deduplication id is released once its holder reaches a terminal state, so
+/// the same id can be enqueued again afterward.
+#[tokio::test]
+async fn pg_dedup_slot_frees_on_completion() -> Result<()> {
+    use durust::{Client, WorkflowHandle, STATUS_SUCCESS};
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_dedup_slot_frees_on_completion: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let queue = format!("dq-{tag}");
+    let dedup = format!("once-{tag}");
+    let d1 = format!("d1-{tag}");
+    let d3 = format!("d3-{tag}");
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    let client = Client::new(provider.clone());
+
+    let first: WorkflowHandle<i64> = client
+        .enqueue(
+            &queue,
+            "wf",
+            1i64,
+            WorkflowOptions::with_id(&d1).dedup_id(&dedup),
+        )
+        .await?;
+    // The partial unique index rejects a colliding dedup id while d1 is active.
+    assert!(client
+        .enqueue::<_, i64>(
+            &queue,
+            "wf",
+            2i64,
+            WorkflowOptions::with_id(format!("d2-{tag}")).dedup_id(&dedup),
+        )
+        .await
+        .is_err());
+
+    // Completing d1 nulls its deduplication_id, freeing the slot.
+    provider
+        .set_workflow_status(first.id(), STATUS_SUCCESS, None, None)
+        .await?;
+
+    let third: WorkflowHandle<i64> = client
+        .enqueue(
+            &queue,
+            "wf",
+            3i64,
+            WorkflowOptions::with_id(&d3).dedup_id(&dedup),
+        )
+        .await?;
+    assert_eq!(third.id(), d3);
+
+    client.delete_workflows(&[d1, d3], false).await?;
+    Ok(())
+}
+
+/// A workflow cancelled during its final step must stay cancelled: a late
+/// SUCCESS/ERROR completion is rejected and does not overwrite the status.
+#[tokio::test]
+async fn pg_completion_cannot_overwrite_cancelled() -> Result<()> {
+    use durust::{Client, WorkflowHandle, STATUS_CANCELLED, STATUS_SUCCESS};
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_completion_cannot_overwrite_cancelled: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let id = format!("c1-{tag}");
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    let client = Client::new(provider.clone());
+
+    let h: WorkflowHandle<i64> = client
+        .enqueue(
+            &format!("q-{tag}"),
+            "wf",
+            1i64,
+            WorkflowOptions::with_id(&id),
+        )
+        .await?;
+    provider
+        .set_workflow_status(h.id(), STATUS_CANCELLED, None, Some("cancelled"))
+        .await?;
+
+    // A completion racing the cancellation must error, not flip it to SUCCESS.
+    let late = provider
+        .set_workflow_status(h.id(), STATUS_SUCCESS, None, None)
+        .await;
+    assert!(late.is_err(), "completing a cancelled workflow must error");
+
+    let row = provider.get_workflow_status(h.id()).await?.unwrap();
+    assert_eq!(row.status, STATUS_CANCELLED);
+
+    client.delete_workflows(&[id], false).await?;
+    Ok(())
+}

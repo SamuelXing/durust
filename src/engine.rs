@@ -1,5 +1,5 @@
 use crate::context::{AuthContext, DurableContext};
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{
     is_terminal, DequeueRequest, ListFilter, StateProvider, StepAggregate, StepAggregateQuery,
@@ -110,12 +110,32 @@ pub struct RegisteredWorkflow {
 ///
 /// `timeout` fixes a deadline when the workflow starts (at claim time for
 /// queued workflows); a run that overruns it is cancelled.
+/// How a queue-scoped deduplication-id collision is handled on enqueue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DeduplicationPolicy {
+    /// Reject the enqueue with a
+    /// [`QueueDeduplicated`](crate::ErrorCode::QueueDeduplicated) error — the
+    /// default.
+    #[default]
+    Reject,
+    /// Instead of erroring, return a handle to the workflow already enqueued
+    /// under this deduplication id. Requires a deduplication id.
+    ReturnExisting,
+}
+
 #[derive(Clone, Default)]
 pub struct WorkflowOptions {
     /// Explicit idempotency key. If `None`, a uuid is generated.
     pub workflow_id: Option<String>,
     /// Queue-scoped deduplication key.
     pub dedup_id: Option<String>,
+    /// How a deduplication-id collision is handled (queued runs only); requires
+    /// `dedup_id` when not [`Reject`](DeduplicationPolicy::Reject).
+    pub dedup_policy: DeduplicationPolicy,
+    /// Application version to stamp on this run, overriding the engine/client
+    /// default. `None` uses the default (an empty default lets any executor
+    /// claim the work).
+    pub app_version: Option<String>,
     /// Route through this queue instead of running inline.
     pub queue: Option<String>,
     /// Dispatch priority within a queue; lower runs first.
@@ -163,6 +183,25 @@ impl WorkflowOptions {
     /// Set the partition key for a partitioned queue.
     pub fn partition_key(mut self, key: impl Into<String>) -> Self {
         self.partition_key = Some(key.into());
+        self
+    }
+
+    /// Set the queue-scoped deduplication id.
+    pub fn dedup_id(mut self, id: impl Into<String>) -> Self {
+        self.dedup_id = Some(id.into());
+        self
+    }
+
+    /// Set how a deduplication-id collision is handled (see
+    /// [`DeduplicationPolicy`]).
+    pub fn dedup_policy(mut self, policy: DeduplicationPolicy) -> Self {
+        self.dedup_policy = policy;
+        self
+    }
+
+    /// Stamp a specific application version on this run, overriding the default.
+    pub fn app_version(mut self, version: impl Into<String>) -> Self {
+        self.app_version = Some(version.into());
         self
     }
 
@@ -658,6 +697,11 @@ impl DurableEngine {
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let input_json = serde_json::to_value(input)?;
+        if opts.dedup_policy != DeduplicationPolicy::Reject && opts.dedup_id.is_none() {
+            return Err(Error::app(
+                "a deduplication policy requires a deduplication id",
+            ));
+        }
         let handler = rt
             .workflows
             .get(name)
@@ -670,9 +714,30 @@ impl DurableEngine {
             assumed_role: opts.assumed_role.clone(),
             authenticated_roles: opts.authenticated_roles.clone(),
         };
-        let (canonical, queued) = rt
-            .insert_run(&id, name, input_json, &opts, None, &auth)
-            .await?;
+        // On a dedup collision under `ReturnExisting`, hand back the workflow
+        // already holding the slot; retry if it was freed between insert and
+        // lookup (the slot's owner just completed).
+        let (canonical, queued) = loop {
+            match rt
+                .insert_run(&id, name, input_json.clone(), &opts, None, &auth)
+                .await
+            {
+                Ok(v) => break v,
+                Err(e)
+                    if opts.dedup_policy == DeduplicationPolicy::ReturnExisting
+                        && e.code() == ErrorCode::QueueDeduplicated =>
+                {
+                    if let (Some(q), Some(d)) = (opts.queue.as_deref(), opts.dedup_id.as_deref()) {
+                        if let Some(existing) =
+                            self.provider.get_deduplicated_workflow(q, d).await?
+                        {
+                            return Ok(WorkflowHandle::polling(existing, self.provider.clone()));
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        };
 
         // Terminal already, or owned by a queue: observe via polling.
         if queued || is_terminal(&canonical.status) {
@@ -1130,8 +1195,8 @@ impl Runtime {
             self.executor_id.as_str()
         };
 
-        let mut row =
-            WorkflowStatus::new(id, name, input_json, status, executor, &self.app_version);
+        let app_version = opts.app_version.as_deref().unwrap_or(&self.app_version);
+        let mut row = WorkflowStatus::new(id, name, input_json, status, executor, app_version);
         row.queue_name = opts.queue.clone();
         row.priority = opts.priority;
         row.queue_partition_key = opts.partition_key.clone();
