@@ -1412,3 +1412,63 @@ async fn pg_completion_cannot_overwrite_cancelled() -> Result<()> {
     client.delete_workflows(&[id], false).await?;
     Ok(())
 }
+
+/// Through Postgres: `apply_schedules` is atomic — a mid-batch failure rolls the
+/// whole batch back, leaving any schedule it would have replaced untouched.
+#[tokio::test]
+async fn pg_apply_schedules_is_atomic() -> Result<()> {
+    use durust::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_apply_schedules_is_atomic: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let prefix = format!("sch-{tag}-");
+    let keep = format!("{prefix}keep");
+    let other = format!("{prefix}other");
+    let dup = format!("dup-{tag}");
+    let provider = PostgresProvider::connect(&url).await?;
+
+    let make = |id: String, name: String, cron: &str| WorkflowSchedule {
+        schedule_id: id,
+        schedule_name: name,
+        workflow_name: "wf".to_string(),
+        schedule: cron.to_string(),
+        status: ScheduleStatus::Active,
+        context: None,
+        last_fired_at: None,
+        automatic_backfill: false,
+        cron_timezone: None,
+        queue_name: None,
+    };
+
+    provider
+        .apply_schedules(&[make(format!("idkeep-{tag}"), keep.clone(), "0 0 1 * * *")])
+        .await?;
+
+    // The second insert reuses schedule_id `dup` → PRIMARY KEY violation, so the
+    // whole batch (including the replacement of `keep`) must roll back.
+    let bad = vec![
+        make(dup.clone(), keep.clone(), "0 0 2 * * *"),
+        make(dup.clone(), other.clone(), "0 0 3 * * *"),
+    ];
+    assert!(
+        provider.apply_schedules(&bad).await.is_err(),
+        "a duplicate schedule_id must fail the batch"
+    );
+
+    let mine = provider
+        .list_schedules(&ScheduleFilter {
+            name_prefixes: vec![prefix],
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(mine.len(), 1, "rollback left exactly the original schedule");
+    assert_eq!(mine[0].schedule_name, keep);
+    assert_eq!(mine[0].schedule_id, format!("idkeep-{tag}"), "original id");
+    assert_eq!(mine[0].schedule, "0 0 1 * * *", "original cron preserved");
+
+    provider.delete_schedule(&keep).await?;
+    provider.delete_schedule(&other).await?;
+    Ok(())
+}

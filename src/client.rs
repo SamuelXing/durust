@@ -430,9 +430,12 @@ impl Client {
                 parse_timezone(tz)?;
             }
         }
-        for req in schedules {
-            self.provider.delete_schedule(&req.schedule_name).await?;
-            let schedule = WorkflowSchedule {
+        // Build the replacement set up front, then apply the whole batch in one
+        // transaction so it is all-or-nothing (a mid-batch failure rolls back,
+        // leaving any schedules the batch would have replaced untouched).
+        let built: Vec<WorkflowSchedule> = schedules
+            .into_iter()
+            .map(|req| WorkflowSchedule {
                 schedule_id: uuid::Uuid::new_v4().to_string(),
                 schedule_name: req.schedule_name,
                 workflow_name: req.workflow_name,
@@ -443,10 +446,9 @@ impl Client {
                 automatic_backfill: req.options.automatic_backfill,
                 cron_timezone: req.options.cron_timezone,
                 queue_name: req.options.queue_name,
-            };
-            self.provider.create_schedule(&schedule).await?;
-        }
-        Ok(())
+            })
+            .collect();
+        self.provider.apply_schedules(&built).await
     }
 
     /// The schedule named `schedule_name`, or `None` if there is none.
