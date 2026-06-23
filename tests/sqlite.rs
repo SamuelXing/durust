@@ -1534,3 +1534,125 @@ async fn sqlite_apply_schedules_is_atomic() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// A transactional step commits the user's SQL writes and the step checkpoint
+/// together: across a restart the debit replays from the checkpoint and is not
+/// reapplied (exactly-once).
+#[tokio::test]
+async fn sqlite_transaction_step_exactly_once() -> Result<()> {
+    use durust::params;
+    let (url, path) = temp_db_url("txn");
+
+    fn register(engine: &mut DurableEngine) {
+        engine.register("acct", |ctx: DurableContext, _: ()| async move {
+            ctx.transaction::<(), _>("setup", |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "CREATE TABLE IF NOT EXISTS acct (id INTEGER PRIMARY KEY, bal INTEGER)",
+                        &params![],
+                    )
+                    .await?;
+                    tx.execute(
+                        "INSERT INTO acct (id, bal) VALUES (1, 100) ON CONFLICT (id) DO NOTHING",
+                        &params![],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await?;
+            let bal: i64 = ctx
+                .transaction("debit", |tx| {
+                    Box::pin(async move {
+                        tx.execute(
+                            "UPDATE acct SET bal = bal - ? WHERE id = ?",
+                            &params![10_i64, 1_i64],
+                        )
+                        .await?;
+                        let row = tx
+                            .query_one("SELECT bal FROM acct WHERE id = ?", &params![1_i64])
+                            .await?;
+                        Ok(row.get::<i64>("bal"))
+                    })
+                })
+                .await?;
+            Ok::<_, Error>(bal)
+        });
+    }
+
+    // First run: seed 100, debit 10 -> 90.
+    {
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        register(&mut engine);
+        let bal: i64 = engine.start_typed("acct", "wf-txn", ()).await?;
+        assert_eq!(bal, 90);
+    }
+    // Restart and re-run the same id: both transaction steps replay (the body is
+    // not run), so the debit is not reapplied — still 90, not 80.
+    {
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        register(&mut engine);
+        let bal: i64 = engine.start_typed("acct", "wf-txn", ()).await?;
+        assert_eq!(
+            bal, 90,
+            "transactional step is exactly-once across a restart"
+        );
+    }
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// A transactional step whose body returns an error rolls back its writes: a
+/// later step reads the original value, proving the failed write did not commit.
+#[tokio::test]
+async fn sqlite_transaction_step_rolls_back_on_error() -> Result<()> {
+    use durust::params;
+    let (url, path) = temp_db_url("txnrb");
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("rb", |ctx: DurableContext, _: ()| async move {
+        ctx.transaction::<(), _>("setup", |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "CREATE TABLE IF NOT EXISTS r (id INTEGER PRIMARY KEY, v INTEGER)",
+                    &params![],
+                )
+                .await?;
+                tx.execute(
+                    "INSERT INTO r (id, v) VALUES (1, 0) ON CONFLICT (id) DO NOTHING",
+                    &params![],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await?;
+        // Write, then fail: the write must roll back with the transaction.
+        let failed = ctx
+            .transaction::<(), _>("bad", |tx| {
+                Box::pin(async move {
+                    tx.execute("UPDATE r SET v = 999 WHERE id = 1", &params![])
+                        .await?;
+                    Err(Error::app("boom"))
+                })
+            })
+            .await
+            .is_err();
+        let v: i64 = ctx
+            .transaction("read", |tx| {
+                Box::pin(async move {
+                    let row = tx
+                        .query_one("SELECT v FROM r WHERE id = 1", &params![])
+                        .await?;
+                    Ok(row.get::<i64>("v"))
+                })
+            })
+            .await?;
+        Ok::<_, Error>((failed, v))
+    });
+    let (failed, v): (bool, i64) = engine.start_typed("rb", "wf-rb", ()).await?;
+    assert!(failed, "the failing transaction returned its error");
+    assert_eq!(v, 0, "the failed transaction's write rolled back");
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}

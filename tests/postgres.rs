@@ -1472,3 +1472,88 @@ async fn pg_apply_schedules_is_atomic() -> Result<()> {
     provider.delete_schedule(&other).await?;
     Ok(())
 }
+
+/// Through Postgres: a transactional step commits the user's writes and the step
+/// checkpoint together. Re-running the same workflow id replays the debit from
+/// its checkpoint instead of reapplying it (exactly-once).
+#[tokio::test]
+async fn pg_transaction_step() -> Result<()> {
+    use durust::params;
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_transaction_step: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let table = format!("acct_{tag}");
+    let wf = format!("wf-txn-{tag}");
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+
+    engine.register("acct", |ctx: DurableContext, table: String| async move {
+        let t = table.clone();
+        ctx.transaction::<(), _>("setup", move |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    &format!("CREATE TABLE IF NOT EXISTS {t} (id INT PRIMARY KEY, bal BIGINT)"),
+                    &params![],
+                )
+                .await?;
+                tx.execute(
+                    &format!(
+                        "INSERT INTO {t} (id, bal) VALUES (1, 100) ON CONFLICT (id) DO NOTHING"
+                    ),
+                    &params![],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await?;
+        let t = table.clone();
+        let bal: i64 = ctx
+            .transaction("debit", move |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        &format!("UPDATE {t} SET bal = bal - ? WHERE id = ?"),
+                        &params![10_i64, 1_i64],
+                    )
+                    .await?;
+                    let row = tx
+                        .query_one(
+                            &format!("SELECT bal FROM {t} WHERE id = ?"),
+                            &params![1_i64],
+                        )
+                        .await?;
+                    Ok(row.get::<i64>("bal"))
+                })
+            })
+            .await?;
+        Ok::<_, Error>(bal)
+    });
+
+    // Register the cleanup workflow up front too: the shared runtime is built on
+    // the first run, so a later registration would not be seen.
+    engine.register("drop", |ctx: DurableContext, table: String| async move {
+        ctx.transaction::<(), _>("drop", move |tx| {
+            Box::pin(async move {
+                tx.execute(&format!("DROP TABLE IF EXISTS {table}"), &params![])
+                    .await?;
+                Ok(())
+            })
+        })
+        .await?;
+        Ok::<_, Error>(())
+    });
+
+    let bal1: i64 = engine.start_typed("acct", &wf, table.clone()).await?;
+    assert_eq!(bal1, 90);
+    // Re-run the same id: the debit replays from its checkpoint, not reapplied.
+    let bal2: i64 = engine.start_typed("acct", &wf, table.clone()).await?;
+    assert_eq!(bal2, 90, "exactly-once: re-running does not debit again");
+
+    // Clean up the user table and the workflow rows.
+    let drop_wf = format!("wf-drop-{tag}");
+    let _: () = engine.start_typed("drop", &drop_wf, table.clone()).await?;
+    provider.delete_workflows(&[wf, drop_wf], false).await?;
+    Ok(())
+}

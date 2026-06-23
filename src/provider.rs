@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
+use crate::tx::TxBody;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -531,6 +532,22 @@ pub trait StateProvider: Send + Sync {
         name: &str,
         value: Value,
         started_at_ms: Option<i64>,
+    ) -> Result<Value>;
+
+    /// Run a transactional step: `body`'s SQL writes and this step's
+    /// `operation_outputs` checkpoint commit in **one** database transaction, so
+    /// the writes happen exactly once. Returns the step's JSON output — `body`'s
+    /// on the first run, or the stored one on replay (when `body` is not run).
+    /// On a `body` error the transaction rolls back (no checkpoint), so the step
+    /// re-runs on replay, matching ordinary steps. SQL backends only; the
+    /// in-memory provider returns an error.
+    async fn run_transaction_step(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        name: &str,
+        started_at_ms: i64,
+        body: TxBody<'_>,
     ) -> Result<Value>;
 
     /// Atomically claim up to `req.max_tasks` `ENQUEUED` workflows from a queue,

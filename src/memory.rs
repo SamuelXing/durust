@@ -6,6 +6,7 @@ use crate::provider::{
     STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
+use crate::tx::TxBody;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -177,6 +178,21 @@ impl StateProvider for InMemoryProvider {
             .clone()
             .unwrap_or(Value::Null);
         Ok(canonical)
+    }
+
+    async fn run_transaction_step(
+        &self,
+        _workflow_id: &str,
+        _seq: i32,
+        _name: &str,
+        _started_at_ms: i64,
+        _body: TxBody<'_>,
+    ) -> Result<Value> {
+        // Transactional steps need a real SQL transaction; the in-memory store
+        // has none. Run such workflows on the SQLite or Postgres backend.
+        Err(Error::app(
+            "transactional steps require a SQL backend (Postgres or SQLite)",
+        ))
     }
 
     async fn dequeue_workflows(&self, req: &DequeueRequest) -> Result<Vec<WorkflowStatus>> {

@@ -8,6 +8,7 @@ use crate::provider::{
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
+use crate::tx::{Tx, TxBody};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -297,6 +298,59 @@ impl StateProvider for SqliteProvider {
             row.get::<Option<String>, _>("output").as_deref(),
         )?
         .unwrap_or(Value::Null))
+    }
+
+    async fn run_transaction_step(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        name: &str,
+        started_at_ms: i64,
+        body: TxBody<'_>,
+    ) -> Result<Value> {
+        let mut tx = self.pool.begin().await?;
+        // Replay: if this step already committed, return its recorded output and
+        // do not run the body. (The read-only tx rolls back on drop.)
+        if let Some(r) = sqlx::query(
+            "SELECT output, serialization FROM operation_outputs
+             WHERE workflow_uuid = ? AND function_id = ?",
+        )
+        .bind(workflow_id)
+        .bind(seq)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            return Ok(serialize::decode_opt(
+                r.get::<Option<String>, _>("serialization").as_deref(),
+                r.get::<Option<String>, _>("output").as_deref(),
+            )?
+            .unwrap_or(Value::Null));
+        }
+        // Run the user's body against this transaction. On error we return,
+        // dropping `tx` (rollback), so nothing the body wrote persists.
+        let value = {
+            let mut h = Tx::sqlite(&mut tx);
+            body(&mut h).await?
+        };
+        // Checkpoint in the same transaction, then commit atomically.
+        sqlx::query(
+            "INSERT INTO operation_outputs
+                 (workflow_uuid, function_id, function_name, output, serialization,
+                  started_at_epoch_ms, completed_at_epoch_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
+        )
+        .bind(workflow_id)
+        .bind(seq)
+        .bind(name)
+        .bind(self.serializer.encode(&value)?)
+        .bind(self.serializer.name())
+        .bind(started_at_ms)
+        .bind(Utc::now().timestamp_millis())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(value)
     }
 
     async fn dequeue_workflows(&self, req: &DequeueRequest) -> Result<Vec<WorkflowStatus>> {

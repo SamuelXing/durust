@@ -46,6 +46,7 @@ mod queue;
 mod schedule;
 mod serialize;
 mod sqlite;
+mod tx;
 
 pub use client::Client;
 pub use context::{AuthContext, DurableContext, StepOptions};
@@ -69,6 +70,7 @@ pub use schedule::{
 };
 pub use serialize::{PortableWorkflowArgs, Serializer};
 pub use sqlite::SqliteProvider;
+pub use tx::{Param, Row, Tx, TxBody};
 
 /// The `#[workflow]` attribute macro. Annotate an
 /// `async fn(DurableContext, Input) -> Result<Output>` to have it

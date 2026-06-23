@@ -2,6 +2,7 @@ use crate::engine::{Runtime, WorkflowOptions};
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{StateProvider, WorkflowStatus, STATUS_CANCELLED};
+use crate::tx::{Tx, TxBody};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::future::{poll_fn, Future};
@@ -337,6 +338,57 @@ impl DurableContext {
         let result = self.run_with_retries(&opts, &mut f).await?;
         self.checkpoint(seq, &opts.name, result, Some(started))
             .await
+    }
+
+    /// Run a **transactional step**: the closure's SQL writes and this step's
+    /// checkpoint commit in **one** database transaction, so the writes happen
+    /// exactly once. On replay the recorded output is returned without
+    /// re-running the body; on a body error the transaction rolls back (nothing
+    /// the body wrote persists) and the step re-runs on replay, like an ordinary
+    /// step. Requires a SQL backend (Postgres or SQLite); on the in-memory
+    /// backend it returns an error.
+    ///
+    /// The body receives a [`Tx`] and returns a boxed future — `Box::pin(async
+    /// move { … })`, mirroring sqlx's own transaction closures. SQL is written
+    /// with `?` placeholders (rewritten to `$1, $2, …` for Postgres) and bound
+    /// via [`params!`](crate::params):
+    ///
+    /// ```no_run
+    /// # use durust::{DurableContext, Result, params};
+    /// # async fn ex(ctx: DurableContext) -> Result<()> {
+    /// let bal: i64 = ctx
+    ///     .transaction("debit", |tx| Box::pin(async move {
+    ///         tx.execute("UPDATE acct SET bal = bal - ? WHERE id = ?",
+    ///                    &params![10_i64, 1_i64]).await?;
+    ///         let row = tx.query_one("SELECT bal FROM acct WHERE id = ?",
+    ///                                &params![1_i64]).await?;
+    ///         Ok(row.get::<i64>("bal"))
+    ///     }))
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn transaction<T, F>(&self, name: &str, f: F) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned,
+        F: for<'t, 'c> FnOnce(
+                &'t mut Tx<'c>,
+            ) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 't>>
+            + Send
+            + 'static,
+    {
+        let seq = self.next_seq();
+        let started = chrono::Utc::now().timestamp_millis();
+        let body: TxBody = Box::new(move |tx| {
+            Box::pin(async move {
+                let out = f(tx).await?;
+                Ok::<_, Error>(serde_json::to_value(out)?)
+            })
+        });
+        let value = self
+            .provider
+            .run_transaction_step(&self.workflow_id, seq, name, started, body)
+            .await?;
+        Ok(serde_json::from_value(value)?)
     }
 
     /// Race several async `branches` and return the `(index, value)` of the first
