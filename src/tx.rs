@@ -224,13 +224,71 @@ impl Row {
 /// resolves to the step's JSON output. Produced by
 /// [`DurableContext::transaction`](crate::DurableContext::transaction); consumed
 /// by the provider, which supplies the [`Tx`] and the surrounding transaction.
+///
+/// It is `Fn`, not `FnOnce`, because a transaction-level conflict
+/// (serialization failure / deadlock) under a higher isolation level restarts
+/// the whole transaction on a fresh one, re-running the body.
 pub type TxBody<'a> = Box<
-    dyn for<'t, 'c> FnOnce(
-            &'t mut Tx<'c>,
-        ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 't>>
+    dyn for<'t, 'c> Fn(&'t mut Tx<'c>) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 't>>
         + Send
+        + Sync
         + 'a,
 >;
+
+/// Isolation level for a transactional step. `ReadCommitted` is the default;
+/// `RepeatableRead`/`Serializable` give stronger guarantees but can fail with a
+/// serialization conflict, which the transactional step retries automatically.
+/// SQLite runs every transaction serializably, so the level is advisory there.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IsolationLevel {
+    #[default]
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+impl IsolationLevel {
+    /// The `SET TRANSACTION ISOLATION LEVEL` clause for Postgres.
+    pub(crate) fn pg_sql(self) -> &'static str {
+        match self {
+            IsolationLevel::ReadCommitted => "READ COMMITTED",
+            IsolationLevel::RepeatableRead => "REPEATABLE READ",
+            IsolationLevel::Serializable => "SERIALIZABLE",
+        }
+    }
+}
+
+/// Options for a transactional step: its checkpoint `name`, isolation level, and
+/// whether the transaction is read-only.
+#[derive(Clone, Debug)]
+pub struct TransactionOptions {
+    pub name: String,
+    pub isolation: IsolationLevel,
+    pub read_only: bool,
+}
+
+impl TransactionOptions {
+    /// Default options (`ReadCommitted`, read-write) for a step named `name`.
+    pub fn new(name: impl Into<String>) -> Self {
+        TransactionOptions {
+            name: name.into(),
+            isolation: IsolationLevel::default(),
+            read_only: false,
+        }
+    }
+
+    /// Set the isolation level.
+    pub fn isolation(mut self, level: IsolationLevel) -> Self {
+        self.isolation = level;
+        self
+    }
+
+    /// Mark the transaction read-only.
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+}
 
 /// Rewrite `?` placeholders to Postgres `$1, $2, …`, leaving any `?` inside a
 /// single-quoted string literal untouched.

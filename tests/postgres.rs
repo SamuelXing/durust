@@ -1492,6 +1492,7 @@ async fn pg_transaction_step() -> Result<()> {
     engine.register("acct", |ctx: DurableContext, table: String| async move {
         let t = table.clone();
         ctx.transaction::<(), _>("setup", move |tx| {
+            let t = t.clone();
             Box::pin(async move {
                 tx.execute(
                     &format!("CREATE TABLE IF NOT EXISTS {t} (id INT PRIMARY KEY, bal BIGINT)"),
@@ -1512,6 +1513,7 @@ async fn pg_transaction_step() -> Result<()> {
         let t = table.clone();
         let bal: i64 = ctx
             .transaction("debit", move |tx| {
+                let t = t.clone();
                 Box::pin(async move {
                     tx.execute(
                         &format!("UPDATE {t} SET bal = bal - ? WHERE id = ?"),
@@ -1535,6 +1537,7 @@ async fn pg_transaction_step() -> Result<()> {
     // the first run, so a later registration would not be seen.
     engine.register("drop", |ctx: DurableContext, table: String| async move {
         ctx.transaction::<(), _>("drop", move |tx| {
+            let table = table.clone();
             Box::pin(async move {
                 tx.execute(&format!("DROP TABLE IF EXISTS {table}"), &params![])
                     .await?;
@@ -1555,5 +1558,115 @@ async fn pg_transaction_step() -> Result<()> {
     let drop_wf = format!("wf-drop-{tag}");
     let _: () = engine.start_typed("drop", &drop_wf, table.clone()).await?;
     provider.delete_workflows(&[wf, drop_wf], false).await?;
+    Ok(())
+}
+
+/// Two concurrent SERIALIZABLE transactional steps read-then-write the same row.
+/// One hits a serialization conflict and retries on a fresh transaction, so
+/// neither increment is lost (the counter ends at 2, results are {1, 2}).
+#[tokio::test]
+async fn pg_transaction_serializable_retries_on_conflict() -> Result<()> {
+    use durust::{params, IsolationLevel, TransactionOptions};
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_transaction_serializable_retries_on_conflict: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let table = format!("ctr_{tag}");
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+
+    // All workflows registered up front (the shared runtime is built on first run).
+    engine.register("seed", |ctx: DurableContext, table: String| async move {
+        ctx.transaction::<(), _>("seed", move |tx| {
+            let table = table.clone();
+            Box::pin(async move {
+                tx.execute(
+                    &format!("CREATE TABLE IF NOT EXISTS {table} (id INT PRIMARY KEY, v BIGINT)"),
+                    &params![],
+                )
+                .await?;
+                tx.execute(
+                    &format!(
+                        "INSERT INTO {table} (id, v) VALUES (1, 0) ON CONFLICT (id) DO NOTHING"
+                    ),
+                    &params![],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await?;
+        Ok::<_, Error>(())
+    });
+    engine.register("incr", |ctx: DurableContext, table: String| async move {
+        let t = table.clone();
+        let v: i64 = ctx
+            .transaction_with(
+                TransactionOptions::new("incr").isolation(IsolationLevel::Serializable),
+                move |tx| {
+                    let t = t.clone();
+                    Box::pin(async move {
+                        let row = tx
+                            .query_one(&format!("SELECT v FROM {t} WHERE id = 1"), &params![])
+                            .await?;
+                        let cur: i64 = row.get("v");
+                        // Widen the read-write window so the two overlap.
+                        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                        tx.execute(
+                            &format!("UPDATE {t} SET v = ? WHERE id = 1"),
+                            &params![cur + 1],
+                        )
+                        .await?;
+                        Ok(cur + 1)
+                    })
+                },
+            )
+            .await?;
+        Ok::<_, Error>(v)
+    });
+    engine.register("drop", |ctx: DurableContext, table: String| async move {
+        ctx.transaction::<(), _>("drop", move |tx| {
+            let table = table.clone();
+            Box::pin(async move {
+                tx.execute(&format!("DROP TABLE IF EXISTS {table}"), &params![])
+                    .await?;
+                Ok(())
+            })
+        })
+        .await?;
+        Ok::<_, Error>(())
+    });
+
+    let _: () = engine
+        .start_typed("seed", &format!("seed-{tag}"), table.clone())
+        .await?;
+    let (id_a, id_b) = (format!("a-{tag}"), format!("b-{tag}"));
+    let (a, b) = tokio::join!(
+        engine.start_typed::<_, i64>("incr", &id_a, table.clone()),
+        engine.start_typed::<_, i64>("incr", &id_b, table.clone()),
+    );
+    let mut results = [a?, b?];
+    results.sort();
+    assert_eq!(
+        results,
+        [1, 2],
+        "both increments applied — the serialization conflict was retried"
+    );
+
+    let _: () = engine
+        .start_typed("drop", &format!("drop-{tag}"), table.clone())
+        .await?;
+    provider
+        .delete_workflows(
+            &[
+                format!("seed-{tag}"),
+                format!("a-{tag}"),
+                format!("b-{tag}"),
+                format!("drop-{tag}"),
+            ],
+            false,
+        )
+        .await?;
     Ok(())
 }

@@ -2,7 +2,7 @@ use crate::engine::{Runtime, WorkflowOptions};
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{StateProvider, WorkflowStatus, STATUS_CANCELLED};
-use crate::tx::{Tx, TxBody};
+use crate::tx::{TransactionOptions, Tx, TxBody};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::future::{poll_fn, Future};
@@ -369,24 +369,56 @@ impl DurableContext {
     /// ```
     pub async fn transaction<T, F>(&self, name: &str, f: F) -> Result<T>
     where
-        T: Serialize + DeserializeOwned,
-        F: for<'t, 'c> FnOnce(
-                &'t mut Tx<'c>,
-            ) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 't>>
+        T: Serialize + DeserializeOwned + 'static,
+        F: for<'t, 'c> Fn(&'t mut Tx<'c>) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 't>>
             + Send
+            + Sync
+            + 'static,
+    {
+        self.transaction_with(TransactionOptions::new(name), f)
+            .await
+    }
+
+    /// Like [`transaction`](Self::transaction) but with explicit
+    /// [`TransactionOptions`] — isolation level and read-only.
+    ///
+    /// Under `RepeatableRead`/`Serializable` a serialization conflict restarts
+    /// the whole transaction on a fresh one, so the body may run more than once;
+    /// it must therefore be `Fn` (re-runnable). Capture `Copy` data freely;
+    /// clone other captures inside the closure.
+    ///
+    /// ```no_run
+    /// # use durust::{DurableContext, IsolationLevel, Result, TransactionOptions, params};
+    /// # async fn ex(ctx: DurableContext) -> Result<()> {
+    /// let opts = TransactionOptions::new("transfer").isolation(IsolationLevel::Serializable);
+    /// ctx.transaction_with::<(), _>(opts, |tx| Box::pin(async move {
+    ///     tx.execute("UPDATE acct SET bal = bal - ? WHERE id = ?", &params![10_i64, 1_i64]).await?;
+    ///     Ok(())
+    /// })).await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn transaction_with<T, F>(&self, opts: TransactionOptions, f: F) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned + 'static,
+        F: for<'t, 'c> Fn(&'t mut Tx<'c>) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 't>>
+            + Send
+            + Sync
             + 'static,
     {
         let seq = self.next_seq();
         let started = chrono::Utc::now().timestamp_millis();
+        // Separate the call from the `async move`: `f(tx)` borrows `f` and yields
+        // a future that we move in, so the wrapper stays `Fn` (re-runnable).
         let body: TxBody = Box::new(move |tx| {
+            let fut = f(tx);
             Box::pin(async move {
-                let out = f(tx).await?;
+                let out = fut.await?;
                 Ok::<_, Error>(serde_json::to_value(out)?)
             })
         });
         let value = self
             .provider
-            .run_transaction_step(&self.workflow_id, seq, name, started, body)
+            .run_transaction_step(&self.workflow_id, seq, started, &opts, body)
             .await?;
         Ok(serde_json::from_value(value)?)
     }

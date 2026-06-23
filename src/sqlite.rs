@@ -8,7 +8,7 @@ use crate::provider::{
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
-use crate::tx::{Tx, TxBody};
+use crate::tx::{TransactionOptions, Tx, TxBody};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -304,53 +304,74 @@ impl StateProvider for SqliteProvider {
         &self,
         workflow_id: &str,
         seq: i32,
-        name: &str,
         started_at_ms: i64,
+        opts: &TransactionOptions,
         body: TxBody<'_>,
     ) -> Result<Value> {
-        let mut tx = self.pool.begin().await?;
-        // Replay: if this step already committed, return its recorded output and
-        // do not run the body. (The read-only tx rolls back on drop.)
-        if let Some(r) = sqlx::query(
-            "SELECT output, serialization FROM operation_outputs
-             WHERE workflow_uuid = ? AND function_id = ?",
-        )
-        .bind(workflow_id)
-        .bind(seq)
-        .fetch_optional(&mut *tx)
-        .await?
-        {
-            return Ok(serialize::decode_opt(
-                r.get::<Option<String>, _>("serialization").as_deref(),
-                r.get::<Option<String>, _>("output").as_deref(),
-            )?
-            .unwrap_or(Value::Null));
+        // SQLite runs every transaction serializably, so the isolation level and
+        // read-only flag are advisory here. We still retry on SQLITE_BUSY /
+        // SQLITE_LOCKED, the SQLite analog of a transaction conflict.
+        let name = opts.name.as_str();
+        const MAX_ATTEMPTS: u32 = 10;
+        let mut attempt: u32 = 0;
+        loop {
+            let outcome = async {
+                let mut tx = self.pool.begin().await?;
+                // Replay: if this step already committed, return its recorded
+                // output and do not run the body.
+                if let Some(r) = sqlx::query(
+                    "SELECT output, serialization FROM operation_outputs
+                     WHERE workflow_uuid = ? AND function_id = ?",
+                )
+                .bind(workflow_id)
+                .bind(seq)
+                .fetch_optional(&mut *tx)
+                .await?
+                {
+                    return Ok(serialize::decode_opt(
+                        r.get::<Option<String>, _>("serialization").as_deref(),
+                        r.get::<Option<String>, _>("output").as_deref(),
+                    )?
+                    .unwrap_or(Value::Null));
+                }
+                // Run the user's body against this transaction. On error we
+                // return, dropping `tx` (rollback), so nothing it wrote persists.
+                let value = {
+                    let mut h = Tx::sqlite(&mut tx);
+                    body(&mut h).await?
+                };
+                // Checkpoint in the same transaction, then commit atomically.
+                sqlx::query(
+                    "INSERT INTO operation_outputs
+                         (workflow_uuid, function_id, function_name, output, serialization,
+                          started_at_epoch_ms, completed_at_epoch_ms)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
+                )
+                .bind(workflow_id)
+                .bind(seq)
+                .bind(name)
+                .bind(self.serializer.encode(&value)?)
+                .bind(self.serializer.name())
+                .bind(started_at_ms)
+                .bind(Utc::now().timestamp_millis())
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Ok::<Value, Error>(value)
+            }
+            .await;
+
+            match outcome {
+                Ok(v) => return Ok(v),
+                Err(e) if e.is_tx_conflict() && attempt + 1 < MAX_ATTEMPTS => {
+                    attempt += 1;
+                    let ms = (1u64 << attempt.min(6)).min(200);
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                }
+                Err(e) => return Err(e),
+            }
         }
-        // Run the user's body against this transaction. On error we return,
-        // dropping `tx` (rollback), so nothing the body wrote persists.
-        let value = {
-            let mut h = Tx::sqlite(&mut tx);
-            body(&mut h).await?
-        };
-        // Checkpoint in the same transaction, then commit atomically.
-        sqlx::query(
-            "INSERT INTO operation_outputs
-                 (workflow_uuid, function_id, function_name, output, serialization,
-                  started_at_epoch_ms, completed_at_epoch_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
-        )
-        .bind(workflow_id)
-        .bind(seq)
-        .bind(name)
-        .bind(self.serializer.encode(&value)?)
-        .bind(self.serializer.name())
-        .bind(started_at_ms)
-        .bind(Utc::now().timestamp_millis())
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(value)
     }
 
     async fn dequeue_workflows(&self, req: &DequeueRequest) -> Result<Vec<WorkflowStatus>> {

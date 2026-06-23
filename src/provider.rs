@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
-use crate::tx::TxBody;
+use crate::tx::{TransactionOptions, TxBody};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -539,14 +539,16 @@ pub trait StateProvider: Send + Sync {
     /// the writes happen exactly once. Returns the step's JSON output — `body`'s
     /// on the first run, or the stored one on replay (when `body` is not run).
     /// On a `body` error the transaction rolls back (no checkpoint), so the step
-    /// re-runs on replay, matching ordinary steps. SQL backends only; the
-    /// in-memory provider returns an error.
+    /// re-runs on replay, matching ordinary steps. A transaction-level conflict
+    /// (serialization failure / deadlock) under a higher `isolation` restarts the
+    /// whole transaction on a fresh one, re-running `body`. SQL backends only;
+    /// the in-memory provider returns an error.
     async fn run_transaction_step(
         &self,
         workflow_id: &str,
         seq: i32,
-        name: &str,
         started_at_ms: i64,
+        opts: &TransactionOptions,
         body: TxBody<'_>,
     ) -> Result<Value>;
 

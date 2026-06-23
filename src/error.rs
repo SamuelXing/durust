@@ -142,6 +142,26 @@ impl Error {
             _ => false,
         }
     }
+
+    /// A transaction-level conflict that must be retried by restarting the whole
+    /// transaction on a fresh one: Postgres `40001` serialization_failure / `40P01`
+    /// deadlock_detected, or SQLite `SQLITE_BUSY` / `SQLITE_LOCKED`.
+    pub fn is_tx_conflict(&self) -> bool {
+        let Error::Db(sqlx::Error::Database(db)) = self else {
+            return false;
+        };
+        db.code().map(|c| is_tx_conflict_code(&c)).unwrap_or(false)
+    }
+}
+
+/// Classify a database error code as a transaction-level conflict (see
+/// [`Error::is_tx_conflict`]).
+fn is_tx_conflict_code(code: &str) -> bool {
+    if code.len() == 5 {
+        matches!(code, "40001" | "40P01")
+    } else {
+        code.parse::<i32>().is_ok_and(|n| matches!(n & 0xFF, 5 | 6))
+    }
 }
 
 /// Classify a database error code as a transient (retryable) failure.
@@ -196,5 +216,15 @@ mod tests {
         assert!(is_retryable_db_code("261")); // sqlite BUSY_RECOVERY (5 | 1<<8)
         assert!(!is_retryable_db_code("23505")); // unique violation: not retryable
         assert!(!is_retryable_db_code("40001")); // serialization failure: opt-in only
+    }
+
+    #[test]
+    fn tx_conflict_classification() {
+        assert!(is_tx_conflict_code("40001")); // pg serialization failure
+        assert!(is_tx_conflict_code("40P01")); // pg deadlock detected
+        assert!(is_tx_conflict_code("5")); // sqlite BUSY
+        assert!(is_tx_conflict_code("6")); // sqlite LOCKED
+        assert!(!is_tx_conflict_code("23505")); // unique violation: not a conflict
+        assert!(!is_tx_conflict_code("08006")); // connection failure: not a tx conflict
     }
 }

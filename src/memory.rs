@@ -184,8 +184,8 @@ impl StateProvider for InMemoryProvider {
         &self,
         _workflow_id: &str,
         _seq: i32,
-        _name: &str,
         _started_at_ms: i64,
+        _opts: &crate::tx::TransactionOptions,
         _body: TxBody<'_>,
     ) -> Result<Value> {
         // Transactional steps need a real SQL transaction; the in-memory store

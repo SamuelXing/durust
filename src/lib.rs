@@ -70,7 +70,7 @@ pub use schedule::{
 };
 pub use serialize::{PortableWorkflowArgs, Serializer};
 pub use sqlite::SqliteProvider;
-pub use tx::{Param, Row, Tx, TxBody};
+pub use tx::{IsolationLevel, Param, Row, TransactionOptions, Tx, TxBody};
 
 /// The `#[workflow]` attribute macro. Annotate an
 /// `async fn(DurableContext, Input) -> Result<Output>` to have it
