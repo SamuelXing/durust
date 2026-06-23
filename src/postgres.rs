@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::provider::{
     decode_roles, dedup_or, encode_roles, is_terminal, nonexistent_or, DequeueRequest, ListFilter,
     StateProvider, StepAggregate, StepAggregateQuery, StepInfo, VersionInfo, WorkflowAggregate,
@@ -205,9 +205,12 @@ impl StateProvider for PostgresProvider {
         let now = Utc::now().timestamp_millis();
         let terminal = is_terminal(status);
         let completed = terminal.then_some(now);
+        // A workflow cancelled during its final step must stay cancelled: a
+        // SUCCESS/ERROR completion is not allowed to overwrite a CANCELLED row.
+        let is_completion = status == STATUS_SUCCESS || status == STATUS_ERROR;
         // Reaching a terminal state frees the queue-scoped deduplication slot so
         // the same deduplication id can be enqueued again.
-        sqlx::query(
+        let res = sqlx::query(
             "UPDATE workflow_status
              SET status = $2,
                  output = COALESCE($3, output),
@@ -215,7 +218,7 @@ impl StateProvider for PostgresProvider {
                  completed_at = COALESCE($5, completed_at),
                  deduplication_id = CASE WHEN $7 THEN NULL ELSE deduplication_id END,
                  updated_at = $6
-             WHERE workflow_uuid = $1",
+             WHERE workflow_uuid = $1 AND NOT (status = $8 AND $9)",
         )
         .bind(id)
         .bind(status)
@@ -224,8 +227,19 @@ impl StateProvider for PostgresProvider {
         .bind(completed)
         .bind(now)
         .bind(terminal)
+        .bind(STATUS_CANCELLED)
+        .bind(is_completion)
         .execute(&self.pool)
         .await?;
+        // If the completion was blocked because the workflow was already
+        // cancelled, surface the cancellation rather than reporting success.
+        if is_completion && res.rows_affected() == 0 {
+            if let Some(w) = self.get_workflow_status(id).await? {
+                if w.status == STATUS_CANCELLED {
+                    return Err(Error::Cancelled(id.to_string()));
+                }
+            }
+        }
         Ok(())
     }
 

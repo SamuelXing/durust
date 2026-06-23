@@ -1373,3 +1373,42 @@ async fn pg_dedup_slot_frees_on_completion() -> Result<()> {
     client.delete_workflows(&[d1, d3], false).await?;
     Ok(())
 }
+
+/// A workflow cancelled during its final step must stay cancelled: a late
+/// SUCCESS/ERROR completion is rejected and does not overwrite the status.
+#[tokio::test]
+async fn pg_completion_cannot_overwrite_cancelled() -> Result<()> {
+    use durust::{Client, WorkflowHandle, STATUS_CANCELLED, STATUS_SUCCESS};
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_completion_cannot_overwrite_cancelled: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let id = format!("c1-{tag}");
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    let client = Client::new(provider.clone());
+
+    let h: WorkflowHandle<i64> = client
+        .enqueue(
+            &format!("q-{tag}"),
+            "wf",
+            1i64,
+            WorkflowOptions::with_id(&id),
+        )
+        .await?;
+    provider
+        .set_workflow_status(h.id(), STATUS_CANCELLED, None, Some("cancelled"))
+        .await?;
+
+    // A completion racing the cancellation must error, not flip it to SUCCESS.
+    let late = provider
+        .set_workflow_status(h.id(), STATUS_SUCCESS, None, None)
+        .await;
+    assert!(late.is_err(), "completing a cancelled workflow must error");
+
+    let row = provider.get_workflow_status(h.id()).await?.unwrap();
+    assert_eq!(row.status, STATUS_CANCELLED);
+
+    client.delete_workflows(&[id], false).await?;
+    Ok(())
+}

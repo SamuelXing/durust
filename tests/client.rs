@@ -724,3 +724,29 @@ async fn client_dedup_slot_frees_on_completion() -> Result<()> {
     assert_eq!(third.id(), "d3");
     Ok(())
 }
+
+/// A workflow cancelled during its final step must stay cancelled: a late
+/// SUCCESS/ERROR completion is rejected and does not overwrite the status.
+#[tokio::test]
+async fn client_completion_cannot_overwrite_cancelled() -> Result<()> {
+    use durust::{StateProvider, WorkflowHandle, STATUS_CANCELLED, STATUS_SUCCESS};
+    let provider = Arc::new(InMemoryProvider::new());
+    let client = Client::new(provider.clone());
+
+    let h: WorkflowHandle<i64> = client
+        .enqueue("q", "wf", 1i64, WorkflowOptions::with_id("c1"))
+        .await?;
+    provider
+        .set_workflow_status(h.id(), STATUS_CANCELLED, None, Some("cancelled"))
+        .await?;
+
+    // A completion racing the cancellation must error, not flip it to SUCCESS.
+    let late = provider
+        .set_workflow_status(h.id(), STATUS_SUCCESS, None, None)
+        .await;
+    assert!(late.is_err(), "completing a cancelled workflow must error");
+
+    let row = provider.get_workflow_status(h.id()).await?.unwrap();
+    assert_eq!(row.status, STATUS_CANCELLED);
+    Ok(())
+}

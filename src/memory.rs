@@ -2,8 +2,8 @@ use crate::error::{Error, Result};
 use crate::provider::{
     is_terminal, DequeueRequest, ListFilter, StateProvider, StepAggregate, StepAggregateQuery,
     StepInfo, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
-    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED,
-    STATUS_PENDING,
+    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use async_trait::async_trait;
@@ -122,6 +122,12 @@ impl StateProvider for InMemoryProvider {
     ) -> Result<()> {
         let mut g = self.inner.lock().await;
         if let Some(row) = g.workflows.get_mut(id) {
+            // A workflow cancelled during its final step must stay cancelled: a
+            // SUCCESS/ERROR completion is not allowed to overwrite a CANCELLED row.
+            let is_completion = status == STATUS_SUCCESS || status == STATUS_ERROR;
+            if is_completion && row.status == STATUS_CANCELLED {
+                return Err(Error::Cancelled(id.to_string()));
+            }
             row.status = status.to_string();
             if let Some(o) = output {
                 row.output = Some(o.clone());

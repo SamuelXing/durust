@@ -1452,3 +1452,35 @@ async fn sqlite_dedup_slot_frees_on_completion() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// A workflow cancelled during its final step must stay cancelled: a late
+/// SUCCESS/ERROR completion is rejected and does not overwrite the status.
+#[tokio::test]
+async fn sqlite_completion_cannot_overwrite_cancelled() -> Result<()> {
+    use durust::{Client, StateProvider, WorkflowHandle};
+    let (url, path) = temp_db_url("cancelguard");
+    let provider = Arc::new(SqliteProvider::connect(&url).await?);
+    provider.init().await?;
+    let client = Client::new(provider.clone());
+
+    let h: WorkflowHandle<i64> = client
+        .enqueue("q", "wf", 1i64, WorkflowOptions::with_id("c1"))
+        .await?;
+    provider
+        .set_workflow_status(h.id(), STATUS_CANCELLED, None, Some("cancelled"))
+        .await?;
+
+    // A completion racing the cancellation must error, not flip it to SUCCESS.
+    let late = provider
+        .set_workflow_status(h.id(), STATUS_SUCCESS, None, None)
+        .await;
+    assert!(late.is_err(), "completing a cancelled workflow must error");
+
+    let row = provider.get_workflow_status(h.id()).await?.unwrap();
+    assert_eq!(row.status, STATUS_CANCELLED);
+
+    drop(client);
+    drop(provider);
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
