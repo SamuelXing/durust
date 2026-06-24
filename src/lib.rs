@@ -36,6 +36,7 @@
 
 mod admin;
 mod client;
+mod conductor;
 mod context;
 mod debounce;
 mod engine;
@@ -52,6 +53,7 @@ mod tx;
 
 pub use admin::AdminServer;
 pub use client::Client;
+pub use conductor::{Conductor, ConductorConfig};
 pub use context::{AuthContext, DurableContext, StepOptions};
 pub use debounce::Debouncer;
 pub use engine::{

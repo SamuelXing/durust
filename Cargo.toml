@@ -21,6 +21,10 @@ base64 = "0.21"
 # Admin HTTP control surface (opt-in via `AdminServer::start`). Default features
 # give the tokio/http1/json stack the handlers need.
 axum = "0.7"
+# Conductor websocket client (opt-in via `Conductor::start`). rustls to match the
+# rest of the TLS stack; `futures-util` drives the split Sink/Stream.
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 durust-macros = { path = "durust-macros", version = "0.1" }
 # Postgres backend. If your sqlx version complains about features, see README.
 sqlx = { version = "0.7", features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "json", "chrono", "migrate"] }
@@ -31,6 +35,9 @@ fail = "0.5"
 
 [dev-dependencies]
 tracing-subscriber = "0.3"
+# A local websocket server for the conductor client tests.
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 # Arm the failpoints above during tests and the `order` crash-recovery demo.
 # Cargo unifies features within a build, so this enables `fail/failpoints` for
 # the library too — making the `fail_point!` hooks active under test.
