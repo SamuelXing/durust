@@ -274,6 +274,12 @@ impl DurableEngine {
                 scheduled.push((reg.name.to_string(), spec.to_string()));
             }
         }
+        // The internal debouncer workflow is always available (operates over
+        // JSON, so one registration serves every debounced target).
+        workflows.insert(
+            crate::debounce::DEBOUNCER_WF.to_string(),
+            erase(crate::debounce::internal_debouncer),
+        );
         let mut queues = HashMap::new();
         queues.insert(INTERNAL_QUEUE.to_string(), Arc::new(internal_queue()));
         Ok(Self {
@@ -320,6 +326,19 @@ impl DurableEngine {
     /// The application version stamped onto workflows started here.
     pub fn app_version(&self) -> &str {
         &self.app_version
+    }
+
+    /// The shared state backend.
+    pub(crate) fn provider(&self) -> &Arc<dyn StateProvider> {
+        &self.provider
+    }
+
+    /// A [`Debouncer`](crate::Debouncer) for `target_workflow`: coalesce rapid
+    /// repeated triggers (grouped by key) into a single delayed run with the
+    /// latest input. The target must be registered, and the engine must be
+    /// launched so the internal queue runs the collector.
+    pub fn debouncer(&self, target_workflow: &str) -> crate::debounce::Debouncer<'_> {
+        crate::debounce::Debouncer::new(self, target_workflow)
     }
 
     /// Register a workflow under `name`.

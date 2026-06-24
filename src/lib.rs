@@ -36,6 +36,7 @@
 
 mod client;
 mod context;
+mod debounce;
 mod engine;
 mod error;
 mod handle;
@@ -50,6 +51,7 @@ mod tx;
 
 pub use client::Client;
 pub use context::{AuthContext, DurableContext, StepOptions};
+pub use debounce::Debouncer;
 pub use engine::{
     erase, DeduplicationPolicy, DurableEngine, RegisteredWorkflow, WorkflowFn, WorkflowOptions,
     WorkflowRegistration,

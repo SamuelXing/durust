@@ -89,11 +89,16 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
             };
         }
 
-        // No task: poll the status row until terminal.
+        // No task: poll the status row until terminal. A polling handle may name
+        // a workflow that does not exist yet (e.g. a debounced run the collector
+        // has not started); treat that as "not ready" and keep waiting.
         loop {
-            let status = self.get_status().await?;
-            if is_terminal(&status.status) {
-                return self.terminal_to_result(status);
+            match self.get_status().await {
+                Ok(status) if is_terminal(&status.status) => {
+                    return self.terminal_to_result(status);
+                }
+                Ok(_) | Err(Error::UnknownWorkflow(_)) => {}
+                Err(e) => return Err(e),
             }
             tokio::time::sleep(self.poll_interval).await;
         }
