@@ -18,6 +18,9 @@ inventory = "0.3"
 uuid = { version = "1", features = ["v4"] }
 cron = "0.12"
 base64 = "0.21"
+# Admin HTTP control surface (opt-in via `AdminServer::start`). Default features
+# give the tokio/http1/json stack the handlers need.
+axum = "0.7"
 durust-macros = { path = "durust-macros", version = "0.1" }
 # Postgres backend. If your sqlx version complains about features, see README.
 sqlx = { version = "0.7", features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "json", "chrono", "migrate"] }

@@ -240,6 +240,10 @@ pub struct DurableEngine {
     max_recovery_attempts: i32,
     /// Flipped by [`shutdown`](Self::shutdown); background loops observe it.
     shutting_down: Arc<AtomicBool>,
+    /// Set by [`deactivate`](Self::deactivate): this process stops claiming new
+    /// work (dispatchers/scheduler aborted) but keeps serving in-flight runs and
+    /// the admin server. Idempotent.
+    deactivated: Arc<AtomicBool>,
     /// Count of workflow tasks this process is currently running, so
     /// [`shutdown`](Self::shutdown) can drain before returning.
     inflight: Arc<AtomicUsize>,
@@ -292,6 +296,7 @@ impl DurableEngine {
             app_version: app_version.into(),
             max_recovery_attempts: 100,
             shutting_down: Arc::new(AtomicBool::new(false)),
+            deactivated: Arc::new(AtomicBool::new(false)),
             inflight: Arc::new(AtomicUsize::new(0)),
             dispatchers: std::sync::Mutex::new(Vec::new()),
             runtime: std::sync::OnceLock::new(),
@@ -600,6 +605,10 @@ impl DurableEngine {
     /// timeouts are enforced inline per run, so they need no separate sweep. Call
     /// once per launch; safe to call again after `shutdown`.
     pub async fn launch(&self) -> Result<()> {
+        // A deactivated process must not start claiming work again.
+        if self.is_deactivated() {
+            return Ok(());
+        }
         self.shutting_down.store(false, Ordering::Relaxed);
         let rt = self.runtime();
 
@@ -666,6 +675,60 @@ impl DurableEngine {
                 queue_name: None,
             })
             .collect()
+    }
+
+    /// Stop claiming new work without shutting the process down: abort the queue
+    /// dispatchers and the schedule reconciler, but leave in-flight workflow
+    /// tasks running and keep any admin server serving. Idempotent — a second
+    /// call is a no-op. Used by the admin server's `GET /deactivate`.
+    pub fn deactivate(&self) {
+        if self.deactivated.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        tracing::info!(executor = %self.executor_id, "deactivating executor: stopping dispatch");
+        for d in self
+            .dispatchers
+            .lock()
+            .expect("dispatcher lock poisoned")
+            .drain(..)
+        {
+            d.abort();
+        }
+    }
+
+    /// Whether [`deactivate`](Self::deactivate) has been called on this engine.
+    pub fn is_deactivated(&self) -> bool {
+        self.deactivated.load(Ordering::SeqCst)
+    }
+
+    /// Cancel every workflow still in a non-terminal queueable state
+    /// (`PENDING`/`ENQUEUED`/`DELAYED`) that was created at or before
+    /// `cutoff_epoch_ms`. Returns how many were cancelled. Backs the admin
+    /// server's `POST /dbos-global-timeout`.
+    pub async fn cancel_all_before(&self, cutoff_epoch_ms: i64) -> Result<usize> {
+        let filter = ListFilter {
+            status: vec![
+                STATUS_PENDING.to_string(),
+                STATUS_ENQUEUED.to_string(),
+                STATUS_DELAYED.to_string(),
+            ],
+            end_time_ms: Some(cutoff_epoch_ms),
+            load_input: false,
+            load_output: false,
+            ..Default::default()
+        };
+        let ids: Vec<String> = self
+            .provider
+            .list_workflows(&filter)
+            .await?
+            .into_iter()
+            .map(|w| w.id)
+            .collect();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.cancel_workflows(&ids).await?;
+        Ok(ids.len())
     }
 
     /// Stop the queue dispatchers and wait for in-flight workflow tasks started
@@ -1101,14 +1164,23 @@ impl DurableEngine {
     ///
     /// Returns the number of workflows that were recovered.
     pub async fn recover(&self) -> Result<usize> {
+        Ok(self.recover_pending_for(&[]).await?.len())
+    }
+
+    /// Like [`recover`](Self::recover) but limited to workflows owned by the
+    /// given executor ids (empty = any executor), returning the id of every
+    /// workflow that was recovered. Backs the admin server's
+    /// `POST /dbos-workflow-recovery`, which recovers a named set of executors.
+    pub async fn recover_pending_for(&self, executor_ids: &[String]) -> Result<Vec<String>> {
         let filter = ListFilter {
             status: vec![STATUS_PENDING.to_string()],
             app_version: Some(self.app_version.clone()),
+            executor_ids: executor_ids.to_vec(),
             ..Default::default()
         };
         let pending = self.provider.list_workflows(&filter).await?;
         let rt = self.runtime();
-        let mut resumed = 0;
+        let mut recovered = Vec::new();
         for record in pending {
             let attempts = self
                 .provider
@@ -1129,7 +1201,7 @@ impl DurableEngine {
                 self.provider
                     .set_workflow_status(&record.id, STATUS_ENQUEUED, None, None)
                     .await?;
-                resumed += 1;
+                recovered.push(record.id);
                 continue;
             }
 
@@ -1145,7 +1217,7 @@ impl DurableEngine {
                     AuthContext::from_status(&record),
                 )
                 .await;
-                resumed += 1;
+                recovered.push(record.id);
             } else {
                 tracing::warn!(
                     workflow = %record.name,
@@ -1154,7 +1226,7 @@ impl DurableEngine {
                 );
             }
         }
-        Ok(resumed)
+        Ok(recovered)
     }
 }
 

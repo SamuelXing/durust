@@ -34,6 +34,7 @@
 //! # }
 //! ```
 
+mod admin;
 mod client;
 mod context;
 mod debounce;
@@ -49,6 +50,7 @@ mod serialize;
 mod sqlite;
 mod tx;
 
+pub use admin::AdminServer;
 pub use client::Client;
 pub use context::{AuthContext, DurableContext, StepOptions};
 pub use debounce::Debouncer;
