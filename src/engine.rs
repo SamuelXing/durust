@@ -1154,8 +1154,11 @@ impl DurableEngine {
             // fresh id so an empty id is never persisted.
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // Honor an explicit application-version override (e.g. forking onto a new
+        // deploy); default to this engine's version.
+        let app_version = opts.app_version.as_deref().unwrap_or(&self.app_version);
         self.provider
-            .fork_workflow(original_id, &new_id, start_step, &self.app_version)
+            .fork_workflow(original_id, &new_id, start_step, app_version)
             .await?;
         self.requeue_for_rerun(&new_id).await?;
         Ok(WorkflowHandle::polling(new_id, self.provider.clone()))

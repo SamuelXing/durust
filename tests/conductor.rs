@@ -2,7 +2,10 @@
 //! handlers. A local websocket server stands in for the cloud conductor: it
 //! pushes requests and asserts on the client's responses.
 
-use durust::{Conductor, ConductorConfig, DurableEngine, InMemoryProvider, Result};
+use durust::{
+    Conductor, ConductorConfig, DurableContext, DurableEngine, Error, InMemoryProvider, Result,
+    WorkflowOptions,
+};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -125,6 +128,105 @@ async fn conductor_requires_api_key_and_url() -> Result<()> {
         },
     );
     assert!(no_url.is_err(), "missing URL is rejected");
+    Ok(())
+}
+
+#[tokio::test]
+async fn conductor_handles_workflow_management() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+
+        let list = exchange(
+            &mut ws,
+            json!({"type":"list_workflows","request_id":"l","body":{}}),
+        )
+        .await;
+        let get = exchange(
+            &mut ws,
+            json!({"type":"get_workflow","request_id":"g","workflow_id":"wf-1",
+                   "load_input":true,"load_output":true}),
+        )
+        .await;
+        let steps = exchange(
+            &mut ws,
+            json!({"type":"list_steps","request_id":"s","workflow_id":"wf-1"}),
+        )
+        .await;
+        let fork = exchange(
+            &mut ws,
+            json!({"type":"fork_workflow","request_id":"f",
+                   "body":{"workflow_id":"wf-1","start_step":0,"new_workflow_id":"forked-1"}}),
+        )
+        .await;
+        let cancel = exchange(
+            &mut ws,
+            json!({"type":"cancel","request_id":"c","workflow_id":"wf-1"}),
+        )
+        .await;
+        let delete = exchange(
+            &mut ws,
+            json!({"type":"delete","request_id":"d","workflow_ids":["forked-1"]}),
+        )
+        .await;
+        (list, get, steps, fork, cancel, delete)
+    });
+
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("work", |ctx: DurableContext, msg: String| async move {
+        let r = ctx
+            .step("s1", || async { Ok::<_, Error>(format!("{msg}!")) })
+            .await?;
+        Ok::<_, Error>(r)
+    });
+    let engine = Arc::new(engine);
+    engine.launch().await?;
+    let mut h = engine
+        .run_workflow::<_, String>("work", "hi".to_string(), WorkflowOptions::with_id("wf-1"))
+        .await?;
+    assert_eq!(h.get_result().await?, "hi!");
+
+    let conductor = Conductor::start(
+        engine.clone(),
+        ConductorConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            api_key: "k".into(),
+            app_name: "app".into(),
+            executor_metadata: None,
+        },
+    )?;
+
+    let (list, get, steps, fork, cancel, delete) = server.await.unwrap();
+
+    // list_workflows -> output array carrying the conductor wire shape.
+    assert_eq!(list["type"], "list_workflows");
+    let rows = list["output"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["WorkflowUUID"], "wf-1");
+    assert_eq!(rows[0]["Status"], "SUCCESS");
+    assert_eq!(rows[0]["WasForkedFrom"], false);
+    assert_eq!(rows[0]["Priority"], "0"); // priority always present, stringified
+
+    // get_workflow -> single body with the output loaded.
+    assert_eq!(get["output"]["WorkflowUUID"], "wf-1");
+    assert_eq!(get["output"]["Output"], "\"hi!\"");
+
+    // list_steps -> the one recorded step.
+    let step_list = steps["output"].as_array().unwrap();
+    assert!(step_list.iter().any(|s| s["function_name"] == "s1"));
+
+    // fork -> the new id we asked for.
+    assert_eq!(fork["new_workflow_id"], "forked-1");
+
+    // cancel / delete -> success.
+    assert_eq!(cancel["success"], true);
+    assert_eq!(delete["success"], true);
+
+    conductor.shutdown(Duration::from_secs(2)).await?;
+    engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
 

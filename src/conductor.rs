@@ -5,10 +5,12 @@
 //! schedule management, …). The connection self-heals: it pings to keep the
 //! link alive and reconnects with exponential backoff after a drop.
 //!
-//! This is **part 1**: connection lifecycle + the executor-lifecycle handlers
-//! (`executor_info`, `recovery`, `exist_pending_workflows`). Every other
-//! message type is answered with a well-formed "unknown message type" error
-//! until its handler lands, so the link stays healthy as coverage grows.
+//! Implemented so far: the executor-lifecycle handlers (`executor_info`,
+//! `recovery`, `exist_pending_workflows`) and workflow management/queries
+//! (`cancel`, `resume`, `delete`, `fork_workflow`, `list_workflows`,
+//! `list_queued_workflows`, `get_workflow`, `list_steps`). Every other message
+//! type is answered with a well-formed "unknown message type" error until its
+//! handler lands, so the link stays healthy as coverage grows.
 //!
 //! Opt-in, like the admin server:
 //! ```no_run
@@ -30,9 +32,12 @@
 //! # }
 //! ```
 
-use crate::engine::DurableEngine;
+use crate::engine::{DurableEngine, WorkflowOptions};
 use crate::error::{Error, Result};
-use crate::provider::{ListFilter, STATUS_PENDING};
+use crate::provider::{
+    ListFilter, StepInfo, WorkflowStatus, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_PENDING,
+};
+use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -301,12 +306,481 @@ async fn handle_message(
             resp.insert("exist".into(), json!(exist));
             send(ws, resp).await
         }
+        "cancel" => handle_ids(engine, ws, rid, text, IdsAction::Cancel).await,
+        "resume" => handle_ids(engine, ws, rid, text, IdsAction::Resume).await,
+        "delete" => handle_ids(engine, ws, rid, text, IdsAction::Delete).await,
+        "fork_workflow" => handle_fork(engine, ws, rid, text).await,
+        "list_workflows" => handle_list(engine, ws, rid, text, false).await,
+        "list_queued_workflows" => handle_list(engine, ws, rid, text, true).await,
+        "get_workflow" => handle_get_workflow(engine, ws, rid, text).await,
+        "list_steps" => handle_list_steps(engine, ws, rid, text).await,
         other => {
             tracing::warn!(msg_type = other, "unknown conductor message type");
             let resp = base_response(other, rid, Some("Unknown message type".to_string()));
             send(ws, resp).await
         }
     }
+}
+
+/// Bulk id-based management messages, all shaped `{workflow_id?, workflow_ids?}`
+/// → `{success}`.
+enum IdsAction {
+    Cancel,
+    Resume,
+    Delete,
+}
+
+#[derive(Deserialize)]
+struct IdsRequest {
+    #[serde(default)]
+    workflow_id: String,
+    #[serde(default)]
+    workflow_ids: Vec<String>,
+    #[serde(default)]
+    delete_children: bool,
+}
+
+async fn handle_ids(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+    action: IdsAction,
+) -> Result<()> {
+    let req: IdsRequest = serde_json::from_str(text)?;
+    let mut ids = req.workflow_ids;
+    if ids.is_empty() && !req.workflow_id.is_empty() {
+        ids = vec![req.workflow_id];
+    }
+    let (type_str, result) = match action {
+        IdsAction::Cancel => ("cancel", engine.cancel_workflows(&ids).await),
+        IdsAction::Resume => (
+            "resume",
+            engine.resume_workflows::<Value>(&ids).await.map(|_| ()),
+        ),
+        IdsAction::Delete => (
+            "delete",
+            engine.delete_workflows(&ids, req.delete_children).await,
+        ),
+    };
+    let err = result
+        .err()
+        .map(|e| format!("failed to {type_str} workflows: {e}"));
+    let mut resp = base_response(type_str, rid, err.clone());
+    resp.insert("success".into(), json!(err.is_none()));
+    send(ws, resp).await
+}
+
+#[derive(Deserialize)]
+struct ForkRequest {
+    #[serde(default)]
+    body: ForkBody,
+}
+
+#[derive(Default, Deserialize)]
+struct ForkBody {
+    #[serde(default)]
+    workflow_id: String,
+    #[serde(default)]
+    start_step: i64,
+    application_version: Option<String>,
+    new_workflow_id: Option<String>,
+    queue_name: Option<String>,
+    queue_partition_key: Option<String>,
+}
+
+async fn handle_fork(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+) -> Result<()> {
+    let req: ForkRequest = serde_json::from_str(text)?;
+    let body = req.body;
+    // Validate the step index to avoid an out-of-range cast.
+    if body.start_step < 0 || body.start_step > (i32::MAX as i64) / 2 {
+        let resp = base_response("fork_workflow", rid, Some("invalid start_step".into()));
+        return send(ws, resp).await;
+    }
+    let mut opts = WorkflowOptions::default();
+    if let Some(id) = body.new_workflow_id {
+        opts.workflow_id = Some(id);
+    }
+    if let Some(v) = body.application_version {
+        opts.app_version = Some(v);
+    }
+    if let Some(q) = body.queue_name {
+        opts.queue = Some(q);
+    }
+    if let Some(k) = body.queue_partition_key {
+        opts.partition_key = Some(k);
+    }
+    let (new_id, err) = match engine
+        .fork_workflow::<Value>(&body.workflow_id, body.start_step as i32, opts)
+        .await
+    {
+        Ok(h) => (Some(h.id().to_string()), None),
+        Err(e) => (None, Some(format!("failed to fork workflow: {e}"))),
+    };
+    let mut resp = base_response("fork_workflow", rid, err);
+    if let Some(id) = new_id {
+        resp.insert("new_workflow_id".into(), json!(id));
+    }
+    send(ws, resp).await
+}
+
+async fn handle_list(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+    queued: bool,
+) -> Result<()> {
+    let req: ListRequest = serde_json::from_str(text)?;
+    let filter = req.body.to_filter(queued);
+    let type_str = if queued {
+        "list_queued_workflows"
+    } else {
+        "list_workflows"
+    };
+    let (output, err) = match engine.list_workflows(&filter).await {
+        Ok(rows) => (
+            rows.iter().map(format_list_workflow).collect::<Vec<_>>(),
+            None,
+        ),
+        Err(e) => (vec![], Some(format!("failed to list workflows: {e}"))),
+    };
+    let mut resp = base_response(type_str, rid, err);
+    resp.insert("output".into(), json!(output));
+    send(ws, resp).await
+}
+
+#[derive(Deserialize)]
+struct GetWorkflowRequest {
+    #[serde(default)]
+    workflow_id: String,
+    #[serde(default)]
+    load_input: bool,
+    #[serde(default)]
+    load_output: bool,
+}
+
+async fn handle_get_workflow(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+) -> Result<()> {
+    let req: GetWorkflowRequest = serde_json::from_str(text)?;
+    let filter = ListFilter {
+        workflow_ids: vec![req.workflow_id],
+        load_input: req.load_input,
+        load_output: req.load_output,
+        ..Default::default()
+    };
+    let (output, err) = match engine.list_workflows(&filter).await {
+        Ok(rows) => (rows.first().map(format_list_workflow), None),
+        Err(e) => (None, Some(format!("failed to get workflow: {e}"))),
+    };
+    let mut resp = base_response("get_workflow", rid, err);
+    if let Some(o) = output {
+        resp.insert("output".into(), o);
+    }
+    send(ws, resp).await
+}
+
+#[derive(Deserialize)]
+struct ListStepsRequest {
+    #[serde(default)]
+    workflow_id: String,
+    #[serde(default)]
+    load_output: bool,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+async fn handle_list_steps(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+) -> Result<()> {
+    let req: ListStepsRequest = serde_json::from_str(text)?;
+    let (output, err) = match engine.get_workflow_steps(&req.workflow_id).await {
+        Ok(mut steps) => {
+            // The engine returns all steps; apply the request's window in memory.
+            let off = req.offset.unwrap_or(0).max(0) as usize;
+            if off >= steps.len() {
+                steps.clear();
+            } else {
+                steps.drain(0..off);
+            }
+            if let Some(lim) = req.limit {
+                if lim >= 0 {
+                    steps.truncate(lim as usize);
+                }
+            }
+            if !req.load_output {
+                for s in &mut steps {
+                    s.output = None;
+                }
+            }
+            (
+                Some(steps.iter().map(format_step).collect::<Vec<_>>()),
+                None,
+            )
+        }
+        Err(e) => (None, Some(format!("failed to list workflow steps: {e}"))),
+    };
+    let mut resp = base_response("list_steps", rid, err);
+    if let Some(o) = output {
+        resp.insert("output".into(), json!(o));
+    }
+    send(ws, resp).await
+}
+
+/// A conductor filter field that accepts either a single string or an array of
+/// strings (the wire `StringOrList`).
+#[derive(Default)]
+struct StringOrList(Vec<String>);
+
+impl<'de> Deserialize<'de> for StringOrList {
+    fn deserialize<D>(d: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum OneOrMany {
+            One(String),
+            Many(Vec<String>),
+        }
+        Ok(match Option::<OneOrMany>::deserialize(d)? {
+            None => StringOrList(Vec::new()),
+            Some(OneOrMany::One(s)) => StringOrList(vec![s]),
+            Some(OneOrMany::Many(v)) => StringOrList(v),
+        })
+    }
+}
+
+impl StringOrList {
+    /// First value, for the single-valued list filters this SDK supports.
+    fn first(&self) -> Option<String> {
+        self.0.first().cloned()
+    }
+    fn vec(&self) -> Vec<String> {
+        self.0.clone()
+    }
+}
+
+/// `{ "body": { …filters… } }` for `list_workflows` / `list_queued_workflows`.
+#[derive(Deserialize)]
+struct ListRequest {
+    #[serde(default)]
+    body: ListBody,
+}
+
+#[derive(Default, Deserialize)]
+struct ListBody {
+    #[serde(default)]
+    workflow_uuids: Vec<String>,
+    #[serde(default)]
+    workflow_name: StringOrList,
+    #[serde(default)]
+    status: StringOrList,
+    #[serde(default)]
+    application_version: StringOrList,
+    #[serde(default)]
+    executor_id: StringOrList,
+    #[serde(default)]
+    forked_from: StringOrList,
+    #[serde(default)]
+    queue_name: StringOrList,
+    #[serde(default)]
+    workflow_id_prefix: StringOrList,
+    has_parent: Option<bool>,
+    start_time: Option<DateTime<Utc>>,
+    end_time: Option<DateTime<Utc>>,
+    completed_after: Option<DateTime<Utc>>,
+    completed_before: Option<DateTime<Utc>>,
+    dequeued_after: Option<DateTime<Utc>>,
+    dequeued_before: Option<DateTime<Utc>>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    #[serde(default)]
+    sort_desc: bool,
+    #[serde(default)]
+    load_input: bool,
+    #[serde(default)]
+    load_output: bool,
+    #[serde(default)]
+    queues_only: bool,
+}
+
+impl ListBody {
+    fn to_filter(&self, force_queued: bool) -> ListFilter {
+        let mut f = ListFilter {
+            workflow_ids: self.workflow_uuids.clone(),
+            name: self.workflow_name.first(),
+            status: self.status.vec(),
+            app_version: self.application_version.first(),
+            executor_ids: self.executor_id.vec(),
+            forked_from: self.forked_from.first(),
+            queue_name: self.queue_name.first(),
+            workflow_id_prefix: self.workflow_id_prefix.first(),
+            has_parent: self.has_parent,
+            start_time_ms: self.start_time.map(|t| t.timestamp_millis()),
+            end_time_ms: self.end_time.map(|t| t.timestamp_millis()),
+            completed_after_ms: self.completed_after.map(|t| t.timestamp_millis()),
+            completed_before_ms: self.completed_before.map(|t| t.timestamp_millis()),
+            dequeued_after_ms: self.dequeued_after.map(|t| t.timestamp_millis()),
+            dequeued_before_ms: self.dequeued_before.map(|t| t.timestamp_millis()),
+            limit: self.limit,
+            offset: self.offset,
+            sort_desc: self.sort_desc,
+            load_input: self.load_input,
+            load_output: self.load_output,
+            queues_only: self.queues_only,
+        };
+        if force_queued {
+            f.queues_only = true;
+            f.load_output = false; // queued listings never carry output
+            if f.status.is_empty() {
+                f.status = vec![
+                    STATUS_PENDING.to_string(),
+                    STATUS_ENQUEUED.to_string(),
+                    STATUS_DELAYED.to_string(),
+                ];
+            }
+        }
+        f
+    }
+}
+
+/// Render an epoch-ms instant as the stringified-millis the conductor expects.
+fn epoch_ms_str(ms: i64) -> Value {
+    Value::String(ms.to_string())
+}
+
+/// A stored payload's compact JSON string, if present and non-null.
+fn payload(v: Option<&Value>) -> Option<String> {
+    match v {
+        Some(v) if !v.is_null() => Some(v.to_string()),
+        _ => None,
+    }
+}
+
+/// Render a [`WorkflowStatus`] in the conductor's list/get response shape — the
+/// PascalCase keys with stringified-epoch-ms times, every field `omitempty`.
+fn format_list_workflow(ws: &WorkflowStatus) -> Value {
+    let mut m = Map::new();
+    m.insert("WorkflowUUID".into(), json!(ws.id));
+    if !ws.status.is_empty() {
+        m.insert("Status".into(), json!(ws.status));
+    }
+    if !ws.name.is_empty() {
+        m.insert("WorkflowName".into(), json!(ws.name));
+    }
+    if let Some(u) = &ws.authenticated_user {
+        m.insert("AuthenticatedUser".into(), json!(u));
+    }
+    if let Some(r) = &ws.assumed_role {
+        m.insert("AssumedRole".into(), json!(r));
+    }
+    if !ws.authenticated_roles.is_empty() {
+        let roles = serde_json::to_string(&ws.authenticated_roles).unwrap_or_default();
+        m.insert("AuthenticatedRoles".into(), json!(roles));
+    }
+    if let Some(i) = payload(Some(&ws.input)) {
+        m.insert("Input".into(), json!(i));
+    }
+    if let Some(o) = payload(ws.output.as_ref()) {
+        m.insert("Output".into(), json!(o));
+    }
+    if let Some(e) = &ws.error {
+        m.insert("Error".into(), json!(e));
+    }
+    m.insert(
+        "CreatedAt".into(),
+        epoch_ms_str(ws.created_at.timestamp_millis()),
+    );
+    m.insert(
+        "UpdatedAt".into(),
+        epoch_ms_str(ws.updated_at.timestamp_millis()),
+    );
+    if let Some(q) = &ws.queue_name {
+        m.insert("QueueName".into(), json!(q));
+    }
+    if let Some(k) = &ws.queue_partition_key {
+        m.insert("QueuePartitionKey".into(), json!(k));
+    }
+    if let Some(d) = &ws.dedup_id {
+        m.insert("DeduplicationID".into(), json!(d));
+    }
+    m.insert("Priority".into(), json!(ws.priority.to_string()));
+    if !ws.app_version.is_empty() {
+        m.insert("ApplicationVersion".into(), json!(ws.app_version));
+    }
+    if !ws.executor_id.is_empty() {
+        m.insert("ExecutorID".into(), json!(ws.executor_id));
+    }
+    if let Some(t) = ws.timeout_ms {
+        if t > 0 {
+            m.insert("WorkflowTimeoutMS".into(), epoch_ms_str(t));
+        }
+    }
+    if let Some(d) = ws.deadline_ms {
+        m.insert("WorkflowDeadlineEpochMS".into(), epoch_ms_str(d));
+    }
+    if let Some(f) = &ws.forked_from {
+        m.insert("ForkedFrom".into(), json!(f));
+    }
+    m.insert("WasForkedFrom".into(), json!(ws.forked_from.is_some()));
+    if let Some(p) = &ws.parent_workflow_id {
+        m.insert("ParentWorkflowID".into(), json!(p));
+    }
+    // A dequeued workflow (PENDING with a start time) reports when it started.
+    if ws.status == STATUS_PENDING {
+        if let Some(s) = ws.started_at_ms {
+            m.insert("DequeuedAt".into(), epoch_ms_str(s));
+        }
+    }
+    if let Some(d) = ws.delay_until_ms {
+        m.insert("DelayUntilEpochMS".into(), epoch_ms_str(d));
+    }
+    if let Some(c) = ws.completed_at_ms {
+        m.insert("CompletedAt".into(), epoch_ms_str(c));
+    }
+    Value::Object(m)
+}
+
+/// Render a [`StepInfo`] in the conductor's step response shape (snake_case).
+fn format_step(s: &StepInfo) -> Value {
+    let mut m = Map::new();
+    m.insert("function_id".into(), json!(s.step_id));
+    m.insert("function_name".into(), json!(s.name));
+    if let Some(o) = payload(s.output.as_ref()) {
+        m.insert("output".into(), json!(o));
+    }
+    if let Some(e) = &s.error {
+        m.insert("error".into(), json!(e));
+    }
+    if let Some(c) = &s.child_workflow_id {
+        m.insert("child_workflow_id".into(), json!(c));
+    }
+    if let Some(t) = s.started_at {
+        m.insert(
+            "started_at_epoch_ms".into(),
+            epoch_ms_str(t.timestamp_millis()),
+        );
+    }
+    if let Some(t) = s.completed_at {
+        m.insert(
+            "completed_at_epoch_ms".into(),
+            epoch_ms_str(t.timestamp_millis()),
+        );
+    }
+    Value::Object(m)
 }
 
 /// Build a response object with the shared `type`/`request_id`/`error_message`
