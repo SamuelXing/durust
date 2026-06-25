@@ -25,6 +25,9 @@ axum = "0.7"
 # rest of the TLS stack; `futures-util` drives the split Sink/Stream.
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+# CancellationToken for structured, level-triggered shutdown of the conductor
+# connection loop (and the sub-tasks later parts will spawn).
+tokio-util = { version = "0.7", default-features = false }
 durust-macros = { path = "durust-macros", version = "0.1" }
 # Postgres backend. If your sqlx version complains about features, see README.
 sqlx = { version = "0.7", features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "json", "chrono", "migrate"] }

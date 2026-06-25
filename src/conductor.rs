@@ -39,10 +39,10 @@ use serde_json::{json, Map, Value};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_util::sync::CancellationToken;
 
 /// The DBOS version this client advertises to the conductor.
 const DBOS_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -69,7 +69,7 @@ pub struct ConductorConfig {
 
 /// A running conductor connection. Call [`shutdown`](Self::shutdown) to stop it.
 pub struct Conductor {
-    stop: watch::Sender<bool>,
+    token: CancellationToken,
     task: JoinHandle<()>,
 }
 
@@ -92,17 +92,14 @@ impl Conductor {
             config.app_name,
             config.api_key
         );
-        let (stop_tx, stop_rx) = watch::channel(false);
-        let task = tokio::spawn(connection_loop(engine, config, ws_url, stop_rx));
-        Ok(Conductor {
-            stop: stop_tx,
-            task,
-        })
+        let token = CancellationToken::new();
+        let task = tokio::spawn(connection_loop(engine, config, ws_url, token.clone()));
+        Ok(Conductor { token, task })
     }
 
     /// Signal the connection loop to stop and wait up to `timeout` for it.
     pub async fn shutdown(mut self, timeout: Duration) -> Result<()> {
-        let _ = self.stop.send(true);
+        self.token.cancel();
         let _ = tokio::time::timeout(timeout, &mut self.task).await;
         Ok(())
     }
@@ -114,18 +111,18 @@ async fn connection_loop(
     engine: Arc<DurableEngine>,
     config: ConductorConfig,
     ws_url: String,
-    mut stop: watch::Receiver<bool>,
+    token: CancellationToken,
 ) {
     let mut backoff = INITIAL_RECONNECT_WAIT;
     loop {
-        if *stop.borrow() {
+        if token.is_cancelled() {
             return;
         }
         match connect_async(ws_url.as_str()).await {
             Ok((mut ws, _resp)) => {
                 tracing::info!("connected to DBOS conductor");
                 backoff = INITIAL_RECONNECT_WAIT;
-                let stopped = serve(&mut ws, &engine, &config, &mut stop).await;
+                let stopped = serve(&mut ws, &engine, &config, &token).await;
                 if stopped {
                     return;
                 }
@@ -136,7 +133,7 @@ async fn connection_loop(
                 // Exponential backoff with jitter, interruptible by shutdown.
                 let wait = jittered(backoff, &ws_url);
                 tokio::select! {
-                    _ = stop.changed() => return,
+                    _ = token.cancelled() => return,
                     _ = tokio::time::sleep(wait) => {}
                 }
                 backoff = (backoff * 2).min(MAX_RECONNECT_WAIT);
@@ -151,7 +148,7 @@ async fn serve(
     ws: &mut WsStream,
     engine: &Arc<DurableEngine>,
     config: &ConductorConfig,
-    stop: &mut watch::Receiver<bool>,
+    token: &CancellationToken,
 ) -> bool {
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -159,7 +156,7 @@ async fn serve(
 
     loop {
         tokio::select! {
-            _ = stop.changed() => {
+            _ = token.cancelled() => {
                 let _ = ws.send(Message::Close(None)).await;
                 return true;
             }
