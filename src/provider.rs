@@ -71,6 +71,31 @@ pub const STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED: &str = "MAX_RECOVERY_ATTEMPTS_E
 /// names. User values are serializer-encoded, so they never collide with it.
 pub(crate) const STREAM_CLOSED_SENTINEL: &str = "__DBOS_STREAM_CLOSED__";
 
+/// Group ordered `(key, value, serialization)` stream rows — sorted by key then
+/// offset — into one `(key, decoded values)` entry per key, decoding each value
+/// and dropping the close sentinel (a key present only via its sentinel still
+/// appears, with an empty value list). Shared by the SQL backends'
+/// `list_workflow_streams`.
+pub(crate) fn group_stream_rows(
+    rows: Vec<(String, String, Option<String>)>,
+) -> Result<Vec<(String, Vec<Value>)>> {
+    let mut out: Vec<(String, Vec<Value>)> = Vec::new();
+    for (key, value, fmt) in rows {
+        if value == STREAM_CLOSED_SENTINEL {
+            if out.last().map(|(k, _)| k != &key).unwrap_or(true) {
+                out.push((key, Vec::new()));
+            }
+            continue;
+        }
+        let decoded = crate::serialize::decode(fmt.as_deref(), &value)?;
+        match out.last_mut() {
+            Some((k, vals)) if *k == key => vals.push(decoded),
+            _ => out.push((key, vec![decoded])),
+        }
+    }
+    Ok(out)
+}
+
 /// `true` if `status` is terminal (no further execution will occur).
 pub fn is_terminal(status: &str) -> bool {
     matches!(
@@ -400,6 +425,20 @@ pub struct StepAggregate {
     /// Maximum step duration in ms for this group, if `select_max_duration_ms`
     /// was set; `None` when no row in the group had recorded timing.
     pub max_duration_ms: Option<i64>,
+}
+
+/// One notification in a workflow's `send`/`recv` mailbox, surfaced by
+/// [`StateProvider::list_workflow_notifications`].
+#[derive(Clone, Debug)]
+pub struct NotificationInfo {
+    /// The topic it was sent on, or `None` when sent without one.
+    pub topic: Option<String>,
+    /// The decoded message payload.
+    pub message: Value,
+    /// When it was enqueued, epoch ms.
+    pub created_at_ms: i64,
+    /// Whether a `recv` has already consumed it.
+    pub consumed: bool,
 }
 
 /// One recorded operation of a workflow.
@@ -736,6 +775,20 @@ pub trait StateProvider: Send + Sync {
         key: &str,
         from_offset: i32,
     ) -> Result<(Vec<Value>, bool)>;
+
+    /// All `(key, value)` events set on a workflow (`set_event`), decoded per
+    /// their stored serialization, ordered by key. For observability/control
+    /// planes that surface a workflow's events.
+    async fn list_workflow_events(&self, workflow_id: &str) -> Result<Vec<(String, Value)>>;
+
+    /// All notifications sent to a workflow (its `send`/`recv` mailbox), oldest
+    /// first, with each message decoded. Includes already-consumed entries.
+    async fn list_workflow_notifications(&self, workflow_id: &str)
+        -> Result<Vec<NotificationInfo>>;
+
+    /// All of a workflow's streams, grouped by key and ordered by write offset,
+    /// with values decoded and the close sentinel excluded.
+    async fn list_workflow_streams(&self, workflow_id: &str) -> Result<Vec<(String, Vec<Value>)>>;
 
     /// Insert a schedule row. The `schedule_name` is unique, so creating one that
     /// already exists is a unique violation.

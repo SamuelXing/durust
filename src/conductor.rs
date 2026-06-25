@@ -13,9 +13,11 @@
 //! `resume_schedule`, `backfill_schedule`, `trigger_schedule`), and the
 //! registry/analytics messages (`list_queues`, `get_queue`,
 //! `list_application_versions`, `set_latest_application_version`,
-//! `get_workflow_aggregates`, `get_step_aggregates`). Every other message type
-//! is answered with a well-formed "unknown message type" error until its
-//! handler lands, so the link stays healthy as coverage grows.
+//! `get_workflow_aggregates`, `get_step_aggregates`), and the per-workflow
+//! observability reads (`get_workflow_events`, `get_workflow_notifications`,
+//! `get_workflow_streams`). Every other message type is answered with a
+//! well-formed "unknown message type" error until its handler lands, so the
+//! link stays healthy as coverage grows.
 //!
 //! Opt-in, like the admin server:
 //! ```no_run
@@ -334,6 +336,9 @@ async fn handle_message(
         "set_latest_application_version" => handle_set_latest_version(engine, ws, rid, text).await,
         "get_workflow_aggregates" => handle_workflow_aggregates(engine, ws, rid, text).await,
         "get_step_aggregates" => handle_step_aggregates(engine, ws, rid, text).await,
+        "get_workflow_events" => handle_get_events(engine, ws, rid, text).await,
+        "get_workflow_notifications" => handle_get_notifications(engine, ws, rid, text).await,
+        "get_workflow_streams" => handle_get_streams(engine, ws, rid, text).await,
         other => {
             tracing::warn!(msg_type = other, "unknown conductor message type");
             let resp = base_response(other, rid, Some("Unknown message type".to_string()));
@@ -992,6 +997,90 @@ async fn handle_step_aggregates(
     };
     let mut resp = base_response("get_step_aggregates", rid, err);
     resp.insert("output".into(), json!(output));
+    send(ws, resp).await
+}
+
+#[derive(Deserialize)]
+struct WorkflowIdRequest {
+    #[serde(default)]
+    workflow_id: String,
+}
+
+async fn handle_get_events(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+) -> Result<()> {
+    let req: WorkflowIdRequest = serde_json::from_str(text)?;
+    let (events, err) = match engine.list_workflow_events(&req.workflow_id).await {
+        Ok(evs) => (
+            evs.iter()
+                .map(|(k, v)| json!({ "key": k, "value": v.to_string() }))
+                .collect::<Vec<_>>(),
+            None,
+        ),
+        Err(e) => (vec![], Some(format!("failed to get workflow events: {e}"))),
+    };
+    let mut resp = base_response("get_workflow_events", rid, err);
+    resp.insert("events".into(), json!(events));
+    send(ws, resp).await
+}
+
+async fn handle_get_notifications(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+) -> Result<()> {
+    let req: WorkflowIdRequest = serde_json::from_str(text)?;
+    let (notifications, err) = match engine.list_workflow_notifications(&req.workflow_id).await {
+        Ok(rows) => (
+            rows.iter()
+                .map(|n| {
+                    json!({
+                        "topic": n.topic,
+                        "message": n.message.to_string(),
+                        "created_at_epoch_ms": n.created_at_ms,
+                        "consumed": n.consumed,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            None,
+        ),
+        Err(e) => (
+            vec![],
+            Some(format!("failed to get workflow notifications: {e}")),
+        ),
+    };
+    let mut resp = base_response("get_workflow_notifications", rid, err);
+    resp.insert("notifications".into(), json!(notifications));
+    send(ws, resp).await
+}
+
+async fn handle_get_streams(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+) -> Result<()> {
+    let req: WorkflowIdRequest = serde_json::from_str(text)?;
+    let (streams, err) = match engine.list_workflow_streams(&req.workflow_id).await {
+        Ok(rows) => (
+            rows.iter()
+                .map(|(key, vals)| {
+                    json!({
+                        "key": key,
+                        "values": vals.iter().map(|v| v.to_string()).collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>(),
+            None,
+        ),
+        Err(e) => (vec![], Some(format!("failed to get workflow streams: {e}"))),
+    };
+    let mut resp = base_response("get_workflow_streams", rid, err);
+    resp.insert("streams".into(), json!(streams));
     send(ws, resp).await
 }
 

@@ -443,6 +443,91 @@ async fn conductor_handles_registry_and_aggregates() -> Result<()> {
 }
 
 #[tokio::test]
+async fn conductor_handles_events_and_streams() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+
+        let events = exchange(
+            &mut ws,
+            json!({"type":"get_workflow_events","request_id":"e","workflow_id":"p-1"}),
+        )
+        .await;
+        let streams = exchange(
+            &mut ws,
+            json!({"type":"get_workflow_streams","request_id":"st","workflow_id":"p-1"}),
+        )
+        .await;
+        let notifs = exchange(
+            &mut ws,
+            json!({"type":"get_workflow_notifications","request_id":"n","workflow_id":"p-1"}),
+        )
+        .await;
+        (events, streams, notifs)
+    });
+
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("producer", |ctx: DurableContext, _: String| async move {
+        ctx.set_event("status", "done").await?;
+        ctx.write_stream("log", "line1").await?;
+        ctx.write_stream("log", "line2").await?;
+        ctx.close_stream("log").await?;
+        Ok::<_, Error>("ok".to_string())
+    });
+    let engine = Arc::new(engine);
+    engine.launch().await?;
+    let mut h = engine
+        .run_workflow::<_, String>("producer", String::new(), WorkflowOptions::with_id("p-1"))
+        .await?;
+    h.get_result().await?;
+    // A notification delivered to the workflow's mailbox.
+    engine.send("p-1", "hello", "greetings").await?;
+
+    let conductor = Conductor::start(
+        engine.clone(),
+        ConductorConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            api_key: "k".into(),
+            app_name: "app".into(),
+            executor_metadata: None,
+        },
+    )?;
+
+    let (events, streams, notifs) = server.await.unwrap();
+
+    // events -> {key, value} with the value JSON-stringified.
+    let evs = events["events"].as_array().unwrap();
+    let status = evs
+        .iter()
+        .find(|e| e["key"] == "status")
+        .expect("status event");
+    assert_eq!(status["value"], "\"done\"");
+
+    // streams -> values grouped by key, in write order, sentinel excluded.
+    let sts = streams["streams"].as_array().unwrap();
+    let log = sts.iter().find(|s| s["key"] == "log").expect("log stream");
+    assert_eq!(
+        log["values"].as_array().unwrap(),
+        &vec![json!("\"line1\""), json!("\"line2\"")]
+    );
+
+    // notifications -> the delivered message, with its topic and consumed flag.
+    let ns = notifs["notifications"].as_array().unwrap();
+    assert_eq!(ns.len(), 1);
+    assert_eq!(ns[0]["topic"], "greetings");
+    assert_eq!(ns[0]["message"], "\"hello\"");
+    assert_eq!(ns[0]["consumed"], false);
+    assert!(ns[0]["created_at_epoch_ms"].is_number());
+
+    conductor.shutdown(Duration::from_secs(2)).await?;
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn conductor_closes_gracefully_on_shutdown() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();

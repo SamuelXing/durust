@@ -1,8 +1,8 @@
 use crate::error::{Error, Result};
 use crate::provider::{
-    is_terminal, DequeueRequest, ListFilter, StateProvider, StepAggregate, StepAggregateQuery,
-    StepInfo, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
-    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    is_terminal, DequeueRequest, ListFilter, NotificationInfo, StateProvider, StepAggregate,
+    StepAggregateQuery, StepInfo, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery,
+    WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
     STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
@@ -903,6 +903,60 @@ impl StateProvider for InMemoryProvider {
             }
         }
         Ok((values, closed))
+    }
+
+    async fn list_workflow_events(&self, workflow_id: &str) -> Result<Vec<(String, Value)>> {
+        let g = self.inner.lock().await;
+        let mut out: Vec<(String, Value)> = g
+            .events
+            .iter()
+            .filter(|((wid, _), _)| wid == workflow_id)
+            .map(|((_, key), value)| (key.clone(), value.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    async fn list_workflow_notifications(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Vec<NotificationInfo>> {
+        let g = self.inner.lock().await;
+        let mut rows: Vec<&NotificationRow> = g
+            .notifications
+            .iter()
+            .filter(|n| n.destination_id == workflow_id)
+            .collect();
+        rows.sort_by_key(|n| n.created_at_ms);
+        Ok(rows
+            .into_iter()
+            .map(|n| NotificationInfo {
+                topic: (!n.topic.is_empty()).then(|| n.topic.clone()),
+                message: n.message.clone(),
+                created_at_ms: n.created_at_ms,
+                consumed: n.consumed,
+            })
+            .collect())
+    }
+
+    async fn list_workflow_streams(&self, workflow_id: &str) -> Result<Vec<(String, Vec<Value>)>> {
+        let g = self.inner.lock().await;
+        let mut out: Vec<(String, Vec<Value>)> = g
+            .streams
+            .iter()
+            .filter(|((wid, _), _)| wid == workflow_id)
+            .map(|((_, key), entries)| {
+                // Stop at the close sentinel (`None`); include values before it.
+                let values = entries
+                    .iter()
+                    .take_while(|e| e.is_some())
+                    .filter_map(|e| e.clone())
+                    .collect();
+                (key.clone(), values)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
     }
 
     async fn create_schedule(&self, schedule: &WorkflowSchedule) -> Result<()> {
