@@ -779,6 +779,9 @@ impl DurableEngine {
         let id = opts
             .workflow_id
             .clone()
+            // An explicit empty id means "assign one for me": fall through to a
+            // fresh id so an empty id is never persisted.
+            .filter(|s| !s.is_empty())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let input_json = serde_json::to_value(input)?;
         if opts.dedup_policy != DeduplicationPolicy::Reject && opts.dedup_id.is_none() {
@@ -1147,6 +1150,9 @@ impl DurableEngine {
     ) -> Result<WorkflowHandle<O>> {
         let new_id = opts
             .workflow_id
+            // An explicit empty id means "assign one for me": fall through to a
+            // fresh id so an empty id is never persisted.
+            .filter(|s| !s.is_empty())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         self.provider
             .fork_workflow(original_id, &new_id, start_step, &self.app_version)
