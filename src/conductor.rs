@@ -15,7 +15,8 @@
 //! `list_application_versions`, `set_latest_application_version`,
 //! `get_workflow_aggregates`, `get_step_aggregates`), and the per-workflow
 //! observability reads (`get_workflow_events`, `get_workflow_notifications`,
-//! `get_workflow_streams`), and the ops messages (`get_metrics`, `retention`).
+//! `get_workflow_streams`), and the ops messages (`get_metrics`, `retention`),
+//! and the `alert` message (delivered to an optional user-registered handler).
 //! Every other message type is answered with a well-formed "unknown message
 //! type" error until its handler lands, so the link stays healthy as coverage
 //! grows.
@@ -33,6 +34,7 @@
 //!     api_key: std::env::var("DBOS_CONDUCTOR_KEY").unwrap(),
 //!     app_name: "my-app".into(),
 //!     executor_metadata: None,
+//!     alert_handler: None,
 //! })?;
 //! // ... runs in the background ...
 //! conductor.shutdown(Duration::from_secs(5)).await?;
@@ -52,6 +54,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -73,6 +76,12 @@ const MAX_RECONNECT_WAIT: Duration = Duration::from_secs(30);
 // giving up and dropping the connection.
 const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Handler invoked when the conductor delivers an `alert` message: receives the
+/// alert's `name`, `message`, and `metadata`. Registered via
+/// [`ConductorConfig::alert_handler`]; a panic inside it is caught and reported
+/// back to the conductor as a failure rather than tearing down the connection.
+pub type AlertHandler = Arc<dyn Fn(&str, &str, &HashMap<String, String>) + Send + Sync>;
+
 /// Configuration for [`Conductor::start`].
 pub struct ConductorConfig {
     /// Base conductor URL, e.g. `wss://conductor.dbos.dev` (the
@@ -84,6 +93,9 @@ pub struct ConductorConfig {
     pub app_name: String,
     /// Optional free-form metadata reported in `executor_info` responses.
     pub executor_metadata: Option<Value>,
+    /// Optional handler for `alert` messages pushed by the conductor. When
+    /// absent, alerts are logged and acknowledged as success.
+    pub alert_handler: Option<AlertHandler>,
 }
 
 /// A running conductor connection. Call [`shutdown`](Self::shutdown) to stop it.
@@ -342,6 +354,7 @@ async fn handle_message(
         "get_workflow_streams" => handle_get_streams(engine, ws, rid, text).await,
         "get_metrics" => handle_get_metrics(engine, ws, rid, text).await,
         "retention" => handle_retention(engine, ws, rid, text).await,
+        "alert" => handle_alert(config, ws, rid, text).await,
         other => {
             tracing::warn!(msg_type = other, "unknown conductor message type");
             let resp = base_response(other, rid, Some("Unknown message type".to_string()));
@@ -1229,6 +1242,62 @@ async fn handle_retention(
     let mut resp = base_response("retention", rid, err.clone());
     resp.insert("success".into(), json!(err.is_none()));
     send(ws, resp).await
+}
+
+#[derive(Deserialize)]
+struct AlertRequest {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    metadata: HashMap<String, String>,
+}
+
+/// Deliver an `alert` to the registered handler, if any. The handler is a
+/// user callback, so we run it inside [`catch_unwind`](std::panic::catch_unwind):
+/// a panic is reported back as a failure (mirroring the conductor's contract)
+/// instead of unwinding through the connection task. With no handler registered,
+/// the alert is logged and acknowledged as success.
+async fn handle_alert(
+    config: &ConductorConfig,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+) -> Result<()> {
+    let req: AlertRequest = serde_json::from_str(text)?;
+    let err = match &config.alert_handler {
+        Some(handler) => {
+            let handler = handler.clone();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                handler(&req.name, &req.message, &req.metadata);
+            }))
+            .err()
+            .map(|p| format!("panic in alert handler: {}", panic_detail(p.as_ref())))
+        }
+        None => {
+            tracing::info!(
+                name = %req.name,
+                message = %req.message,
+                "alert received (no handler registered)"
+            );
+            None
+        }
+    };
+    let mut resp = base_response("alert", rid, err.clone());
+    resp.insert("success".into(), json!(err.is_none()));
+    send(ws, resp).await
+}
+
+/// Best-effort string for a caught panic payload (`&str` or `String`).
+fn panic_detail(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown".to_string()
+    }
 }
 
 /// Render a [`WorkflowQueue`] in the conductor's queue shape (snake_case;

@@ -53,7 +53,7 @@ mod tx;
 
 pub use admin::AdminServer;
 pub use client::Client;
-pub use conductor::{Conductor, ConductorConfig};
+pub use conductor::{AlertHandler, Conductor, ConductorConfig};
 pub use context::{AuthContext, DurableContext, StepOptions};
 pub use debounce::Debouncer;
 pub use engine::{

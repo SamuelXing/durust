@@ -3,11 +3,12 @@
 //! pushes requests and asserts on the client's responses.
 
 use durust::{
-    Conductor, ConductorConfig, DurableContext, DurableEngine, Error, InMemoryProvider, Result,
-    ScheduleOptions, WorkflowOptions, WorkflowQueue,
+    AlertHandler, Conductor, ConductorConfig, DurableContext, DurableEngine, Error,
+    InMemoryProvider, Result, ScheduleOptions, WorkflowOptions, WorkflowQueue,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -68,6 +69,7 @@ async fn conductor_answers_lifecycle_messages() -> Result<()> {
             api_key: "test-key".into(),
             app_name: "test-app".into(),
             executor_metadata: Some(json!({"region": "us-east"})),
+            alert_handler: None,
         },
     )?;
 
@@ -114,6 +116,7 @@ async fn conductor_requires_api_key_and_url() -> Result<()> {
             api_key: String::new(),
             app_name: "app".into(),
             executor_metadata: None,
+            alert_handler: None,
         },
     );
     assert!(no_key.is_err(), "missing API key is rejected");
@@ -125,6 +128,7 @@ async fn conductor_requires_api_key_and_url() -> Result<()> {
             api_key: "k".into(),
             app_name: "app".into(),
             executor_metadata: None,
+            alert_handler: None,
         },
     );
     assert!(no_url.is_err(), "missing URL is rejected");
@@ -196,6 +200,7 @@ async fn conductor_handles_workflow_management() -> Result<()> {
             api_key: "k".into(),
             app_name: "app".into(),
             executor_metadata: None,
+            alert_handler: None,
         },
     )?;
 
@@ -302,6 +307,7 @@ async fn conductor_handles_schedule_management() -> Result<()> {
             api_key: "k".into(),
             app_name: "app".into(),
             executor_metadata: None,
+            alert_handler: None,
         },
     )?;
 
@@ -401,6 +407,7 @@ async fn conductor_handles_registry_and_aggregates() -> Result<()> {
             api_key: "k".into(),
             app_name: "app".into(),
             executor_metadata: None,
+            alert_handler: None,
         },
     )?;
 
@@ -493,6 +500,7 @@ async fn conductor_handles_events_and_streams() -> Result<()> {
             api_key: "k".into(),
             app_name: "app".into(),
             executor_metadata: None,
+            alert_handler: None,
         },
     )?;
 
@@ -597,6 +605,7 @@ async fn conductor_handles_metrics_and_retention() -> Result<()> {
             api_key: "k".into(),
             app_name: "app".into(),
             executor_metadata: None,
+            alert_handler: None,
         },
     )?;
 
@@ -624,6 +633,124 @@ async fn conductor_handles_metrics_and_retention() -> Result<()> {
     assert_eq!(retention["success"], true);
     let status = engine.retrieve_workflow::<String>("delayed-1").await?;
     assert_eq!(status.get_status().await?.status, "CANCELLED");
+
+    conductor.shutdown(Duration::from_secs(2)).await?;
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn conductor_handles_alert() -> Result<()> {
+    use std::sync::Mutex;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let ok = exchange(
+            &mut ws,
+            json!({"type":"alert","request_id":"a1","name":"deploy",
+                   "message":"new version live","metadata":{"env":"prod"}}),
+        )
+        .await;
+        let boom = exchange(
+            &mut ws,
+            json!({"type":"alert","request_id":"a2","name":"boom",
+                   "message":"trigger panic","metadata":{}}),
+        )
+        .await;
+        (ok, boom)
+    });
+
+    // The handler records each alert it receives, and panics on "boom".
+    type AlertLog = Arc<Mutex<Vec<(String, String, HashMap<String, String>)>>>;
+    let seen: AlertLog = Arc::new(Mutex::new(Vec::new()));
+    let recorder = seen.clone();
+    let handler: AlertHandler = Arc::new(move |name: &str, message: &str, meta| {
+        if name == "boom" {
+            panic!("handler exploded");
+        }
+        recorder
+            .lock()
+            .unwrap()
+            .push((name.to_string(), message.to_string(), meta.clone()));
+    });
+
+    let engine = Arc::new(DurableEngine::new(Arc::new(InMemoryProvider::new())).await?);
+    engine.launch().await?;
+    let conductor = Conductor::start(
+        engine.clone(),
+        ConductorConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            api_key: "k".into(),
+            app_name: "app".into(),
+            executor_metadata: None,
+            alert_handler: Some(handler),
+        },
+    )?;
+
+    let (ok, boom) = server.await.unwrap();
+
+    // A normal alert acks success and reaches the handler verbatim.
+    assert_eq!(ok["type"], "alert");
+    assert_eq!(ok["request_id"], "a1");
+    assert_eq!(ok["success"], true);
+    assert!(ok.get("error_message").is_none());
+    let recorded = seen.lock().unwrap().clone();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].0, "deploy");
+    assert_eq!(recorded[0].1, "new version live");
+    assert_eq!(recorded[0].2.get("env").map(String::as_str), Some("prod"));
+
+    // A panicking handler is caught and reported as a failure (the link lives on).
+    assert_eq!(boom["success"], false);
+    assert!(boom["error_message"]
+        .as_str()
+        .unwrap()
+        .contains("panic in alert handler"));
+
+    conductor.shutdown(Duration::from_secs(2)).await?;
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn conductor_acks_alert_without_handler() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        exchange(
+            &mut ws,
+            json!({"type":"alert","request_id":"a","name":"info",
+                   "message":"hi","metadata":{}}),
+        )
+        .await
+    });
+
+    let engine = Arc::new(DurableEngine::new(Arc::new(InMemoryProvider::new())).await?);
+    engine.launch().await?;
+    let conductor = Conductor::start(
+        engine.clone(),
+        ConductorConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            api_key: "k".into(),
+            app_name: "app".into(),
+            executor_metadata: None,
+            alert_handler: None,
+        },
+    )?;
+
+    // With no handler registered, the alert is still acknowledged as success.
+    let resp = server.await.unwrap();
+    assert_eq!(resp["type"], "alert");
+    assert_eq!(resp["request_id"], "a");
+    assert_eq!(resp["success"], true);
+    assert!(resp.get("error_message").is_none());
 
     conductor.shutdown(Duration::from_secs(2)).await?;
     engine.shutdown(Duration::from_secs(1)).await?;
@@ -661,6 +788,7 @@ async fn conductor_closes_gracefully_on_shutdown() -> Result<()> {
             api_key: "k".into(),
             app_name: "app".into(),
             executor_metadata: None,
+            alert_handler: None,
         },
     )?;
 
