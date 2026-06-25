@@ -6,11 +6,13 @@
 //! link alive and reconnects with exponential backoff after a drop.
 //!
 //! Implemented so far: the executor-lifecycle handlers (`executor_info`,
-//! `recovery`, `exist_pending_workflows`) and workflow management/queries
+//! `recovery`, `exist_pending_workflows`), workflow management/queries
 //! (`cancel`, `resume`, `delete`, `fork_workflow`, `list_workflows`,
-//! `list_queued_workflows`, `get_workflow`, `list_steps`). Every other message
-//! type is answered with a well-formed "unknown message type" error until its
-//! handler lands, so the link stays healthy as coverage grows.
+//! `list_queued_workflows`, `get_workflow`, `list_steps`), and schedule
+//! management (`list_schedules`, `get_schedule`, `pause_schedule`,
+//! `resume_schedule`, `backfill_schedule`, `trigger_schedule`). Every other
+//! message type is answered with a well-formed "unknown message type" error
+//! until its handler lands, so the link stays healthy as coverage grows.
 //!
 //! Opt-in, like the admin server:
 //! ```no_run
@@ -37,7 +39,8 @@ use crate::error::{Error, Result};
 use crate::provider::{
     ListFilter, StepInfo, WorkflowStatus, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_PENDING,
 };
-use chrono::{DateTime, Utc};
+use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
+use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -314,6 +317,12 @@ async fn handle_message(
         "list_queued_workflows" => handle_list(engine, ws, rid, text, true).await,
         "get_workflow" => handle_get_workflow(engine, ws, rid, text).await,
         "list_steps" => handle_list_steps(engine, ws, rid, text).await,
+        "list_schedules" => handle_list_schedules(engine, ws, rid, text).await,
+        "get_schedule" => handle_get_schedule(engine, ws, rid, text).await,
+        "pause_schedule" => handle_schedule_toggle(engine, ws, rid, text, true).await,
+        "resume_schedule" => handle_schedule_toggle(engine, ws, rid, text, false).await,
+        "backfill_schedule" => handle_backfill_schedule(engine, ws, rid, text).await,
+        "trigger_schedule" => handle_trigger_schedule(engine, ws, rid, text).await,
         other => {
             tracing::warn!(msg_type = other, "unknown conductor message type");
             let resp = base_response(other, rid, Some("Unknown message type".to_string()));
@@ -537,6 +546,222 @@ async fn handle_list_steps(
         resp.insert("output".into(), json!(o));
     }
     send(ws, resp).await
+}
+
+#[derive(Deserialize)]
+struct ListSchedulesRequest {
+    #[serde(default)]
+    body: ListSchedulesBody,
+}
+
+#[derive(Default, Deserialize)]
+struct ListSchedulesBody {
+    #[serde(default)]
+    status: StringOrList,
+    #[serde(default)]
+    workflow_name: StringOrList,
+    #[serde(default)]
+    schedule_name_prefix: StringOrList,
+    load_context: Option<bool>,
+}
+
+async fn handle_list_schedules(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+) -> Result<()> {
+    let req: ListSchedulesRequest = serde_json::from_str(text)?;
+    let load_context = req.body.load_context.unwrap_or(true);
+    let filter = ScheduleFilter {
+        statuses: req
+            .body
+            .status
+            .vec()
+            .iter()
+            .map(|s| ScheduleStatus::parse(s))
+            .collect(),
+        workflow_names: req.body.workflow_name.vec(),
+        name_prefixes: req.body.schedule_name_prefix.vec(),
+    };
+    let (output, err) = match engine.list_schedules(&filter).await {
+        Ok(rows) => (
+            rows.iter()
+                .map(|s| format_schedule(s, load_context))
+                .collect::<Vec<_>>(),
+            None,
+        ),
+        Err(e) => (vec![], Some(format!("failed to list schedules: {e}"))),
+    };
+    let mut resp = base_response("list_schedules", rid, err);
+    resp.insert("output".into(), json!(output));
+    send(ws, resp).await
+}
+
+#[derive(Deserialize)]
+struct GetScheduleRequest {
+    #[serde(default)]
+    schedule_name: String,
+    load_context: Option<bool>,
+}
+
+async fn handle_get_schedule(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+) -> Result<()> {
+    let req: GetScheduleRequest = serde_json::from_str(text)?;
+    let load_context = req.load_context.unwrap_or(true);
+    let (output, err) = match engine.get_schedule(&req.schedule_name).await {
+        Ok(s) => (s.map(|s| format_schedule(&s, load_context)), None),
+        Err(e) => (
+            None,
+            Some(format!(
+                "failed to get schedule '{}': {e}",
+                req.schedule_name
+            )),
+        ),
+    };
+    let mut resp = base_response("get_schedule", rid, err);
+    // `output` is non-omitempty on the wire: null when the schedule is absent.
+    resp.insert("output".into(), output.unwrap_or(Value::Null));
+    send(ws, resp).await
+}
+
+#[derive(Deserialize)]
+struct ScheduleNameRequest {
+    #[serde(default)]
+    schedule_name: String,
+}
+
+async fn handle_schedule_toggle(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+    pause: bool,
+) -> Result<()> {
+    let req: ScheduleNameRequest = serde_json::from_str(text)?;
+    let (type_str, verb, result) = if pause {
+        (
+            "pause_schedule",
+            "pause",
+            engine.pause_schedule(&req.schedule_name).await,
+        )
+    } else {
+        (
+            "resume_schedule",
+            "resume",
+            engine.resume_schedule(&req.schedule_name).await,
+        )
+    };
+    let err = result
+        .err()
+        .map(|e| format!("failed to {verb} schedule '{}': {e}", req.schedule_name));
+    let mut resp = base_response(type_str, rid, err.clone());
+    resp.insert("success".into(), json!(err.is_none()));
+    send(ws, resp).await
+}
+
+#[derive(Deserialize)]
+struct BackfillRequest {
+    #[serde(default)]
+    schedule_name: String,
+    #[serde(default)]
+    start: String,
+    #[serde(default)]
+    end: String,
+}
+
+async fn handle_backfill_schedule(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+) -> Result<()> {
+    let req: BackfillRequest = serde_json::from_str(text)?;
+    let parse = |s: &str| DateTime::parse_from_rfc3339(s).map(|d| d.with_timezone(&Utc));
+    let (ids, err) = match (parse(&req.start), parse(&req.end)) {
+        (Err(e), _) => (
+            vec![],
+            Some(format!("failed to parse start time '{}': {e}", req.start)),
+        ),
+        (_, Err(e)) => (
+            vec![],
+            Some(format!("failed to parse end time '{}': {e}", req.end)),
+        ),
+        (Ok(start), Ok(end)) => match engine
+            .backfill_schedule(&req.schedule_name, start, end)
+            .await
+        {
+            Ok(ids) => (ids, None),
+            Err(e) => (
+                vec![],
+                Some(format!(
+                    "failed to backfill schedule '{}': {e}",
+                    req.schedule_name
+                )),
+            ),
+        },
+    };
+    let mut resp = base_response("backfill_schedule", rid, err);
+    resp.insert("workflow_ids".into(), json!(ids));
+    send(ws, resp).await
+}
+
+async fn handle_trigger_schedule(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+) -> Result<()> {
+    let req: ScheduleNameRequest = serde_json::from_str(text)?;
+    let (id, err) = match engine.trigger_schedule::<Value>(&req.schedule_name).await {
+        Ok(h) => (Some(h.id().to_string()), None),
+        Err(e) => (
+            None,
+            Some(format!(
+                "failed to trigger schedule '{}': {e}",
+                req.schedule_name
+            )),
+        ),
+    };
+    let mut resp = base_response("trigger_schedule", rid, err);
+    // `workflow_id` is non-omitempty on the wire: null on failure.
+    resp.insert(
+        "workflow_id".into(),
+        id.map(Value::String).unwrap_or(Value::Null),
+    );
+    send(ws, resp).await
+}
+
+/// Render a [`WorkflowSchedule`] in the conductor's schedule shape. Nullable
+/// fields are emitted as `null` (not omitted) to match the wire `*string` tags.
+fn format_schedule(s: &WorkflowSchedule, load_context: bool) -> Value {
+    let context = if load_context {
+        s.context
+            .as_ref()
+            .map(|c| Value::String(c.to_string()))
+            .unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    json!({
+        "schedule_id": s.schedule_id,
+        "schedule_name": s.schedule_name,
+        "workflow_name": s.workflow_name,
+        "workflow_class_name": Value::Null, // no class concept in this SDK
+        "schedule": s.schedule,
+        "status": s.status.as_str(),
+        "context": context,
+        "last_fired_at": s.last_fired_at
+            .map(|t| Value::String(t.to_rfc3339_opts(SecondsFormat::Nanos, true)))
+            .unwrap_or(Value::Null),
+        "automatic_backfill": s.automatic_backfill,
+        "cron_timezone": s.cron_timezone.as_ref().map(|t| json!(t)).unwrap_or(Value::Null),
+        "queue_name": s.queue_name.as_ref().map(|q| json!(q)).unwrap_or(Value::Null),
+    })
 }
 
 /// A conductor filter field that accepts either a single string or an array of
