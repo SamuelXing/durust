@@ -991,6 +991,28 @@ impl DurableEngine {
         self.provider.get_workflow_steps(workflow_id).await
     }
 
+    /// All `(key, value)` events a workflow has set (`set_event`), ordered by key.
+    pub async fn list_workflow_events(&self, workflow_id: &str) -> Result<Vec<(String, Value)>> {
+        self.provider.list_workflow_events(workflow_id).await
+    }
+
+    /// All notifications in a workflow's `send`/`recv` mailbox, oldest first
+    /// (including already-consumed ones).
+    pub async fn list_workflow_notifications(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Vec<crate::provider::NotificationInfo>> {
+        self.provider.list_workflow_notifications(workflow_id).await
+    }
+
+    /// All of a workflow's streams, grouped by key and ordered by write offset.
+    pub async fn list_workflow_streams(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Vec<(String, Vec<Value>)>> {
+        self.provider.list_workflow_streams(workflow_id).await
+    }
+
     /// Read the durable stream `key` produced by `workflow_id`, blocking until it
     /// is closed (a producer called [`close_stream`](crate::DurableContext::close_stream))
     /// or the producing workflow becomes inactive (no longer `PENDING`/`ENQUEUED`).

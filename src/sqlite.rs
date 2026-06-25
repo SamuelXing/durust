@@ -1,10 +1,11 @@
 use crate::error::{Error, Result};
 use crate::provider::{
-    decode_roles, dedup_or, encode_roles, is_terminal, nonexistent_or, DequeueRequest, ListFilter,
-    StateProvider, StepAggregate, StepAggregateQuery, StepInfo, VersionInfo, WorkflowAggregate,
-    WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
-    STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
-    STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL,
+    decode_roles, dedup_or, encode_roles, group_stream_rows, is_terminal, nonexistent_or,
+    DequeueRequest, ListFilter, NotificationInfo, StateProvider, StepAggregate, StepAggregateQuery,
+    StepInfo, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
+    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
+    STREAM_CLOSED_SENTINEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
@@ -1127,6 +1128,54 @@ impl StateProvider for SqliteProvider {
             values.push(serialize::decode(fmt.as_deref(), &value)?);
         }
         Ok((values, closed))
+    }
+
+    async fn list_workflow_events(&self, workflow_id: &str) -> Result<Vec<(String, Value)>> {
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT key, value, serialization FROM workflow_events
+             WHERE workflow_uuid = ? ORDER BY key ASC",
+        )
+        .bind(workflow_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(key, value, fmt)| Ok((key, serialize::decode(fmt.as_deref(), &value)?)))
+            .collect()
+    }
+
+    async fn list_workflow_notifications(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Vec<NotificationInfo>> {
+        let rows: Vec<(String, String, Option<String>, i64, bool)> = sqlx::query_as(
+            "SELECT topic, message, serialization, created_at_epoch_ms, consumed
+             FROM notifications WHERE destination_uuid = ?
+             ORDER BY created_at_epoch_ms ASC",
+        )
+        .bind(workflow_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(topic, message, fmt, created_at_ms, consumed)| {
+                Ok(NotificationInfo {
+                    topic: (!topic.is_empty()).then_some(topic),
+                    message: serialize::decode(fmt.as_deref(), &message)?,
+                    created_at_ms,
+                    consumed,
+                })
+            })
+            .collect()
+    }
+
+    async fn list_workflow_streams(&self, workflow_id: &str) -> Result<Vec<(String, Vec<Value>)>> {
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT key, value, serialization FROM streams
+             WHERE workflow_uuid = ? ORDER BY key ASC, \"offset\" ASC",
+        )
+        .bind(workflow_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(group_stream_rows(rows)?)
     }
 
     async fn create_schedule(&self, schedule: &WorkflowSchedule) -> Result<()> {
