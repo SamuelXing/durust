@@ -4,7 +4,7 @@
 
 use durust::{
     Conductor, ConductorConfig, DurableContext, DurableEngine, Error, InMemoryProvider, Result,
-    WorkflowOptions,
+    ScheduleOptions, WorkflowOptions,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -224,6 +224,114 @@ async fn conductor_handles_workflow_management() -> Result<()> {
     // cancel / delete -> success.
     assert_eq!(cancel["success"], true);
     assert_eq!(delete["success"], true);
+
+    conductor.shutdown(Duration::from_secs(2)).await?;
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn conductor_handles_schedule_management() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+
+        let list = exchange(
+            &mut ws,
+            json!({"type":"list_schedules","request_id":"l","body":{}}),
+        )
+        .await;
+        let get = exchange(
+            &mut ws,
+            json!({"type":"get_schedule","request_id":"g","schedule_name":"s1"}),
+        )
+        .await;
+        let pause = exchange(
+            &mut ws,
+            json!({"type":"pause_schedule","request_id":"p","schedule_name":"s1"}),
+        )
+        .await;
+        let resume = exchange(
+            &mut ws,
+            json!({"type":"resume_schedule","request_id":"r","schedule_name":"s1"}),
+        )
+        .await;
+        let trigger = exchange(
+            &mut ws,
+            json!({"type":"trigger_schedule","request_id":"t","schedule_name":"s1"}),
+        )
+        .await;
+        let backfill = exchange(
+            &mut ws,
+            json!({"type":"backfill_schedule","request_id":"b","schedule_name":"s1",
+                   "start":"2022-06-01T00:00:00Z","end":"2024-06-01T00:00:00Z"}),
+        )
+        .await;
+        let missing = exchange(
+            &mut ws,
+            json!({"type":"get_schedule","request_id":"m","schedule_name":"nope"}),
+        )
+        .await;
+        (list, get, pause, resume, trigger, backfill, missing)
+    });
+
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("sched_wf", |_ctx: DurableContext, ts: String| async move {
+        Ok::<_, Error>(ts)
+    });
+    let engine = Arc::new(engine);
+    engine.launch().await?;
+    // Cron fires Jan 1 00:00:00 each year — never during the test, but the
+    // backfill window below spans two such instants.
+    engine
+        .create_schedule(
+            "s1",
+            "sched_wf",
+            "0 0 0 1 1 *",
+            ScheduleOptions::new().context(&json!({"k": "v"})),
+        )
+        .await?;
+
+    let conductor = Conductor::start(
+        engine.clone(),
+        ConductorConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            api_key: "k".into(),
+            app_name: "app".into(),
+            executor_metadata: None,
+        },
+    )?;
+
+    let (list, get, pause, resume, trigger, backfill, missing) = server.await.unwrap();
+
+    // list_schedules -> our schedule in the conductor wire shape.
+    let rows = list["output"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["schedule_name"], "s1");
+    assert_eq!(rows[0]["workflow_name"], "sched_wf");
+    assert_eq!(rows[0]["status"], "ACTIVE");
+    assert_eq!(rows[0]["context"], "{\"k\":\"v\"}"); // load_context defaults true
+    assert!(rows[0]["workflow_class_name"].is_null()); // null, not omitted
+
+    // get_schedule -> single body.
+    assert_eq!(get["output"]["schedule_name"], "s1");
+
+    // pause / resume -> success.
+    assert_eq!(pause["success"], true);
+    assert_eq!(resume["success"], true);
+
+    // trigger -> a workflow id for the one-off run.
+    assert!(trigger["workflow_id"].is_string());
+
+    // backfill -> the Jan-1 ticks inside the window.
+    let ids = backfill["workflow_ids"].as_array().unwrap();
+    assert!(!ids.is_empty(), "backfill fired at least one tick");
+
+    // get_schedule for an unknown name -> output null.
+    assert!(missing["output"].is_null());
 
     conductor.shutdown(Duration::from_secs(2)).await?;
     engine.shutdown(Duration::from_secs(1)).await?;
