@@ -15,9 +15,10 @@
 //! `list_application_versions`, `set_latest_application_version`,
 //! `get_workflow_aggregates`, `get_step_aggregates`), and the per-workflow
 //! observability reads (`get_workflow_events`, `get_workflow_notifications`,
-//! `get_workflow_streams`). Every other message type is answered with a
-//! well-formed "unknown message type" error until its handler lands, so the
-//! link stays healthy as coverage grows.
+//! `get_workflow_streams`), and the ops messages (`get_metrics`, `retention`).
+//! Every other message type is answered with a well-formed "unknown message
+//! type" error until its handler lands, so the link stays healthy as coverage
+//! grows.
 //!
 //! Opt-in, like the admin server:
 //! ```no_run
@@ -339,6 +340,8 @@ async fn handle_message(
         "get_workflow_events" => handle_get_events(engine, ws, rid, text).await,
         "get_workflow_notifications" => handle_get_notifications(engine, ws, rid, text).await,
         "get_workflow_streams" => handle_get_streams(engine, ws, rid, text).await,
+        "get_metrics" => handle_get_metrics(engine, ws, rid, text).await,
+        "retention" => handle_retention(engine, ws, rid, text).await,
         other => {
             tracing::warn!(msg_type = other, "unknown conductor message type");
             let resp = base_response(other, rid, Some("Unknown message type".to_string()));
@@ -1081,6 +1084,150 @@ async fn handle_get_streams(
     };
     let mut resp = base_response("get_workflow_streams", rid, err);
     resp.insert("streams".into(), json!(streams));
+    send(ws, resp).await
+}
+
+#[derive(Deserialize)]
+struct GetMetricsRequest {
+    #[serde(default)]
+    start_time: String,
+    #[serde(default)]
+    end_time: String,
+    #[serde(default)]
+    metric_class: String,
+}
+
+async fn handle_get_metrics(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+) -> Result<()> {
+    let req: GetMetricsRequest = serde_json::from_str(text)?;
+    // The only metric class the conductor asks for; mirror Go's rejection.
+    if req.metric_class != "workflow_step_count" {
+        let mut resp = base_response(
+            "get_metrics",
+            rid,
+            Some(format!("Unexpected metric class: {}", req.metric_class)),
+        );
+        resp.insert("metrics".into(), Value::Null);
+        return send(ws, resp).await;
+    }
+    let parse = |s: &str| DateTime::parse_from_rfc3339(s).map(|d| d.with_timezone(&Utc));
+    let (start, end) = match (parse(&req.start_time), parse(&req.end_time)) {
+        (Ok(s), Ok(e)) => (s.timestamp_millis(), e.timestamp_millis()),
+        (Err(e), _) => {
+            let mut resp =
+                base_response("get_metrics", rid, Some(format!("invalid start_time: {e}")));
+            resp.insert("metrics".into(), Value::Null);
+            return send(ws, resp).await;
+        }
+        (_, Err(e)) => {
+            let mut resp =
+                base_response("get_metrics", rid, Some(format!("invalid end_time: {e}")));
+            resp.insert("metrics".into(), Value::Null);
+            return send(ws, resp).await;
+        }
+    };
+
+    // workflow_count grouped by name, step_count grouped by function name —
+    // both over the [start, end) window (workflows by created_at, steps by
+    // completed_at), matching the reference metric queries.
+    let wq = WorkflowAggregateQuery {
+        by_name: true,
+        start_time_ms: Some(start),
+        end_time_ms: Some(end),
+        ..Default::default()
+    };
+    let sq = StepAggregateQuery {
+        by_function_name: true,
+        select_count: true,
+        completed_after_ms: Some(start),
+        completed_before_ms: Some(end),
+        ..Default::default()
+    };
+
+    let mut metrics: Vec<Value> = Vec::new();
+    let mut err = None;
+    match engine.get_workflow_aggregates(&wq).await {
+        Ok(rows) => {
+            for r in rows {
+                if let Some(Some(name)) = r.group.get("name") {
+                    metrics.push(metric("workflow_count", name, r.count as f64));
+                }
+            }
+        }
+        Err(e) => err = Some(format!("Exception encountered when getting metrics: {e}")),
+    }
+    if err.is_none() {
+        match engine.get_step_aggregates(&sq).await {
+            Ok(rows) => {
+                for r in rows {
+                    if let (Some(Some(name)), Some(count)) = (r.group.get("function_name"), r.count)
+                    {
+                        metrics.push(metric("step_count", name, count as f64));
+                    }
+                }
+            }
+            Err(e) => err = Some(format!("Exception encountered when getting metrics: {e}")),
+        }
+    }
+
+    let mut resp = base_response("get_metrics", rid, err.clone());
+    resp.insert(
+        "metrics".into(),
+        if err.is_some() {
+            Value::Null
+        } else {
+            json!(metrics)
+        },
+    );
+    send(ws, resp).await
+}
+
+/// One `metricData` entry.
+fn metric(metric_type: &str, name: &str, value: f64) -> Value {
+    json!({ "metric_name": name, "metric_type": metric_type, "value": value })
+}
+
+#[derive(Deserialize)]
+struct RetentionRequest {
+    #[serde(default)]
+    body: RetentionBody,
+}
+
+#[derive(Default, Deserialize)]
+struct RetentionBody {
+    // GC parameters are accepted for wire-compatibility but not yet acted on
+    // (garbage collection is unimplemented, like the admin server's endpoint).
+    #[allow(dead_code)]
+    gc_cutoff_epoch_ms: Option<i64>,
+    #[allow(dead_code)]
+    gc_rows_threshold: Option<i64>,
+    timeout_cutoff_epoch_ms: Option<i64>,
+}
+
+async fn handle_retention(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+) -> Result<()> {
+    let req: RetentionRequest = serde_json::from_str(text)?;
+    // Timeout enforcement: cancel everything still pending before the cutoff.
+    // (Garbage collection is not yet implemented — a no-op, matching the admin
+    // server's GC endpoint.)
+    let err = match req.body.timeout_cutoff_epoch_ms {
+        Some(cutoff) => engine
+            .cancel_all_before(cutoff)
+            .await
+            .err()
+            .map(|e| format!("failed to timeout workflows: {e}")),
+        None => None,
+    };
+    let mut resp = base_response("retention", rid, err.clone());
+    resp.insert("success".into(), json!(err.is_none()));
     send(ws, resp).await
 }
 

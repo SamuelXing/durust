@@ -528,6 +528,109 @@ async fn conductor_handles_events_and_streams() -> Result<()> {
 }
 
 #[tokio::test]
+async fn conductor_handles_metrics_and_retention() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+
+        let metrics = exchange(
+            &mut ws,
+            json!({"type":"get_metrics","request_id":"m",
+                   "start_time":"2000-01-01T00:00:00Z","end_time":"2100-01-01T00:00:00Z",
+                   "metric_class":"workflow_step_count"}),
+        )
+        .await;
+        let bad_class = exchange(
+            &mut ws,
+            json!({"type":"get_metrics","request_id":"mb",
+                   "start_time":"2000-01-01T00:00:00Z","end_time":"2100-01-01T00:00:00Z",
+                   "metric_class":"nonsense"}),
+        )
+        .await;
+        // Cutoff far in the future -> cancels everything still pending.
+        let retention = exchange(
+            &mut ws,
+            json!({"type":"retention","request_id":"rt",
+                   "body":{"timeout_cutoff_epoch_ms":9999999999999i64}}),
+        )
+        .await;
+        (metrics, bad_class, retention)
+    });
+
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("work", |ctx: DurableContext, msg: String| async move {
+        let r = ctx
+            .step("s1", || async { Ok::<_, Error>(format!("{msg}!")) })
+            .await?;
+        Ok::<_, Error>(r)
+    });
+    engine.register_queue(WorkflowQueue::new("q"));
+    let engine = Arc::new(engine);
+    engine.launch().await?;
+
+    // One completed workflow (with a step) ...
+    let mut h = engine
+        .run_workflow::<_, String>("work", "hi".to_string(), WorkflowOptions::with_id("wf-1"))
+        .await?;
+    h.get_result().await?;
+    // ... and one long-delayed workflow that stays DELAYED (cancellable).
+    let _delayed = engine
+        .run_workflow::<_, String>(
+            "work",
+            "later".to_string(),
+            WorkflowOptions {
+                workflow_id: Some("delayed-1".into()),
+                queue: Some("q".into()),
+                delay: Some(Duration::from_secs(3600)),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+    let conductor = Conductor::start(
+        engine.clone(),
+        ConductorConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            api_key: "k".into(),
+            app_name: "app".into(),
+            executor_metadata: None,
+        },
+    )?;
+
+    let (metrics, bad_class, retention) = server.await.unwrap();
+
+    // metrics -> workflow_count for "work" and step_count for "s1".
+    let ms = metrics["metrics"].as_array().unwrap();
+    let wf_metric = ms
+        .iter()
+        .find(|m| m["metric_type"] == "workflow_count" && m["metric_name"] == "work")
+        .expect("workflow_count for 'work'");
+    assert!(wf_metric["value"].as_f64().unwrap() >= 1.0);
+    assert!(ms
+        .iter()
+        .any(|m| m["metric_type"] == "step_count" && m["metric_name"] == "s1"));
+
+    // unexpected metric class -> error + null metrics.
+    assert!(bad_class["error_message"]
+        .as_str()
+        .unwrap()
+        .contains("Unexpected metric class"));
+    assert!(bad_class["metrics"].is_null());
+
+    // retention timeout -> success, and the delayed workflow is now cancelled.
+    assert_eq!(retention["success"], true);
+    let status = engine.retrieve_workflow::<String>("delayed-1").await?;
+    assert_eq!(status.get_status().await?.status, "CANCELLED");
+
+    conductor.shutdown(Duration::from_secs(2)).await?;
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn conductor_closes_gracefully_on_shutdown() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
