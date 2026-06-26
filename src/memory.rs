@@ -1218,14 +1218,13 @@ fn ms_to_dt(ms: Option<i64>) -> DateTime<Utc> {
         .unwrap_or_else(Utc::now)
 }
 
-/// Render a stored payload as the portable `inputs`/`output`/`value` string a
-/// SQL backend would hold (`null` for a `Value::Null`).
+/// A stored payload rendered as the portable JSON string a SQL backend keeps in
+/// its `inputs`/`output`/`value` TEXT column. A JSON `null` *value* becomes the
+/// string `"null"` — it is a present payload, not an absent column, which is what
+/// the SQL backends store. Absence is a `null` column instead, which callers
+/// produce directly (e.g. a `None` output → `Value::Null`).
 fn payload_str(v: &Value) -> Value {
-    if v.is_null() {
-        Value::Null
-    } else {
-        json!(v.to_string())
-    }
+    json!(v.to_string())
 }
 
 /// A [`WorkflowStatus`] as a portable `workflow_status` row. Columns this backend
@@ -1244,7 +1243,7 @@ fn status_to_map(w: &WorkflowStatus) -> Map<String, Value> {
     );
     m.insert(
         "output".into(),
-        json!(w.output.as_ref().map(|v| v.to_string())),
+        w.output.as_ref().map_or(Value::Null, payload_str),
     );
     m.insert("error".into(), json!(w.error));
     m.insert("executor_id".into(), json!(w.executor_id));
@@ -1313,7 +1312,7 @@ fn step_to_map(wf_id: &str, seq: i32, r: &StepRow) -> Map<String, Value> {
     m.insert("function_name".into(), json!(r.name));
     m.insert(
         "output".into(),
-        json!(r.output.as_ref().map(|v| v.to_string())),
+        r.output.as_ref().map_or(Value::Null, payload_str),
     );
     m.insert("error".into(), Value::Null);
     m.insert("child_workflow_id".into(), json!(r.child_workflow_id));
@@ -1335,7 +1334,7 @@ fn event_to_map(wf_id: &str, key: &str, value: &Value) -> Map<String, Value> {
 /// is the close sentinel). The in-memory backend does not track `function_id`.
 fn stream_to_map(wf_id: &str, key: &str, offset: i64, entry: &Option<Value>) -> Map<String, Value> {
     let value = match entry {
-        Some(v) => json!(v.to_string()),
+        Some(v) => payload_str(v),
         None => json!(STREAM_CLOSED_SENTINEL),
     };
     let mut m = Map::new();

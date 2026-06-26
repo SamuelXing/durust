@@ -1704,7 +1704,9 @@ async fn pg_export_import_round_trip() -> Result<()> {
 
     let exported = engine.export_workflow(&id, false).await?;
     assert_eq!(exported.len(), 1);
-    engine.delete_workflows(std::slice::from_ref(&id), false).await?;
+    engine
+        .delete_workflows(std::slice::from_ref(&id), false)
+        .await?;
     assert!(engine
         .list_workflows(&ListFilter {
             workflow_ids: vec![id.clone()],
@@ -1744,6 +1746,8 @@ async fn pg_export_import_round_trip() -> Result<()> {
     // Importing again fails: import never overwrites an existing workflow.
     assert!(engine.import_workflow(&exported).await.is_err());
 
-    engine.delete_workflows(std::slice::from_ref(&id), false).await?;
+    engine
+        .delete_workflows(std::slice::from_ref(&id), false)
+        .await?;
     Ok(())
 }
