@@ -1,15 +1,16 @@
 use crate::error::{Error, Result};
 use crate::provider::{
-    is_terminal, DequeueRequest, ListFilter, NotificationInfo, StateProvider, StepAggregate,
-    StepAggregateQuery, StepInfo, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery,
-    WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
-    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
+    col_i64, col_str, decode_roles, encode_roles, is_terminal, DequeueRequest, ExportedWorkflow,
+    ListFilter, NotificationInfo, StateProvider, StepAggregate, StepAggregateQuery, StepInfo,
+    VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED,
+    STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED,
+    STATUS_PENDING, STATUS_SUCCESS, STREAM_CLOSED_SENTINEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::tx::TxBody;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use tokio::sync::Mutex;
 
@@ -1068,4 +1069,279 @@ impl StateProvider for InMemoryProvider {
             None => Ok(false),
         }
     }
+
+    async fn export_workflow(
+        &self,
+        workflow_id: &str,
+        export_children: bool,
+    ) -> Result<Vec<ExportedWorkflow>> {
+        let g = self.inner.lock().await;
+
+        // Root first, then transitive children discovered through parent_workflow_id.
+        let mut ids = vec![workflow_id.to_string()];
+        if export_children {
+            let mut queue = vec![workflow_id.to_string()];
+            while let Some(parent) = queue.pop() {
+                let mut children: Vec<String> = g
+                    .workflows
+                    .values()
+                    .filter(|w| w.parent_workflow_id.as_deref() == Some(parent.as_str()))
+                    .map(|w| w.id.clone())
+                    .collect();
+                children.sort();
+                for c in children {
+                    ids.push(c.clone());
+                    queue.push(c);
+                }
+            }
+        }
+
+        let mut exported = Vec::with_capacity(ids.len());
+        for id in &ids {
+            let Some(w) = g.workflows.get(id) else {
+                return Err(Error::nonexistent_workflow(id));
+            };
+
+            let mut ops: Vec<(i32, &StepRow)> = g
+                .steps
+                .iter()
+                .filter(|((wid, _), _)| wid == id)
+                .map(|((_, seq), r)| (*seq, r))
+                .collect();
+            ops.sort_by_key(|(seq, _)| *seq);
+            let operation_outputs = ops
+                .iter()
+                .map(|(seq, r)| step_to_map(id, *seq, r))
+                .collect();
+
+            let mut evs: Vec<(&String, &Value)> = g
+                .events
+                .iter()
+                .filter(|((wid, _), _)| wid == id)
+                .map(|((_, k), v)| (k, v))
+                .collect();
+            evs.sort_by(|a, b| a.0.cmp(b.0));
+            let workflow_events = evs.iter().map(|(k, v)| event_to_map(id, k, v)).collect();
+
+            let mut strms: Vec<(&String, &Vec<Option<Value>>)> = g
+                .streams
+                .iter()
+                .filter(|((wid, _), _)| wid == id)
+                .map(|((_, k), vs)| (k, vs))
+                .collect();
+            strms.sort_by(|a, b| a.0.cmp(b.0));
+            let mut streams = Vec::new();
+            for (key, entries) in strms {
+                for (offset, entry) in entries.iter().enumerate() {
+                    streams.push(stream_to_map(id, key, offset as i64, entry));
+                }
+            }
+
+            exported.push(ExportedWorkflow {
+                workflow_status: status_to_map(w),
+                operation_outputs,
+                workflow_events,
+                // No events-history table in the in-memory backend.
+                workflow_events_history: Vec::new(),
+                streams,
+            });
+        }
+        Ok(exported)
+    }
+
+    async fn import_workflow(&self, workflows: &[ExportedWorkflow]) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        // Validate up front so the whole import is all-or-nothing (the lock is
+        // held throughout): importing never overwrites an existing workflow.
+        for wf in workflows {
+            if let Some(id) = col_str(&wf.workflow_status, "workflow_uuid") {
+                if g.workflows.contains_key(&id) {
+                    return Err(Error::app(format!("workflow {id} already exists")));
+                }
+            }
+        }
+        for wf in workflows {
+            let id = col_str(&wf.workflow_status, "workflow_uuid").unwrap_or_default();
+            g.workflows
+                .insert(id.clone(), map_to_status(&wf.workflow_status));
+
+            for op in &wf.operation_outputs {
+                let seq = col_i64(op, "function_id").unwrap_or(0) as i32;
+                g.steps.insert(
+                    (id.clone(), seq),
+                    StepRow {
+                        name: col_str(op, "function_name").unwrap_or_default(),
+                        output: col_str(op, "output").and_then(|v| serde_json::from_str(&v).ok()),
+                        child_workflow_id: col_str(op, "child_workflow_id"),
+                        started_at_ms: col_i64(op, "started_at_epoch_ms"),
+                        completed_at_ms: col_i64(op, "completed_at_epoch_ms"),
+                    },
+                );
+            }
+
+            for ev in &wf.workflow_events {
+                let key = col_str(ev, "key").unwrap_or_default();
+                let value = col_str(ev, "value")
+                    .and_then(|v| serde_json::from_str(&v).ok())
+                    .unwrap_or(Value::Null);
+                g.events.insert((id.clone(), key), value);
+            }
+
+            // Reassemble each stream's offset-indexed buffer (`None` == close sentinel).
+            let mut by_key: HashMap<String, Vec<(usize, Option<Value>)>> = HashMap::new();
+            for st in &wf.streams {
+                let key = col_str(st, "key").unwrap_or_default();
+                let offset = col_i64(st, "offset").unwrap_or(0) as usize;
+                let entry = match col_str(st, "value") {
+                    Some(v) if v == STREAM_CLOSED_SENTINEL => None,
+                    Some(v) => serde_json::from_str(&v).ok(),
+                    None => None,
+                };
+                by_key.entry(key).or_default().push((offset, entry));
+            }
+            for (key, rows) in by_key {
+                let len = rows.iter().map(|(o, _)| *o + 1).max().unwrap_or(0);
+                let mut buf = vec![None; len];
+                for (offset, entry) in rows {
+                    buf[offset] = entry;
+                }
+                g.streams.insert((id.clone(), key), buf);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Epoch-millis (or now if absent) → `DateTime<Utc>`.
+fn ms_to_dt(ms: Option<i64>) -> DateTime<Utc> {
+    ms.and_then(DateTime::from_timestamp_millis)
+        .unwrap_or_else(Utc::now)
+}
+
+/// A stored payload rendered as the portable JSON string a SQL backend keeps in
+/// its `inputs`/`output`/`value` TEXT column. A JSON `null` *value* becomes the
+/// string `"null"` — it is a present payload, not an absent column, which is what
+/// the SQL backends store. Absence is a `null` column instead, which callers
+/// produce directly (e.g. a `None` output → `Value::Null`).
+fn payload_str(v: &Value) -> Value {
+    json!(v.to_string())
+}
+
+/// A [`WorkflowStatus`] as a portable `workflow_status` row. Columns this backend
+/// does not track (`application_id`/`class_name`/`config_name`/`serialization`)
+/// are emitted as null.
+fn status_to_map(w: &WorkflowStatus) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("workflow_uuid".into(), json!(w.id));
+    m.insert("status".into(), json!(w.status));
+    m.insert("name".into(), json!(w.name));
+    m.insert("authenticated_user".into(), json!(w.authenticated_user));
+    m.insert("assumed_role".into(), json!(w.assumed_role));
+    m.insert(
+        "authenticated_roles".into(),
+        json!(encode_roles(&w.authenticated_roles)),
+    );
+    m.insert(
+        "output".into(),
+        w.output.as_ref().map_or(Value::Null, payload_str),
+    );
+    m.insert("error".into(), json!(w.error));
+    m.insert("executor_id".into(), json!(w.executor_id));
+    m.insert("created_at".into(), json!(w.created_at.timestamp_millis()));
+    m.insert("updated_at".into(), json!(w.updated_at.timestamp_millis()));
+    m.insert("application_version".into(), json!(w.app_version));
+    m.insert("application_id".into(), Value::Null);
+    m.insert("class_name".into(), Value::Null);
+    m.insert("config_name".into(), Value::Null);
+    m.insert("recovery_attempts".into(), json!(w.recovery_attempts));
+    m.insert("queue_name".into(), json!(w.queue_name));
+    m.insert("workflow_timeout_ms".into(), json!(w.timeout_ms));
+    m.insert("workflow_deadline_epoch_ms".into(), json!(w.deadline_ms));
+    m.insert("started_at_epoch_ms".into(), json!(w.started_at_ms));
+    m.insert("deduplication_id".into(), json!(w.dedup_id));
+    m.insert("inputs".into(), payload_str(&w.input));
+    m.insert("priority".into(), json!(w.priority));
+    m.insert("queue_partition_key".into(), json!(w.queue_partition_key));
+    m.insert("forked_from".into(), json!(w.forked_from));
+    m.insert("parent_workflow_id".into(), json!(w.parent_workflow_id));
+    m.insert("delay_until_epoch_ms".into(), json!(w.delay_until_ms));
+    m.insert("serialization".into(), Value::Null);
+    m
+}
+
+/// Rebuild a [`WorkflowStatus`] from a portable `workflow_status` row.
+fn map_to_status(s: &Map<String, Value>) -> WorkflowStatus {
+    WorkflowStatus {
+        id: col_str(s, "workflow_uuid").unwrap_or_default(),
+        name: col_str(s, "name").unwrap_or_default(),
+        status: col_str(s, "status").unwrap_or_default(),
+        input: col_str(s, "inputs")
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or(Value::Null),
+        output: col_str(s, "output").and_then(|v| serde_json::from_str(&v).ok()),
+        error: col_str(s, "error"),
+        executor_id: col_str(s, "executor_id").unwrap_or_default(),
+        app_version: col_str(s, "application_version").unwrap_or_default(),
+        queue_name: col_str(s, "queue_name"),
+        queue_partition_key: col_str(s, "queue_partition_key"),
+        priority: col_i64(s, "priority").unwrap_or(0) as i32,
+        dedup_id: col_str(s, "deduplication_id"),
+        recovery_attempts: col_i64(s, "recovery_attempts").unwrap_or(0) as i32,
+        parent_workflow_id: col_str(s, "parent_workflow_id"),
+        timeout_ms: col_i64(s, "workflow_timeout_ms"),
+        deadline_ms: col_i64(s, "workflow_deadline_epoch_ms"),
+        started_at_ms: col_i64(s, "started_at_epoch_ms"),
+        rate_limited: false,
+        delay_until_ms: col_i64(s, "delay_until_epoch_ms"),
+        completed_at_ms: None,
+        forked_from: col_str(s, "forked_from"),
+        authenticated_user: col_str(s, "authenticated_user"),
+        assumed_role: col_str(s, "assumed_role"),
+        authenticated_roles: decode_roles(col_str(s, "authenticated_roles").as_deref()),
+        created_at: ms_to_dt(col_i64(s, "created_at")),
+        updated_at: ms_to_dt(col_i64(s, "updated_at")),
+    }
+}
+
+/// An `operation_outputs` row in portable form. The in-memory backend records no
+/// step error, so `error` is always null.
+fn step_to_map(wf_id: &str, seq: i32, r: &StepRow) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("workflow_uuid".into(), json!(wf_id));
+    m.insert("function_id".into(), json!(seq));
+    m.insert("function_name".into(), json!(r.name));
+    m.insert(
+        "output".into(),
+        r.output.as_ref().map_or(Value::Null, payload_str),
+    );
+    m.insert("error".into(), Value::Null);
+    m.insert("child_workflow_id".into(), json!(r.child_workflow_id));
+    m.insert("started_at_epoch_ms".into(), json!(r.started_at_ms));
+    m.insert("completed_at_epoch_ms".into(), json!(r.completed_at_ms));
+    m
+}
+
+/// A `workflow_events` row in portable form.
+fn event_to_map(wf_id: &str, key: &str, value: &Value) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("workflow_uuid".into(), json!(wf_id));
+    m.insert("key".into(), json!(key));
+    m.insert("value".into(), payload_str(value));
+    m
+}
+
+/// A `streams` row in portable form (`offset` is the entry index; a `None` entry
+/// is the close sentinel). The in-memory backend does not track `function_id`.
+fn stream_to_map(wf_id: &str, key: &str, offset: i64, entry: &Option<Value>) -> Map<String, Value> {
+    let value = match entry {
+        Some(v) => payload_str(v),
+        None => json!(STREAM_CLOSED_SENTINEL),
+    };
+    let mut m = Map::new();
+    m.insert("workflow_uuid".into(), json!(wf_id));
+    m.insert("key".into(), json!(key));
+    m.insert("value".into(), value);
+    m.insert("offset".into(), json!(offset));
+    m.insert("function_id".into(), Value::Null);
+    m
 }

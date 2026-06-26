@@ -1,18 +1,18 @@
 use crate::error::{Error, Result};
 use crate::provider::{
-    decode_roles, dedup_or, encode_roles, group_stream_rows, is_terminal, nonexistent_or,
-    DequeueRequest, ListFilter, NotificationInfo, StateProvider, StepAggregate, StepAggregateQuery,
-    StepInfo, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
-    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
-    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
-    STREAM_CLOSED_SENTINEL,
+    col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows, is_terminal,
+    nonexistent_or, DequeueRequest, ExportedWorkflow, ListFilter, NotificationInfo, StateProvider,
+    StepAggregate, StepAggregateQuery, StepInfo, VersionInfo, WorkflowAggregate,
+    WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_STR_COLS, STATUS_CANCELLED,
+    STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED,
+    STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
 use crate::tx::{IsolationLevel, TransactionOptions, Tx, TxBody};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use sqlx::postgres::{PgPool, PgPoolOptions, Postgres};
 use sqlx::{QueryBuilder, Row};
 use std::collections::BTreeMap;
@@ -1368,6 +1368,286 @@ impl StateProvider for PostgresProvider {
         .await?;
         Ok(res.rows_affected() > 0)
     }
+
+    async fn export_workflow(
+        &self,
+        workflow_id: &str,
+        export_children: bool,
+    ) -> Result<Vec<ExportedWorkflow>> {
+        let mut tx = self.pool.begin().await?;
+
+        // Root first, then transitive children discovered through parent_workflow_id.
+        let mut ids = vec![workflow_id.to_string()];
+        if export_children {
+            let mut queue = vec![workflow_id.to_string()];
+            while let Some(parent) = queue.pop() {
+                let children: Vec<(String,)> = sqlx::query_as(
+                    "SELECT workflow_uuid FROM workflow_status \
+                     WHERE parent_workflow_id = $1 ORDER BY workflow_uuid ASC",
+                )
+                .bind(&parent)
+                .fetch_all(&mut *tx)
+                .await?;
+                for (id,) in children {
+                    ids.push(id.clone());
+                    queue.push(id);
+                }
+            }
+        }
+
+        let mut exported = Vec::with_capacity(ids.len());
+        for id in &ids {
+            let status_row = sqlx::query("SELECT * FROM workflow_status WHERE workflow_uuid = $1")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            let Some(status_row) = status_row else {
+                return Err(Error::nonexistent_workflow(id));
+            };
+            let workflow_status = export_status_map(&status_row);
+
+            let op_rows = sqlx::query(
+                "SELECT * FROM operation_outputs WHERE workflow_uuid = $1 ORDER BY function_id ASC",
+            )
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+            let operation_outputs = op_rows.iter().map(export_op_map).collect();
+
+            let event_rows = sqlx::query(
+                "SELECT * FROM workflow_events WHERE workflow_uuid = $1 ORDER BY key ASC",
+            )
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+            let workflow_events = event_rows.iter().map(export_event_map).collect();
+
+            let history_rows = sqlx::query(
+                "SELECT * FROM workflow_events_history WHERE workflow_uuid = $1 \
+                 ORDER BY function_id ASC, key ASC",
+            )
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+            let workflow_events_history = history_rows.iter().map(export_history_map).collect();
+
+            let stream_rows = sqlx::query(
+                "SELECT * FROM streams WHERE workflow_uuid = $1 ORDER BY key ASC, \"offset\" ASC",
+            )
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+            let streams = stream_rows.iter().map(export_stream_map).collect();
+
+            exported.push(ExportedWorkflow {
+                workflow_status,
+                operation_outputs,
+                workflow_events,
+                workflow_events_history,
+                streams,
+            });
+        }
+
+        tx.commit().await?;
+        Ok(exported)
+    }
+
+    async fn import_workflow(&self, workflows: &[ExportedWorkflow]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for wf in workflows {
+            let s = &wf.workflow_status;
+            sqlx::query(
+                "INSERT INTO workflow_status
+                     (workflow_uuid, status, name, authenticated_user, assumed_role,
+                      authenticated_roles, output, error, executor_id, created_at, updated_at,
+                      application_version, application_id, class_name, config_name,
+                      recovery_attempts, queue_name, workflow_timeout_ms,
+                      workflow_deadline_epoch_ms, started_at_epoch_ms, deduplication_id, inputs,
+                      priority, queue_partition_key, forked_from, parent_workflow_id,
+                      delay_until_epoch_ms, serialization, was_forked_from)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                         $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)",
+            )
+            .bind(col_str(s, "workflow_uuid"))
+            .bind(col_str(s, "status"))
+            .bind(col_str(s, "name"))
+            .bind(col_str(s, "authenticated_user"))
+            .bind(col_str(s, "assumed_role"))
+            .bind(col_str(s, "authenticated_roles"))
+            .bind(col_str(s, "output"))
+            .bind(col_str(s, "error"))
+            .bind(col_str(s, "executor_id"))
+            .bind(col_i64(s, "created_at"))
+            .bind(col_i64(s, "updated_at"))
+            .bind(col_str(s, "application_version"))
+            .bind(col_str(s, "application_id"))
+            .bind(col_str(s, "class_name"))
+            .bind(col_str(s, "config_name"))
+            .bind(col_i64(s, "recovery_attempts"))
+            .bind(col_str(s, "queue_name"))
+            .bind(col_i64(s, "workflow_timeout_ms"))
+            .bind(col_i64(s, "workflow_deadline_epoch_ms"))
+            .bind(col_i64(s, "started_at_epoch_ms"))
+            .bind(col_str(s, "deduplication_id"))
+            .bind(col_str(s, "inputs"))
+            .bind(col_i32(s, "priority"))
+            .bind(col_str(s, "queue_partition_key"))
+            .bind(col_str(s, "forked_from"))
+            .bind(col_str(s, "parent_workflow_id"))
+            .bind(col_i64(s, "delay_until_epoch_ms"))
+            .bind(col_str(s, "serialization"))
+            .bind(col_str(s, "forked_from").is_some())
+            .execute(&mut *tx)
+            .await?;
+
+            for op in &wf.operation_outputs {
+                sqlx::query(
+                    "INSERT INTO operation_outputs
+                         (workflow_uuid, function_id, function_name, output, error,
+                          child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                )
+                .bind(col_str(op, "workflow_uuid"))
+                .bind(col_i32(op, "function_id"))
+                .bind(col_str(op, "function_name"))
+                .bind(col_str(op, "output"))
+                .bind(col_str(op, "error"))
+                .bind(col_str(op, "child_workflow_id"))
+                .bind(col_i64(op, "started_at_epoch_ms"))
+                .bind(col_i64(op, "completed_at_epoch_ms"))
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            for ev in &wf.workflow_events {
+                sqlx::query(
+                    "INSERT INTO workflow_events (workflow_uuid, key, value) VALUES ($1, $2, $3)",
+                )
+                .bind(col_str(ev, "workflow_uuid"))
+                .bind(col_str(ev, "key"))
+                .bind(col_str(ev, "value"))
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            for h in &wf.workflow_events_history {
+                sqlx::query(
+                    "INSERT INTO workflow_events_history (workflow_uuid, function_id, key, value)
+                     VALUES ($1, $2, $3, $4)",
+                )
+                .bind(col_str(h, "workflow_uuid"))
+                .bind(col_i32(h, "function_id"))
+                .bind(col_str(h, "key"))
+                .bind(col_str(h, "value"))
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            for st in &wf.streams {
+                sqlx::query(
+                    "INSERT INTO streams (workflow_uuid, key, value, \"offset\", function_id)
+                     VALUES ($1, $2, $3, $4, $5)",
+                )
+                .bind(col_str(st, "workflow_uuid"))
+                .bind(col_str(st, "key"))
+                .bind(col_str(st, "value"))
+                .bind(col_i32(st, "offset"))
+                .bind(col_i32(st, "function_id"))
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+/// An exported column read as an `i32` (Postgres `INTEGER`), matching the
+/// narrower columns (`priority`, `function_id`, `offset`).
+fn col_i32(m: &Map<String, Value>, key: &str) -> Option<i32> {
+    col_i64(m, key).map(|v| v as i32)
+}
+
+/// A `String` column of a Postgres row as a JSON value (`null` when SQL NULL).
+fn s_col(row: &sqlx::postgres::PgRow, key: &str) -> Value {
+    json!(row.try_get::<Option<String>, _>(key).ok().flatten())
+}
+
+/// A `BIGINT` column of a Postgres row as a JSON value (`null` when SQL NULL).
+fn i64_col(row: &sqlx::postgres::PgRow, key: &str) -> Value {
+    json!(row.try_get::<Option<i64>, _>(key).ok().flatten())
+}
+
+/// An `INTEGER` column of a Postgres row as a JSON value (`null` when SQL NULL).
+fn i32_col(row: &sqlx::postgres::PgRow, key: &str) -> Value {
+    json!(row.try_get::<Option<i32>, _>(key).ok().flatten())
+}
+
+fn export_status_map(row: &sqlx::postgres::PgRow) -> Map<String, Value> {
+    let mut m = Map::new();
+    for &c in EXPORT_STATUS_STR_COLS {
+        m.insert(c.to_string(), s_col(row, c));
+    }
+    // All exported status integers are BIGINT except `priority` (INTEGER).
+    for &c in &[
+        "created_at",
+        "updated_at",
+        "recovery_attempts",
+        "workflow_timeout_ms",
+        "workflow_deadline_epoch_ms",
+        "started_at_epoch_ms",
+        "delay_until_epoch_ms",
+    ] {
+        m.insert(c.to_string(), i64_col(row, c));
+    }
+    m.insert("priority".to_string(), i32_col(row, "priority"));
+    m
+}
+
+fn export_op_map(row: &sqlx::postgres::PgRow) -> Map<String, Value> {
+    let mut m = Map::new();
+    for &c in &[
+        "workflow_uuid",
+        "function_name",
+        "output",
+        "error",
+        "child_workflow_id",
+    ] {
+        m.insert(c.to_string(), s_col(row, c));
+    }
+    m.insert("function_id".to_string(), i32_col(row, "function_id"));
+    for &c in &["started_at_epoch_ms", "completed_at_epoch_ms"] {
+        m.insert(c.to_string(), i64_col(row, c));
+    }
+    m
+}
+
+fn export_event_map(row: &sqlx::postgres::PgRow) -> Map<String, Value> {
+    let mut m = Map::new();
+    for &c in &["workflow_uuid", "key", "value"] {
+        m.insert(c.to_string(), s_col(row, c));
+    }
+    m
+}
+
+fn export_history_map(row: &sqlx::postgres::PgRow) -> Map<String, Value> {
+    let mut m = Map::new();
+    for &c in &["workflow_uuid", "key", "value"] {
+        m.insert(c.to_string(), s_col(row, c));
+    }
+    m.insert("function_id".to_string(), i32_col(row, "function_id"));
+    m
+}
+
+fn export_stream_map(row: &sqlx::postgres::PgRow) -> Map<String, Value> {
+    let mut m = Map::new();
+    for &c in &["workflow_uuid", "key", "value"] {
+        m.insert(c.to_string(), s_col(row, c));
+    }
+    for &c in &["offset", "function_id"] {
+        m.insert(c.to_string(), i32_col(row, c));
+    }
+    m
 }
 
 fn row_to_version(row: &sqlx::postgres::PgRow) -> VersionInfo {

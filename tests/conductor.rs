@@ -639,6 +639,135 @@ async fn conductor_handles_metrics_and_retention() -> Result<()> {
     Ok(())
 }
 
+/// export_workflow ships a workflow's durable state as a gzipped/base64 payload;
+/// import_workflow restores it. The round trip goes entirely over the conductor
+/// link: export, delete via the link, then re-import and verify the state is back.
+#[tokio::test]
+async fn conductor_exports_and_imports_workflow() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+
+        let exported = exchange(
+            &mut ws,
+            json!({"type":"export_workflow","request_id":"ex","workflow_id":"p-1"}),
+        )
+        .await;
+        // Delete the workflow over the link so import has to recreate it.
+        let deleted = exchange(
+            &mut ws,
+            json!({"type":"delete","request_id":"del","workflow_id":"p-1"}),
+        )
+        .await;
+        let serialized = exported["serialized_workflow"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let imported = exchange(
+            &mut ws,
+            json!({"type":"import_workflow","request_id":"imp",
+                   "serialized_workflow": serialized}),
+        )
+        .await;
+        // A missing workflow reports an error and ships no payload.
+        let missing = exchange(
+            &mut ws,
+            json!({"type":"export_workflow","request_id":"miss","workflow_id":"ghost"}),
+        )
+        .await;
+        // A malformed payload fails cleanly with success=false.
+        let bad = exchange(
+            &mut ws,
+            json!({"type":"import_workflow","request_id":"bad",
+                   "serialized_workflow":"not valid base64!!"}),
+        )
+        .await;
+        (exported, deleted, imported, missing, bad)
+    });
+
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("producer", |ctx: DurableContext, n: i64| async move {
+        let doubled = ctx
+            .step("double", || async { Ok::<_, Error>(n * 2) })
+            .await?;
+        ctx.set_event("status", "done").await?;
+        ctx.write_stream("log", "line1").await?;
+        ctx.write_stream("log", "line2").await?;
+        ctx.close_stream("log").await?;
+        Ok::<_, Error>(doubled)
+    });
+    let engine = Arc::new(engine);
+    engine.launch().await?;
+    engine
+        .run_workflow::<_, i64>("producer", 21_i64, WorkflowOptions::with_id("p-1"))
+        .await?
+        .get_result()
+        .await?;
+
+    let conductor = Conductor::start(
+        engine.clone(),
+        ConductorConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            api_key: "k".into(),
+            app_name: "app".into(),
+            executor_metadata: None,
+            alert_handler: None,
+        },
+    )?;
+
+    let (exported, deleted, imported, missing, bad) = server.await.unwrap();
+
+    // export -> a non-empty serialized payload, no error.
+    assert_eq!(exported["type"], "export_workflow");
+    assert!(exported.get("error_message").is_none());
+    assert!(!exported["serialized_workflow"].as_str().unwrap().is_empty());
+
+    assert_eq!(deleted["success"], true);
+    assert_eq!(imported["type"], "import_workflow");
+    assert_eq!(imported["success"], true);
+    assert!(imported.get("error_message").is_none());
+
+    // export of an unknown workflow -> error, no payload.
+    assert!(missing["error_message"].is_string());
+    assert!(missing.get("serialized_workflow").is_none());
+
+    // import of a malformed payload -> failure with a base64 error.
+    assert_eq!(bad["success"], false);
+    assert!(bad["error_message"].as_str().unwrap().contains("base64"));
+
+    // The re-imported workflow's durable state is intact.
+    let rows = engine
+        .list_workflows(&durust::ListFilter {
+            workflow_ids: vec!["p-1".to_string()],
+            load_output: true,
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, durust::STATUS_SUCCESS);
+    assert_eq!(rows[0].output, Some(json!(42)));
+
+    let steps = engine.get_workflow_steps("p-1").await?;
+    let double = steps.iter().find(|s| s.name == "double").expect("step");
+    assert_eq!(double.output, Some(json!(42)));
+
+    let events = engine.list_workflow_events("p-1").await?;
+    assert_eq!(events, vec![("status".to_string(), json!("done"))]);
+
+    let streams = engine.list_workflow_streams("p-1").await?;
+    assert_eq!(
+        streams,
+        vec![("log".to_string(), vec![json!("line1"), json!("line2")])]
+    );
+
+    conductor.shutdown(Duration::from_secs(2)).await?;
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn conductor_handles_alert() -> Result<()> {
     use std::sync::Mutex;

@@ -3,7 +3,8 @@ use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::tx::{TransactionOptions, TxBody};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 /// Map a `workflow_status` insert failure to a typed deduplication error when it
 /// is a unique-constraint violation — the queue-scoped dedup index. A primary
@@ -479,6 +480,89 @@ pub struct VersionInfo {
     pub created_at: DateTime<Utc>,
 }
 
+/// One workflow's full durable state in a portable, backend-agnostic form: the
+/// `workflow_status` row plus every dependent `operation_outputs`,
+/// `workflow_events`, `workflow_events_history`, and `streams` row, each kept as
+/// a column-keyed JSON object. Produced by [`StateProvider::export_workflow`] and
+/// consumed by [`StateProvider::import_workflow`]; the conductor ships it between
+/// environments as gzipped, base64-encoded JSON. The keys match the other DBOS
+/// SDKs' portable schema, so a workflow exported by one can be imported by
+/// another.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ExportedWorkflow {
+    #[serde(default)]
+    pub workflow_status: Map<String, Value>,
+    #[serde(default, deserialize_with = "null_seq")]
+    pub operation_outputs: Vec<Map<String, Value>>,
+    #[serde(default, deserialize_with = "null_seq")]
+    pub workflow_events: Vec<Map<String, Value>>,
+    #[serde(default, deserialize_with = "null_seq")]
+    pub workflow_events_history: Vec<Map<String, Value>>,
+    #[serde(default, deserialize_with = "null_seq")]
+    pub streams: Vec<Map<String, Value>>,
+}
+
+/// Deserialize a JSON array that the producer may have rendered as `null` (some
+/// SDKs marshal an empty list as null rather than `[]`) into an empty `Vec`.
+fn null_seq<'de, D, T>(d: D) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(d)?.unwrap_or_default())
+}
+
+/// The text columns carried in an exported `workflow_status` row — the cross-SDK
+/// portable set. String and integer columns are listed separately so each is read
+/// (and re-bound) with the right type. Together with [`EXPORT_STATUS_INT_COLS`]
+/// these are exactly the columns the other SDKs export.
+pub(crate) const EXPORT_STATUS_STR_COLS: &[&str] = &[
+    "workflow_uuid",
+    "status",
+    "name",
+    "authenticated_user",
+    "assumed_role",
+    "authenticated_roles",
+    "output",
+    "error",
+    "executor_id",
+    "application_version",
+    "application_id",
+    "class_name",
+    "config_name",
+    "queue_name",
+    "deduplication_id",
+    "inputs",
+    "queue_partition_key",
+    "forked_from",
+    "parent_workflow_id",
+    "serialization",
+];
+/// The integer columns of an exported `workflow_status` row (see
+/// [`EXPORT_STATUS_STR_COLS`]).
+pub(crate) const EXPORT_STATUS_INT_COLS: &[&str] = &[
+    "created_at",
+    "updated_at",
+    "recovery_attempts",
+    "workflow_timeout_ms",
+    "workflow_deadline_epoch_ms",
+    "started_at_epoch_ms",
+    "priority",
+    "delay_until_epoch_ms",
+];
+
+/// A column's value pulled from an exported row as an owned `String` (`None` for
+/// JSON null or a missing/non-string key). Shared by the SQL providers' import.
+pub(crate) fn col_str(m: &Map<String, Value>, key: &str) -> Option<String> {
+    m.get(key).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+/// A column's value pulled from an exported row as an `i64` (`None` for JSON null
+/// or a missing/non-integer key). Shared by the SQL providers' import.
+pub(crate) fn col_i64(m: &Map<String, Value>, key: &str) -> Option<i64> {
+    m.get(key).and_then(Value::as_i64)
+}
+
 /// Parameters for one dequeue iteration, computed by the engine's dispatcher
 /// from a [`crate::WorkflowQueue`]'s configuration. Plain scalars so the storage
 /// layer stays decoupled from the queue type.
@@ -828,6 +912,22 @@ pub trait StateProvider: Send + Sync {
     /// Mark a version as latest by bumping its `version_timestamp` to now.
     /// Returns whether a row matched (no-op if the name is unknown).
     async fn set_latest_application_version(&self, version_name: &str) -> Result<bool>;
+
+    /// Export a workflow and (when `export_children`) all of its transitive
+    /// children into the portable [`ExportedWorkflow`] form. The root workflow is
+    /// first in the returned list, followed by descendants discovered through
+    /// `parent_workflow_id`. Errors if the root workflow does not exist.
+    async fn export_workflow(
+        &self,
+        workflow_id: &str,
+        export_children: bool,
+    ) -> Result<Vec<ExportedWorkflow>>;
+
+    /// Import previously [`export_workflow`](Self::export_workflow)ed workflows,
+    /// re-inserting each one's `workflow_status` row and dependent rows. Atomic:
+    /// either every workflow is imported or none is. A workflow whose id already
+    /// exists is an error (import does not overwrite).
+    async fn import_workflow(&self, workflows: &[ExportedWorkflow]) -> Result<()>;
 }
 
 #[cfg(test)]

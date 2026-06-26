@@ -1670,3 +1670,84 @@ async fn pg_transaction_serializable_retries_on_conflict() -> Result<()> {
         .await?;
     Ok(())
 }
+
+/// export_workflow / import_workflow round-trip a workflow's full durable state
+/// (status, steps, events, streams) through Postgres after deletion.
+#[tokio::test]
+async fn pg_export_import_round_trip() -> Result<()> {
+    use durust::STATUS_SUCCESS;
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_export_import_round_trip: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let id = format!("wf-export-{tag}");
+
+    let mut engine = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
+    engine.register("expo", |ctx: DurableContext, n: i64| async move {
+        let doubled = ctx
+            .step("double", || async { Ok::<_, Error>(n * 2) })
+            .await?;
+        ctx.set_event("k", "v").await?;
+        ctx.write_stream("s", 1_i64).await?;
+        ctx.write_stream("s", 2_i64).await?;
+        ctx.close_stream("s").await?;
+        Ok::<_, Error>(doubled)
+    });
+
+    let out: i64 = engine
+        .run_workflow::<_, i64>("expo", 21_i64, WorkflowOptions::with_id(&id))
+        .await?
+        .get_result()
+        .await?;
+    assert_eq!(out, 42);
+
+    let exported = engine.export_workflow(&id, false).await?;
+    assert_eq!(exported.len(), 1);
+    engine
+        .delete_workflows(std::slice::from_ref(&id), false)
+        .await?;
+    assert!(engine
+        .list_workflows(&ListFilter {
+            workflow_ids: vec![id.clone()],
+            ..Default::default()
+        })
+        .await?
+        .is_empty());
+
+    engine.import_workflow(&exported).await?;
+    let rows = engine
+        .list_workflows(&ListFilter {
+            workflow_ids: vec![id.clone()],
+            load_output: true,
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, STATUS_SUCCESS);
+    assert_eq!(rows[0].output, Some(serde_json::json!(42)));
+
+    let steps = engine.get_workflow_steps(&id).await?;
+    let double = steps.iter().find(|s| s.name == "double").expect("step");
+    assert_eq!(double.output, Some(serde_json::json!(42)));
+
+    let events = engine.list_workflow_events(&id).await?;
+    assert_eq!(events, vec![("k".to_string(), serde_json::json!("v"))]);
+
+    let streams = engine.list_workflow_streams(&id).await?;
+    assert_eq!(
+        streams,
+        vec![(
+            "s".to_string(),
+            vec![serde_json::json!(1), serde_json::json!(2)]
+        )]
+    );
+
+    // Importing again fails: import never overwrites an existing workflow.
+    assert!(engine.import_workflow(&exported).await.is_err());
+
+    engine
+        .delete_workflows(std::slice::from_ref(&id), false)
+        .await?;
+    Ok(())
+}

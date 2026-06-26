@@ -16,10 +16,10 @@
 //! `get_workflow_aggregates`, `get_step_aggregates`), and the per-workflow
 //! observability reads (`get_workflow_events`, `get_workflow_notifications`,
 //! `get_workflow_streams`), and the ops messages (`get_metrics`, `retention`),
-//! and the `alert` message (delivered to an optional user-registered handler).
-//! Every other message type is answered with a well-formed "unknown message
-//! type" error until its handler lands, so the link stays healthy as coverage
-//! grows.
+//! the portable transfer messages (`export_workflow`, `import_workflow`), and the
+//! `alert` message (delivered to an optional user-registered handler). Every
+//! other message type is answered with a well-formed "unknown message type"
+//! error until its handler lands, so the link stays healthy as coverage grows.
 //!
 //! Opt-in, like the admin server:
 //! ```no_run
@@ -45,16 +45,22 @@
 use crate::engine::{DurableEngine, WorkflowOptions};
 use crate::error::{Error, Result};
 use crate::provider::{
-    ListFilter, StepAggregate, StepAggregateQuery, StepInfo, VersionInfo, WorkflowAggregate,
-    WorkflowAggregateQuery, WorkflowStatus, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_PENDING,
+    ExportedWorkflow, ListFilter, StepAggregate, StepAggregateQuery, StepInfo, VersionInfo,
+    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, STATUS_DELAYED, STATUS_ENQUEUED,
+    STATUS_PENDING,
 };
 use crate::queue::WorkflowQueue;
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, SecondsFormat, Utc};
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -354,6 +360,8 @@ async fn handle_message(
         "get_workflow_streams" => handle_get_streams(engine, ws, rid, text).await,
         "get_metrics" => handle_get_metrics(engine, ws, rid, text).await,
         "retention" => handle_retention(engine, ws, rid, text).await,
+        "export_workflow" => handle_export_workflow(engine, ws, rid, text).await,
+        "import_workflow" => handle_import_workflow(engine, ws, rid, text).await,
         "alert" => handle_alert(config, ws, rid, text).await,
         other => {
             tracing::warn!(msg_type = other, "unknown conductor message type");
@@ -1242,6 +1250,103 @@ async fn handle_retention(
     let mut resp = base_response("retention", rid, err.clone());
     resp.insert("success".into(), json!(err.is_none()));
     send(ws, resp).await
+}
+
+#[derive(Deserialize)]
+struct ExportWorkflowRequest {
+    #[serde(default)]
+    workflow_id: String,
+    #[serde(default)]
+    export_children: bool,
+}
+
+/// Export a workflow (and optionally its children) and reply with the portable
+/// payload as gzipped, base64-encoded JSON under `serialized_workflow` (omitted
+/// on failure). The encoding matches the other SDKs so the payload is portable.
+async fn handle_export_workflow(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+) -> Result<()> {
+    let req: ExportWorkflowRequest = serde_json::from_str(text)?;
+    let (serialized, err) = match engine
+        .export_workflow(&req.workflow_id, req.export_children)
+        .await
+    {
+        Ok(exported) => match encode_export(&exported) {
+            Ok(s) => (Some(s), None),
+            Err(e) => (
+                None,
+                Some(format!("failed to serialize exported workflow: {e}")),
+            ),
+        },
+        Err(e) => (
+            None,
+            Some(format!(
+                "Exception encountered when exporting workflow {}: {e}",
+                req.workflow_id
+            )),
+        ),
+    };
+    let mut resp = base_response("export_workflow", rid, err);
+    if let Some(s) = serialized {
+        resp.insert("serialized_workflow".into(), json!(s));
+    }
+    send(ws, resp).await
+}
+
+#[derive(Deserialize)]
+struct ImportWorkflowRequest {
+    #[serde(default)]
+    serialized_workflow: String,
+}
+
+/// Decode a `serialized_workflow` payload (base64 → gunzip → JSON) and import the
+/// workflows it carries, replying with `{success}`.
+async fn handle_import_workflow(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+) -> Result<()> {
+    let req: ImportWorkflowRequest = serde_json::from_str(text)?;
+    let err = match decode_export(&req.serialized_workflow) {
+        Ok(workflows) => engine
+            .import_workflow(&workflows)
+            .await
+            .err()
+            .map(|e| format!("Exception encountered when importing workflow: {e}")),
+        Err(e) => Some(e),
+    };
+    let mut resp = base_response("import_workflow", rid, err.clone());
+    resp.insert("success".into(), json!(err.is_none()));
+    send(ws, resp).await
+}
+
+/// Serialize exported workflows to the portable wire form: JSON → gzip → base64.
+fn encode_export(exported: &[ExportedWorkflow]) -> Result<String> {
+    let json = serde_json::to_vec(exported)?;
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    gz.write_all(&json)
+        .map_err(|e| Error::app(format!("failed to gzip exported workflow: {e}")))?;
+    let bytes = gz
+        .finish()
+        .map_err(|e| Error::app(format!("failed to finish gzip: {e}")))?;
+    Ok(STANDARD.encode(bytes))
+}
+
+/// Reverse [`encode_export`]: base64 → gunzip → JSON. Errors are returned as the
+/// conductor-facing message strings (mirroring each failure stage).
+fn decode_export(serialized: &str) -> std::result::Result<Vec<ExportedWorkflow>, String> {
+    let compressed = STANDARD
+        .decode(serialized)
+        .map_err(|e| format!("Failed to base64 decode serialized workflow: {e}"))?;
+    let mut json = Vec::new();
+    GzDecoder::new(&compressed[..])
+        .read_to_end(&mut json)
+        .map_err(|e| format!("Failed to decompress workflow data: {e}"))?;
+    serde_json::from_slice(&json).map_err(|e| format!("Failed to unmarshal workflow data: {e}"))
 }
 
 #[derive(Deserialize)]

@@ -1013,6 +1013,27 @@ impl DurableEngine {
         self.provider.list_workflow_streams(workflow_id).await
     }
 
+    /// Export a workflow (and, when `export_children`, its transitive children)
+    /// into the portable [`ExportedWorkflow`](crate::provider::ExportedWorkflow)
+    /// form for transfer to another environment.
+    pub async fn export_workflow(
+        &self,
+        workflow_id: &str,
+        export_children: bool,
+    ) -> Result<Vec<crate::provider::ExportedWorkflow>> {
+        self.provider
+            .export_workflow(workflow_id, export_children)
+            .await
+    }
+
+    /// Import previously exported workflows, re-creating each one's durable state.
+    pub async fn import_workflow(
+        &self,
+        workflows: &[crate::provider::ExportedWorkflow],
+    ) -> Result<()> {
+        self.provider.import_workflow(workflows).await
+    }
+
     /// Read the durable stream `key` produced by `workflow_id`, blocking until it
     /// is closed (a producer called [`close_stream`](crate::DurableContext::close_stream))
     /// or the producing workflow becomes inactive (no longer `PENDING`/`ENQUEUED`).
