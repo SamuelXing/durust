@@ -282,8 +282,10 @@ impl StateProvider for PostgresProvider {
             .await?;
         // Start the LISTEN/NOTIFY listener once (it powers await_change). Spawned
         // here so it only runs for a provider that has been brought up; cancelled
-        // when the provider is dropped.
-        if !self.listener_started.swap(true, Ordering::SeqCst) {
+        // when the provider is dropped. `Relaxed` suffices: this is purely a
+        // spawn-once guard — the task's inputs are moved in via `spawn` (which
+        // carries its own happens-before), so the flag publishes no other memory.
+        if !self.listener_started.swap(true, Ordering::Relaxed) {
             tokio::spawn(run_listener(
                 self.pool.clone(),
                 self.notify_hub.clone(),
