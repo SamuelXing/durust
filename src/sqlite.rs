@@ -89,7 +89,7 @@ fn row_to_status(row: &sqlx::sqlite::SqliteRow) -> WorkflowStatus {
             .flatten()
             .unwrap_or(Value::Null),
         output: serialize::decode_opt(fmt, output.as_deref()).ok().flatten(),
-        error: error.clone(),
+        error,
         error_info,
         executor_id: row.get("executor_id"),
         app_version: row.get("application_version"),

@@ -196,8 +196,8 @@ fn first_positional(value: Value) -> Value {
     }
 }
 
-/// Generic name stored for an error with no cross-language type — the name the
-/// other SDKs use when an untyped error is serialized in portable mode.
+/// Generic name stored for an error that carries no cross-language type, written
+/// when an untyped error is serialized in portable mode.
 pub const PORTABLE_ERROR_NAME: &str = "Portable Error";
 
 /// The cross-language workflow-**error** envelope: `{"name":…,"message":…,"code"?,"data"?}`.
@@ -205,10 +205,11 @@ pub const PORTABLE_ERROR_NAME: &str = "Portable Error";
 /// In [`Serializer::Portable`] mode a failed workflow's stored error is written
 /// in this shape so a DBOS app in another language can read it as a structured
 /// error — a type/class name, the human message, and optional `code`/`data` —
-/// rather than an opaque string. A Rust error carries no user-defined name, so it
-/// is stored under the generic [`PORTABLE_ERROR_NAME`] with its display text as
-/// `message`, matching the other SDKs' fallback for an untyped error. `code` and
-/// `data` are omitted when absent, so the byte form matches Go and Python.
+/// rather than an opaque string. A native error carries no user-defined name, so
+/// it is stored under the generic [`PORTABLE_ERROR_NAME`] with its display text as
+/// `message`, and `code`/`data` are omitted when absent. The envelope is read
+/// tolerantly: a value another SDK wrote — which may carry the concrete error
+/// type's name and its own `code`/`data` — still decodes here.
 ///
 /// This type is surfaced on [`crate::WorkflowStatus::error_info`] when reading a
 /// portable error written by any SDK.
