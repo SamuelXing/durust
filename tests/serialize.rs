@@ -3,7 +3,8 @@
 //! the basis for cross-language interop via `portable_json`.
 
 use durust::{
-    DurableContext, DurableEngine, Error, Result, Serializer, SqliteProvider, WorkflowOptions,
+    DurableContext, DurableEngine, Error, PortableWorkflowError, Result, Serializer,
+    SqliteProvider, WorkflowOptions,
 };
 use std::sync::Arc;
 
@@ -96,6 +97,69 @@ async fn portable_error_is_stored_as_envelope() -> Result<()> {
     assert_eq!(info.name, "Portable Error");
     assert_eq!(info.message, "kaboom");
     assert!(info.code.is_none() && info.data.is_none());
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// A workflow that raises a structured `Error::Portable` under portable mode
+/// stores its full type name + code + data, and a separate reader recovers them
+/// — both as the structured `error_info` and as a reconstructed `Error::Portable`
+/// from `get_result`, the cross-language structured-error round-trip.
+#[tokio::test]
+async fn portable_typed_error_round_trips() -> Result<()> {
+    let (url, path) = temp_db_url("err-typed");
+
+    // Writer: a workflow fails with a typed, cross-language error.
+    {
+        let provider = SqliteProvider::connect(&url)
+            .await?
+            .with_serializer(Serializer::Portable);
+        let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+        engine.register("validate", |_ctx: DurableContext, _: ()| async move {
+            Err::<(), _>(Error::Portable(PortableWorkflowError {
+                name: "ValidationError".to_string(),
+                message: "bad email".to_string(),
+                code: Some(serde_json::json!(400)),
+                data: Some(serde_json::json!({"field": "email"})),
+            }))
+        });
+        let outcome = engine
+            .run_workflow::<_, ()>("validate", (), WorkflowOptions::with_id("wf-typed"))
+            .await?
+            .get_result()
+            .await;
+        // The owning caller gets the typed error straight back.
+        assert!(matches!(outcome, Err(Error::Portable(ref pe)) if pe.name == "ValidationError"));
+    }
+
+    // Reader: a fresh engine recovers the structured error from storage.
+    {
+        let provider = SqliteProvider::connect(&url)
+            .await?
+            .with_serializer(Serializer::Portable);
+        let engine = DurableEngine::new(Arc::new(provider)).await?;
+        let handle = engine.retrieve_workflow::<()>("wf-typed").await?;
+
+        let status = handle.get_status().await?;
+        let info = status
+            .error_info
+            .expect("structured error survives storage");
+        assert_eq!(info.name, "ValidationError");
+        assert_eq!(info.code, Some(serde_json::json!(400)));
+        assert_eq!(info.data, Some(serde_json::json!({"field": "email"})));
+
+        // get_result reconstructs the typed error for the observer.
+        let mut handle = handle;
+        match handle.get_result().await {
+            Err(Error::Portable(pe)) => {
+                assert_eq!(pe.name, "ValidationError");
+                assert_eq!(pe.message, "bad email");
+                assert_eq!(pe.code, Some(serde_json::json!(400)));
+            }
+            other => panic!("expected a reconstructed portable error, got {other:?}"),
+        }
+    }
 
     let _ = std::fs::remove_file(path);
     Ok(())

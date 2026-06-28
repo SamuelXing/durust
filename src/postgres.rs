@@ -325,6 +325,10 @@ impl StateProvider for PostgresProvider {
         true
     }
 
+    fn serializer(&self) -> serialize::Serializer {
+        self.serializer
+    }
+
     async fn await_change(&self, wait: ChangeWait<'_>, within: Duration) {
         // Subscribe before awaiting so a NOTIFY arriving during the wait wakes us;
         // a NOTIFY in the gap before subscribing is covered by `within` (the
@@ -415,15 +419,10 @@ impl StateProvider for PostgresProvider {
         error: Option<&str>,
     ) -> Result<()> {
         let output_str = output.map(|v| self.serializer.encode(v)).transpose()?;
-        // A genuine error outcome is stored as the portable error envelope (in
-        // portable mode); cancellation/timeout reasons are passed bare.
-        let error_str = error.map(|e| {
-            if status == STATUS_ERROR {
-                serialize::encode_error(self.serializer, e)
-            } else {
-                e.to_string()
-            }
-        });
+        // The error column is stored verbatim: the engine has already encoded a
+        // failed workflow's error (as the portable envelope when portable), since
+        // only it sees the structured error type. Cancellation/timeout reasons
+        // arrive here as the plain strings their call sites pass.
         let now = Utc::now().timestamp_millis();
         let terminal = is_terminal(status);
         let completed = terminal.then_some(now);
@@ -445,7 +444,7 @@ impl StateProvider for PostgresProvider {
         .bind(id)
         .bind(status)
         .bind(output_str)
-        .bind(error_str)
+        .bind(error)
         .bind(completed)
         .bind(now)
         .bind(terminal)

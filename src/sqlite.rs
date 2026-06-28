@@ -128,6 +128,10 @@ impl StateProvider for SqliteProvider {
         Ok(())
     }
 
+    fn serializer(&self) -> serialize::Serializer {
+        self.serializer
+    }
+
     async fn insert_workflow_status(&self, s: WorkflowStatus) -> Result<WorkflowStatus> {
         sqlx::query(
             "INSERT INTO workflow_status
@@ -206,15 +210,10 @@ impl StateProvider for SqliteProvider {
         error: Option<&str>,
     ) -> Result<()> {
         let output_str = output.map(|v| self.serializer.encode(v)).transpose()?;
-        // A genuine error outcome is stored as the portable error envelope (in
-        // portable mode); cancellation/timeout reasons are passed bare.
-        let error_str = error.map(|e| {
-            if status == STATUS_ERROR {
-                serialize::encode_error(self.serializer, e)
-            } else {
-                e.to_string()
-            }
-        });
+        // The error column is stored verbatim: the engine has already encoded a
+        // failed workflow's error (as the portable envelope when portable), since
+        // only it sees the structured error type. Cancellation/timeout reasons
+        // arrive here as the plain strings their call sites pass.
         let now = Utc::now().timestamp_millis();
         let terminal = is_terminal(status);
         let completed = terminal.then_some(now);
@@ -235,7 +234,7 @@ impl StateProvider for SqliteProvider {
         )
         .bind(status)
         .bind(output_str)
-        .bind(error_str)
+        .bind(error)
         .bind(completed)
         .bind(terminal)
         .bind(now)

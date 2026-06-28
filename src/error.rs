@@ -1,3 +1,4 @@
+use crate::serialize::PortableWorkflowError;
 use thiserror::Error;
 
 /// A stable, programmatic classification of an [`Error`], returned by
@@ -81,12 +82,33 @@ pub enum Error {
     /// An error raised by user code inside a step or workflow.
     #[error("{0}")]
     App(String),
+
+    /// A structured, cross-language error raised by user code: a type/class
+    /// `name`, a human `message`, and optional app-level `code`/`data`. Under
+    /// portable serialization it is stored as the [`PortableWorkflowError`]
+    /// envelope so an observer in any language reads its structure; the display
+    /// form is the message (like the other SDKs' `Error()`). A workflow that
+    /// failed under portable mode is read back as this variant.
+    #[error("{}", .0.message)]
+    Portable(PortableWorkflowError),
 }
 
 impl Error {
     /// Construct an application-level error from anything string-like.
     pub fn app(msg: impl Into<String>) -> Self {
         Error::App(msg.into())
+    }
+
+    /// Construct a structured cross-language error with a type `name` and a
+    /// `message` (no `code`/`data`). Build [`Error::Portable`] directly to set
+    /// those — its [`PortableWorkflowError`] fields are public.
+    pub fn portable(name: impl Into<String>, message: impl Into<String>) -> Self {
+        Error::Portable(PortableWorkflowError {
+            name: name.into(),
+            message: message.into(),
+            code: None,
+            data: None,
+        })
     }
 
     /// Construct a [`Error::NonExistentWorkflow`] for the given workflow id.
@@ -114,7 +136,7 @@ impl Error {
             Error::QueueDeduplicated { .. } => ErrorCode::QueueDeduplicated,
             Error::Cancelled(_) => ErrorCode::WorkflowCancelled,
             Error::Timeout => ErrorCode::Timeout,
-            Error::App(_) => ErrorCode::Application,
+            Error::App(_) | Error::Portable(_) => ErrorCode::Application,
         }
     }
 
