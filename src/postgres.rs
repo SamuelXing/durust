@@ -108,6 +108,8 @@ pub struct PostgresProvider {
     /// row's recorded format, so this only sets what new rows are written as.
     serializer: Serializer,
     /// Wakes parked `recv`/`get_event` calls from the `LISTEN`/`NOTIFY` listener.
+    /// Note: the listener (started in `init`) holds one pool connection for its
+    /// lifetime, so the app effectively has `max_connections - 1` available.
     notify_hub: Arc<NotifyHub>,
     /// Cancels the background listener task when the provider is dropped.
     listener_token: CancellationToken,
@@ -119,6 +121,8 @@ impl PostgresProvider {
     /// Connect to Postgres using a standard connection URL, e.g.
     /// `postgres://user:pass@localhost:5432/durust`.
     pub async fn connect(database_url: &str) -> Result<Self> {
+        // One of these is held by the LISTEN/NOTIFY listener for its lifetime
+        // (see `notify_hub`), leaving the rest for workflow/app queries.
         let pool = PgPoolOptions::new()
             .max_connections(8)
             .connect(database_url)
@@ -152,12 +156,18 @@ impl Drop for PostgresProvider {
     }
 }
 
+/// Initial (and post-recovery) delay between failed listener (re)connect/recv
+/// attempts; doubles up to [`LISTENER_BACKOFF_MAX`].
+const LISTENER_BACKOFF_MIN: Duration = Duration::from_millis(100);
+/// Ceiling on the listener reconnect backoff.
+const LISTENER_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
 /// Background task: hold a dedicated connection `LISTEN`ing on the notification
 /// and event channels, and wake the matching waiters as notifications arrive.
 /// Reconnects on failure (waking all waiters to re-poll, in case one was missed),
 /// and exits when `token` is cancelled (provider dropped).
 async fn run_listener(pool: PgPool, hub: Arc<NotifyHub>, token: CancellationToken) {
-    let mut backoff = Duration::from_millis(100);
+    let mut backoff = LISTENER_BACKOFF_MIN;
     loop {
         if token.is_cancelled() {
             return;
@@ -169,7 +179,7 @@ async fn run_listener(pool: PgPool, hub: Arc<NotifyHub>, token: CancellationToke
                 if !sleep_or_cancel(backoff, &token).await {
                     return;
                 }
-                backoff = (backoff * 2).min(Duration::from_secs(30));
+                backoff = (backoff * 2).min(LISTENER_BACKOFF_MAX);
                 continue;
             }
         };
@@ -181,10 +191,9 @@ async fn run_listener(pool: PgPool, hub: Arc<NotifyHub>, token: CancellationToke
             if !sleep_or_cancel(backoff, &token).await {
                 return;
             }
-            backoff = (backoff * 2).min(Duration::from_secs(30));
+            backoff = (backoff * 2).min(LISTENER_BACKOFF_MAX);
             continue;
         }
-        backoff = Duration::from_millis(100);
         // Freshly (re)connected: a notification may have been missed while
         // disconnected, so nudge every waiter to re-check the database.
         hub.signal_all();
@@ -194,11 +203,25 @@ async fn run_listener(pool: PgPool, hub: Arc<NotifyHub>, token: CancellationToke
                 _ = token.cancelled() => return,
                 res = listener.try_recv() => match res {
                     // A notification: wake exactly the channel+payload's waiters.
-                    Ok(Some(n)) => hub.signal(&hub_key(n.channel(), n.payload())),
+                    // Receiving anything proves the link works, so relax the backoff.
+                    Ok(Some(n)) => {
+                        backoff = LISTENER_BACKOFF_MIN;
+                        hub.signal(&hub_key(n.channel(), n.payload()));
+                    }
                     // try_recv returns None when it had to reconnect; re-poll all.
-                    Ok(None) => hub.signal_all(),
+                    Ok(None) => {
+                        backoff = LISTENER_BACKOFF_MIN;
+                        hub.signal_all();
+                    }
+                    // Hard error: back off before rebuilding so a recv that keeps
+                    // failing while connect succeeds can't spin (matches Go's loop,
+                    // which sleeps on a notification error rather than retrying hot).
                     Err(e) => {
                         tracing::debug!(error = %e, "notification listener: recv failed");
+                        if !sleep_or_cancel(backoff, &token).await {
+                            return;
+                        }
+                        backoff = (backoff * 2).min(LISTENER_BACKOFF_MAX);
                         break; // rebuild the listener
                     }
                 }
