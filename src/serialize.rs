@@ -223,25 +223,30 @@ pub struct PortableWorkflowError {
     pub data: Option<Value>,
 }
 
-/// Encode a workflow **error** message for storage. In [`Serializer::Portable`]
-/// mode it is wrapped in the cross-language error envelope under the generic
-/// [`PORTABLE_ERROR_NAME`]; other formats store the bare message, exactly as
-/// before. Only the genuine error outcome is encoded this way — cancellation and
-/// timeout reasons are stored bare by their callers, mirroring the other SDKs,
-/// which serialize the envelope only on the error path.
-pub fn encode_error(serializer: Serializer, message: &str) -> String {
+/// Encode a failed workflow's **error** for storage. In [`Serializer::Portable`]
+/// mode it becomes the cross-language envelope: a structured [`Error::Portable`]
+/// is written with the type name and `code`/`data` its author supplied; any other
+/// error is wrapped under the generic [`PORTABLE_ERROR_NAME`] with its display
+/// text as `message`. Other formats store the bare display text. This mirrors the
+/// other SDKs' `serializeWorkflowError`, called at workflow completion — so only
+/// the error outcome is encoded here; cancellation/timeout reasons are stored bare
+/// by their own call sites.
+pub fn encode_error(serializer: Serializer, err: &Error) -> String {
     if serializer == Serializer::Portable {
-        let env = PortableWorkflowError {
-            name: PORTABLE_ERROR_NAME.to_string(),
-            message: message.to_string(),
-            code: None,
-            data: None,
+        let env = match err {
+            Error::Portable(pe) => pe.clone(),
+            other => PortableWorkflowError {
+                name: PORTABLE_ERROR_NAME.to_string(),
+                message: other.to_string(),
+                code: None,
+                data: None,
+            },
         };
-        // The envelope is plain strings, so serialization cannot fail; fall back
-        // to the bare message in the impossible case that it does.
-        return serde_json::to_string(&env).unwrap_or_else(|_| message.to_string());
+        // The envelope is plain JSON values, so serialization cannot fail; fall
+        // back to the bare message in the impossible case that it does.
+        return serde_json::to_string(&env).unwrap_or_else(|_| err.to_string());
     }
-    message.to_string()
+    err.to_string()
 }
 
 /// Decode a stored workflow **error**, returning its human message and — for a
@@ -381,9 +386,9 @@ mod tests {
 
     #[test]
     fn portable_error_wraps_under_generic_name() {
-        // A failed workflow's error becomes the cross-language envelope —
-        // name/message present, code/data omitted (matching Go and Python bytes).
-        let enc = encode_error(Serializer::Portable, "boom");
+        // An untyped error becomes the cross-language envelope under the generic
+        // name — message present, code/data omitted (matching Go and Python bytes).
+        let enc = encode_error(Serializer::Portable, &Error::app("boom"));
         assert_eq!(enc, r#"{"name":"Portable Error","message":"boom"}"#);
         // It decodes back to the human message plus the structured envelope.
         let (msg, info) = decode_error(Some(PORTABLE), &enc);
@@ -395,13 +400,35 @@ mod tests {
     }
 
     #[test]
+    fn portable_error_keeps_typed_name_and_code() {
+        // A structured Error::Portable is written with its own name/code/data —
+        // and read back intact, the bytes any SDK can parse.
+        let err = Error::Portable(PortableWorkflowError {
+            name: "ValidationError".to_string(),
+            message: "invalid input".to_string(),
+            code: Some(json!(400)),
+            data: Some(json!({"field": "email"})),
+        });
+        let enc = encode_error(Serializer::Portable, &err);
+        let (msg, info) = decode_error(Some(PORTABLE), &enc);
+        assert_eq!(msg, "invalid input");
+        let info = info.expect("typed portable error decodes");
+        assert_eq!(info.name, "ValidationError");
+        assert_eq!(info.code, Some(json!(400)));
+        assert_eq!(info.data, Some(json!({"field": "email"})));
+    }
+
+    #[test]
     fn json_error_stays_bare() {
         // Default (non-portable) mode stores and reads the plain message — no
-        // envelope, no structured info.
-        let enc = encode_error(Serializer::Json, "boom");
-        assert_eq!(enc, "boom");
+        // envelope, no structured info — even for a typed error.
+        assert_eq!(encode_error(Serializer::Json, &Error::app("boom")), "boom");
         assert_eq!(
-            decode_error(Some(DBOS_JSON), &enc),
+            encode_error(Serializer::Json, &Error::portable("Validation", "boom")),
+            "boom"
+        );
+        assert_eq!(
+            decode_error(Some(DBOS_JSON), "boom"),
             ("boom".to_string(), None)
         );
         assert_eq!(decode_error(None, "boom"), ("boom".to_string(), None));

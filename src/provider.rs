@@ -698,6 +698,17 @@ pub trait StateProvider: Send + Sync {
     /// Create tables / indexes if they do not yet exist.
     async fn init(&self) -> Result<()>;
 
+    /// The serialization format this provider stores values in. The engine reads
+    /// it to encode a failed workflow's error in that same format — errors are
+    /// encoded at the engine because they carry a structured type the
+    /// [`set_workflow_status`](Self::set_workflow_status) `&str` channel cannot —
+    /// so a portable provider writes the cross-language error envelope. Defaults
+    /// to [`Serializer::Json`] (bare error strings); the SQL providers return
+    /// their configured serializer.
+    fn serializer(&self) -> crate::serialize::Serializer {
+        crate::serialize::Serializer::Json
+    }
+
     /// Whether this backend pushes change signals (Postgres `LISTEN`/`NOTIFY`),
     /// so a blocked `recv`/`get_event` is woken as soon as the row it waits for
     /// is written rather than only by polling. Callers that get `true` can wait

@@ -108,11 +108,17 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
     fn terminal_to_result(&self, status: WorkflowStatus) -> Result<O> {
         match status.status.as_str() {
             STATUS_CANCELLED => Err(Error::Cancelled(self.id.clone())),
-            STATUS_ERROR => Err(Error::app(
-                status
-                    .error
-                    .unwrap_or_else(|| "workflow failed".to_string()),
-            )),
+            // A workflow that failed under portable mode carries a structured
+            // error; reconstruct it so an observer reads the same name/code/data
+            // any SDK wrote. Otherwise the bare message.
+            STATUS_ERROR => Err(match status.error_info {
+                Some(info) => Error::Portable(info),
+                None => Error::app(
+                    status
+                        .error
+                        .unwrap_or_else(|| "workflow failed".to_string()),
+                ),
+            }),
             _ => {
                 let output = status.output.unwrap_or(Value::Null);
                 Ok(serde_json::from_value(output)?)

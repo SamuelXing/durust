@@ -4,8 +4,9 @@
 //!   createdb durust_test && DATABASE_URL=postgres://localhost/durust_test cargo test --test postgres
 
 use durust::{
-    DurableContext, DurableEngine, Error, ErrorCode, ListFilter, PostgresProvider, Result,
-    Serializer, StateProvider, WorkflowOptions, WorkflowQueue, WorkflowStatus, STATUS_PENDING,
+    DurableContext, DurableEngine, Error, ErrorCode, ListFilter, PortableWorkflowError,
+    PostgresProvider, Result, Serializer, StateProvider, WorkflowOptions, WorkflowQueue,
+    WorkflowStatus, STATUS_PENDING,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -108,6 +109,46 @@ async fn pg_portable_error_envelope_round_trip() -> Result<()> {
     .await?;
     assert_eq!(default.error.as_deref(), Some("kaboom"));
     assert!(default.error_info.is_none());
+
+    // A typed Error::Portable keeps its own name/code through storage, and a
+    // separate reader reconstructs it from get_result.
+    let typed_id = format!("wf-errt-{}", uuid::Uuid::new_v4());
+    {
+        let provider = PostgresProvider::connect(&url)
+            .await?
+            .with_serializer(Serializer::Portable);
+        let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+        engine.register("validate", |_ctx: DurableContext, _: ()| async move {
+            Err::<(), _>(Error::Portable(PortableWorkflowError {
+                name: "ValidationError".to_string(),
+                message: "bad email".to_string(),
+                code: Some(serde_json::json!(400)),
+                data: None,
+            }))
+        });
+        let _ = engine
+            .run_workflow::<_, ()>("validate", (), WorkflowOptions::with_id(&typed_id))
+            .await?
+            .get_result()
+            .await;
+    }
+    {
+        let provider = PostgresProvider::connect(&url)
+            .await?
+            .with_serializer(Serializer::Portable);
+        let engine = DurableEngine::new(Arc::new(provider)).await?;
+        let mut handle = engine.retrieve_workflow::<()>(&typed_id).await?;
+        let info = handle
+            .get_status()
+            .await?
+            .error_info
+            .expect("typed error survives storage");
+        assert_eq!(info.name, "ValidationError");
+        assert_eq!(info.code, Some(serde_json::json!(400)));
+        assert!(
+            matches!(handle.get_result().await, Err(Error::Portable(pe)) if pe.name == "ValidationError")
+        );
+    }
 
     Ok(())
 }
