@@ -160,8 +160,14 @@ pub struct WorkflowStatus {
     pub input: Value,
     /// Present once the workflow reaches `SUCCESS`.
     pub output: Option<Value>,
-    /// Present once the workflow reaches `ERROR`.
+    /// Present once the workflow reaches `ERROR`: the human-readable message.
+    /// For a `portable_json` row this is the envelope's `message` field.
     pub error: Option<String>,
+    /// The structured error for a workflow that failed under portable
+    /// serialization — `name`/`code`/`data` as written by any SDK (a Rust error
+    /// carries the generic name [`crate::PortableWorkflowError`] documents).
+    /// `None` for a non-portable row or a workflow that did not fail.
+    pub error_info: Option<crate::PortableWorkflowError>,
     /// The executor (process) that owns this run; empty until claimed.
     pub executor_id: String,
     /// Application version that produced this row — recovery is version-gated.
@@ -225,6 +231,7 @@ impl WorkflowStatus {
             input,
             output: None,
             error: None,
+            error_info: None,
             executor_id: executor_id.into(),
             app_version: app_version.into(),
             queue_name: None,

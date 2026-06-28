@@ -196,6 +196,84 @@ fn first_positional(value: Value) -> Value {
     }
 }
 
+/// Generic name stored for an error that carries no cross-language type, written
+/// when an untyped error is serialized in portable mode.
+pub const PORTABLE_ERROR_NAME: &str = "Portable Error";
+
+/// The cross-language workflow-**error** envelope: `{"name":…,"message":…,"code"?,"data"?}`.
+///
+/// In [`Serializer::Portable`] mode a failed workflow's stored error is written
+/// in this shape so a DBOS app in another language can read it as a structured
+/// error — a type/class name, the human message, and optional `code`/`data` —
+/// rather than an opaque string. A native error carries no user-defined name, so
+/// it is stored under the generic [`PORTABLE_ERROR_NAME`] with its display text as
+/// `message`, and `code`/`data` are omitted when absent. The envelope is read
+/// tolerantly: a value another SDK wrote — which may carry the concrete error
+/// type's name and its own `code`/`data` — still decodes here.
+///
+/// This type is surfaced on [`crate::WorkflowStatus::error_info`] when reading a
+/// portable error written by any SDK.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PortableWorkflowError {
+    pub name: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+/// Encode a workflow **error** message for storage. In [`Serializer::Portable`]
+/// mode it is wrapped in the cross-language error envelope under the generic
+/// [`PORTABLE_ERROR_NAME`]; other formats store the bare message, exactly as
+/// before. Only the genuine error outcome is encoded this way — cancellation and
+/// timeout reasons are stored bare by their callers, mirroring the other SDKs,
+/// which serialize the envelope only on the error path.
+pub fn encode_error(serializer: Serializer, message: &str) -> String {
+    if serializer == Serializer::Portable {
+        let env = PortableWorkflowError {
+            name: PORTABLE_ERROR_NAME.to_string(),
+            message: message.to_string(),
+            code: None,
+            data: None,
+        };
+        // The envelope is plain strings, so serialization cannot fail; fall back
+        // to the bare message in the impossible case that it does.
+        return serde_json::to_string(&env).unwrap_or_else(|_| message.to_string());
+    }
+    message.to_string()
+}
+
+/// Decode a stored workflow **error**, returning its human message and — for a
+/// `portable_json` row that holds a structured envelope — the full
+/// [`PortableWorkflowError`] (name/code/data) another SDK wrote, or the generic
+/// envelope Rust wrote. A non-portable row, or any value that is not a valid
+/// envelope, decodes to a plain message with no structure, matching the other
+/// SDKs (which only deserialize the envelope in portable mode and otherwise fall
+/// back to the raw string).
+pub fn decode_error(format: Option<&str>, stored: &str) -> (String, Option<PortableWorkflowError>) {
+    if format == Some(PORTABLE) {
+        if let Ok(env) = serde_json::from_str::<PortableWorkflowError>(stored) {
+            return (env.message.clone(), Some(env));
+        }
+    }
+    (stored.to_string(), None)
+}
+
+/// `decode_error` over an optional column: an absent error yields `(None, None)`.
+pub fn decode_error_opt(
+    format: Option<&str>,
+    stored: Option<&str>,
+) -> (Option<String>, Option<PortableWorkflowError>) {
+    match stored {
+        Some(s) => {
+            let (msg, env) = decode_error(format, s);
+            (Some(msg), env)
+        }
+        None => (None, None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +377,59 @@ mod tests {
             decode_input(Some(PORTABLE), r#"{"positionalArgs":[],"namedArgs":{}}"#).unwrap(),
             Value::Null
         );
+    }
+
+    #[test]
+    fn portable_error_wraps_under_generic_name() {
+        // A failed workflow's error becomes the cross-language envelope —
+        // name/message present, code/data omitted (matching Go and Python bytes).
+        let enc = encode_error(Serializer::Portable, "boom");
+        assert_eq!(enc, r#"{"name":"Portable Error","message":"boom"}"#);
+        // It decodes back to the human message plus the structured envelope.
+        let (msg, info) = decode_error(Some(PORTABLE), &enc);
+        assert_eq!(msg, "boom");
+        let info = info.expect("portable error decodes to a structured envelope");
+        assert_eq!(info.name, PORTABLE_ERROR_NAME);
+        assert_eq!(info.message, "boom");
+        assert!(info.code.is_none() && info.data.is_none());
+    }
+
+    #[test]
+    fn json_error_stays_bare() {
+        // Default (non-portable) mode stores and reads the plain message — no
+        // envelope, no structured info.
+        let enc = encode_error(Serializer::Json, "boom");
+        assert_eq!(enc, "boom");
+        assert_eq!(
+            decode_error(Some(DBOS_JSON), &enc),
+            ("boom".to_string(), None)
+        );
+        assert_eq!(decode_error(None, "boom"), ("boom".to_string(), None));
+    }
+
+    #[test]
+    fn portable_error_reads_another_sdk_structured_error() {
+        // A structured error written elsewhere (a real name + numeric code +
+        // data) surfaces with all fields intact.
+        let stored = r#"{"name":"ValidationError","message":"invalid input","code":400,"data":{"field":"email"}}"#;
+        let (msg, info) = decode_error(Some(PORTABLE), stored);
+        assert_eq!(msg, "invalid input");
+        let info = info.expect("structured envelope decodes");
+        assert_eq!(info.name, "ValidationError");
+        assert_eq!(info.code, Some(json!(400)));
+        assert_eq!(info.data, Some(json!({"field": "email"})));
+    }
+
+    #[test]
+    fn portable_error_falls_back_on_non_envelope() {
+        // A portable row that somehow holds a bare (non-JSON) string still reads
+        // as a plain message — never a parse error — like the other SDKs.
+        assert_eq!(
+            decode_error(Some(PORTABLE), "just a string"),
+            ("just a string".to_string(), None)
+        );
+        // decode_error_opt threads None through as no error.
+        assert_eq!(decode_error_opt(Some(PORTABLE), None), (None, None));
     }
 
     #[test]

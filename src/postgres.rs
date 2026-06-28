@@ -256,6 +256,8 @@ fn row_to_status(row: &sqlx::postgres::PgRow) -> WorkflowStatus {
     let fmt = fmt.as_deref();
     let inputs: Option<String> = row.try_get("inputs").ok().flatten();
     let output: Option<String> = row.try_get("output").ok().flatten();
+    let stored_error: Option<String> = row.try_get("error").ok().flatten();
+    let (error, error_info) = serialize::decode_error_opt(fmt, stored_error.as_deref());
     WorkflowStatus {
         id: row.get("workflow_uuid"),
         name: row.get("name"),
@@ -265,7 +267,8 @@ fn row_to_status(row: &sqlx::postgres::PgRow) -> WorkflowStatus {
             .flatten()
             .unwrap_or(Value::Null),
         output: serialize::decode_opt(fmt, output.as_deref()).ok().flatten(),
-        error: row.try_get("error").ok().flatten(),
+        error,
+        error_info,
         executor_id: row.get("executor_id"),
         app_version: row.get("application_version"),
         queue_name: row.try_get("queue_name").ok().flatten(),
@@ -412,6 +415,15 @@ impl StateProvider for PostgresProvider {
         error: Option<&str>,
     ) -> Result<()> {
         let output_str = output.map(|v| self.serializer.encode(v)).transpose()?;
+        // A genuine error outcome is stored as the portable error envelope (in
+        // portable mode); cancellation/timeout reasons are passed bare.
+        let error_str = error.map(|e| {
+            if status == STATUS_ERROR {
+                serialize::encode_error(self.serializer, e)
+            } else {
+                e.to_string()
+            }
+        });
         let now = Utc::now().timestamp_millis();
         let terminal = is_terminal(status);
         let completed = terminal.then_some(now);
@@ -433,7 +445,7 @@ impl StateProvider for PostgresProvider {
         .bind(id)
         .bind(status)
         .bind(output_str)
-        .bind(error)
+        .bind(error_str)
         .bind(completed)
         .bind(now)
         .bind(terminal)

@@ -58,6 +58,60 @@ async fn pg_serialization_cross_format() -> Result<()> {
     Ok(())
 }
 
+/// A workflow that fails under `portable_json` stores its error as the
+/// cross-language envelope, so a reader recovers the structured `error_info`
+/// (name/message); under the default format the error stays a bare string.
+#[tokio::test]
+async fn pg_portable_error_envelope_round_trip() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_portable_error_envelope_round_trip: DATABASE_URL unset");
+        return Ok(());
+    };
+
+    let run = |fmt: Serializer, id: String| {
+        let url = url.clone();
+        async move {
+            let provider = PostgresProvider::connect(&url).await?.with_serializer(fmt);
+            let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+            engine.register("boom", |_ctx: DurableContext, _: ()| async move {
+                Err::<(), _>(Error::app("kaboom"))
+            });
+            let outcome = engine
+                .run_workflow::<_, ()>("boom", (), WorkflowOptions::with_id(&id))
+                .await?
+                .get_result()
+                .await;
+            assert!(outcome.is_err());
+            let handle = engine.retrieve_workflow::<()>(&id).await?;
+            handle.get_status().await
+        }
+    };
+
+    // Portable: the structured envelope is persisted and read back.
+    let portable = run(
+        Serializer::Portable,
+        format!("wf-errp-{}", uuid::Uuid::new_v4()),
+    )
+    .await?;
+    assert_eq!(portable.error.as_deref(), Some("kaboom"));
+    let info = portable
+        .error_info
+        .expect("a portable error carries structured info");
+    assert_eq!(info.name, "Portable Error");
+    assert_eq!(info.message, "kaboom");
+
+    // Default: bare string, no structured info.
+    let default = run(
+        Serializer::Json,
+        format!("wf-errd-{}", uuid::Uuid::new_v4()),
+    )
+    .await?;
+    assert_eq!(default.error.as_deref(), Some("kaboom"));
+    assert!(default.error_info.is_none());
+
+    Ok(())
+}
+
 /// The run identity round-trips through Postgres: the three auth columns are
 /// written on insert (roles as a JSON array in the text column), read back into
 /// the status, threaded into the workflow context, and copied onto a fork.

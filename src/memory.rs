@@ -1304,6 +1304,12 @@ fn status_to_map(w: &WorkflowStatus) -> Map<String, Value> {
 
 /// Rebuild a [`WorkflowStatus`] from a portable `workflow_status` row.
 fn map_to_status(s: &Map<String, Value>) -> WorkflowStatus {
+    // Decode the error per the row's recorded format, so a portable error
+    // imported from any SDK surfaces its structured `name`/`code`/`data`.
+    let (error, error_info) = crate::serialize::decode_error_opt(
+        col_str(s, "serialization").as_deref(),
+        col_str(s, "error").as_deref(),
+    );
     WorkflowStatus {
         id: col_str(s, "workflow_uuid").unwrap_or_default(),
         name: col_str(s, "name").unwrap_or_default(),
@@ -1312,7 +1318,8 @@ fn map_to_status(s: &Map<String, Value>) -> WorkflowStatus {
             .and_then(|v| serde_json::from_str(&v).ok())
             .unwrap_or(Value::Null),
         output: col_str(s, "output").and_then(|v| serde_json::from_str(&v).ok()),
-        error: col_str(s, "error"),
+        error,
+        error_info,
         executor_id: col_str(s, "executor_id").unwrap_or_default(),
         app_version: col_str(s, "application_version").unwrap_or_default(),
         queue_name: col_str(s, "queue_name"),

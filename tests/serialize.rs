@@ -63,6 +63,71 @@ async fn cross_format(writer: Serializer, reader: Serializer, tag: &str) -> Resu
     Ok(())
 }
 
+/// A workflow that fails under `portable_json` stores its error as the
+/// cross-language envelope `{"name","message"}`, so a reader recovers both the
+/// human message and the structured error — the shape any SDK can parse. The
+/// structured `error_info` can only be present if the envelope (not a bare
+/// string) was actually persisted.
+#[tokio::test]
+async fn portable_error_is_stored_as_envelope() -> Result<()> {
+    let (url, path) = temp_db_url("err-p");
+    let provider = SqliteProvider::connect(&url)
+        .await?
+        .with_serializer(Serializer::Portable);
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    engine.register("boom", |_ctx: DurableContext, _: ()| async move {
+        Err::<(), _>(Error::app("kaboom"))
+    });
+
+    let outcome = engine
+        .run_workflow::<_, ()>("boom", (), WorkflowOptions::with_id("wf-err"))
+        .await?
+        .get_result()
+        .await;
+    assert!(outcome.is_err());
+
+    let handle = engine.retrieve_workflow::<()>("wf-err").await?;
+    let status = handle.get_status().await?;
+    assert_eq!(status.status, "ERROR");
+    assert_eq!(status.error.as_deref(), Some("kaboom"));
+    let info = status
+        .error_info
+        .expect("a portable error carries structured info");
+    assert_eq!(info.name, "Portable Error");
+    assert_eq!(info.message, "kaboom");
+    assert!(info.code.is_none() && info.data.is_none());
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// In the default (`DBOS_JSON`) format the error stays a bare string with no
+/// structured envelope — unchanged from before the portable envelope landed.
+#[tokio::test]
+async fn default_error_stays_bare() -> Result<()> {
+    let (url, path) = temp_db_url("err-d");
+    let provider = SqliteProvider::connect(&url).await?;
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    engine.register("boom", |_ctx: DurableContext, _: ()| async move {
+        Err::<(), _>(Error::app("kaboom"))
+    });
+
+    let outcome = engine
+        .run_workflow::<_, ()>("boom", (), WorkflowOptions::with_id("wf-err"))
+        .await?
+        .get_result()
+        .await;
+    assert!(outcome.is_err());
+
+    let handle = engine.retrieve_workflow::<()>("wf-err").await?;
+    let status = handle.get_status().await?;
+    assert_eq!(status.error.as_deref(), Some("kaboom"));
+    assert!(status.error_info.is_none());
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 #[tokio::test]
 async fn portable_written_default_read() -> Result<()> {
     cross_format(Serializer::Portable, Serializer::Json, "p2d").await
