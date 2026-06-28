@@ -1,10 +1,10 @@
 use crate::error::{Error, Result};
 use crate::provider::{
     col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows, is_terminal,
-    nonexistent_or, ChangeWait, DequeueRequest, ExportedWorkflow, ListFilter, NotificationInfo,
-    StateProvider, StepAggregate, StepAggregateQuery, StepInfo, VersionInfo, WorkflowAggregate,
-    WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_STR_COLS, NOTIFICATIONS_CHANNEL,
-    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    nonexistent_or, workflow_agg_selects, ChangeWait, DequeueRequest, ExportedWorkflow, ListFilter,
+    NotificationInfo, StateProvider, StepAggregate, StepAggregateQuery, StepInfo, VersionInfo,
+    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_STR_COLS,
+    NOTIFICATIONS_CHANNEL, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
     STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
     STREAM_CLOSED_SENTINEL, WORKFLOW_EVENTS_CHANNEL,
 };
@@ -894,7 +894,9 @@ impl StateProvider for PostgresProvider {
                 .push_bind(b)
                 .push(" AS time_bucket, ");
         }
-        qb.push("COUNT(*) AS cnt FROM workflow_status");
+        // At least one select is guaranteed by the engine; emit a stable order.
+        qb.push(workflow_agg_selects(query).join(", "));
+        qb.push(" FROM workflow_status");
         push_agg_filters(&mut qb, query);
         qb.push(" GROUP BY ");
         let mut first = true;
@@ -2066,7 +2068,10 @@ fn row_to_aggregate(
     }
     WorkflowAggregate {
         group,
-        count: row.try_get("cnt").unwrap_or(0),
+        count: row.try_get("cnt").ok(),
+        min_created_at: row.try_get("min_created_at").ok().flatten(),
+        max_queue_wait_ms: row.try_get("max_queue_wait_ms").ok().flatten(),
+        max_total_latency_ms: row.try_get("max_total_latency_ms").ok().flatten(),
     }
 }
 

@@ -958,6 +958,11 @@ impl DurableEngine {
                 "get_workflow_aggregates requires at least one grouping dimension",
             ));
         }
+        if query.no_select() {
+            return Err(Error::app(
+                "get_workflow_aggregates requires at least one selected aggregate",
+            ));
+        }
         self.provider.get_workflow_aggregates(query).await
     }
 

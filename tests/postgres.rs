@@ -691,10 +691,13 @@ async fn pg_workflow_aggregates() -> Result<()> {
             .await?;
     }
 
-    // Group by status, scoped to this run's id prefix.
+    // Group by status, scoped to this run's id prefix; select count + latency.
     let by_status = engine
         .get_workflow_aggregates(&WorkflowAggregateQuery {
             by_status: true,
+            select_count: true,
+            select_min_created_at: true,
+            select_max_total_latency_ms: true,
             workflow_id_prefix: Some(prefix.clone()),
             ..Default::default()
         })
@@ -704,18 +707,21 @@ async fn pg_workflow_aggregates() -> Result<()> {
         by_status[0].group.get("status"),
         Some(&Some(STATUS_SUCCESS.to_string()))
     );
-    assert_eq!(by_status[0].count, 3);
+    assert_eq!(by_status[0].count, Some(3));
+    assert!(by_status[0].min_created_at.is_some());
+    assert!(by_status[0].max_total_latency_ms.is_some_and(|l| l >= 0));
 
     // A wide time bucket collapses them into one group with a time_bucket key.
     let bucketed = engine
         .get_workflow_aggregates(&WorkflowAggregateQuery {
+            select_count: true,
             time_bucket_ms: Some(3_600_000),
             workflow_id_prefix: Some(prefix),
             ..Default::default()
         })
         .await?;
     assert_eq!(bucketed.len(), 1);
-    assert_eq!(bucketed[0].count, 3);
+    assert_eq!(bucketed[0].count, Some(3));
     assert!(bucketed[0].group.contains_key("time_bucket"));
 
     engine.shutdown(Duration::from_secs(1)).await?;

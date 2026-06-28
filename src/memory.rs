@@ -458,7 +458,16 @@ impl StateProvider for InMemoryProvider {
     ) -> Result<Vec<WorkflowAggregate>> {
         let g = self.inner.lock().await;
         let cols = query.enabled_columns();
-        let mut counts: HashMap<Vec<(String, Option<String>)>, i64> = HashMap::new();
+        // Per-group accumulator: count, earliest created_at, and the running max
+        // of queue-wait / total-latency (each `None` until a qualifying row).
+        #[derive(Default)]
+        struct Acc {
+            count: i64,
+            min_created: Option<i64>,
+            max_queue_wait: Option<i64>,
+            max_total_latency: Option<i64>,
+        }
+        let mut accs: HashMap<Vec<(String, Option<String>)>, Acc> = HashMap::new();
 
         for w in g.workflows.values() {
             // Filters (all ANDed).
@@ -516,14 +525,38 @@ impl StateProvider for InMemoryProvider {
                 let start = (created / bucket) * bucket;
                 key.push(("time_bucket".to_string(), Some(start.to_string())));
             }
-            *counts.entry(key).or_insert(0) += 1;
+
+            let acc = accs.entry(key).or_default();
+            acc.count += 1;
+            acc.min_created = Some(acc.min_created.map_or(created, |m| m.min(created)));
+            // Queue wait / total latency only count rows that started / finished.
+            if let Some(qw) = w.started_at_ms.map(|s| s - created) {
+                acc.max_queue_wait = Some(acc.max_queue_wait.map_or(qw, |m| m.max(qw)));
+            }
+            if let Some(tl) = w.completed_at_ms.map(|c| c - created) {
+                acc.max_total_latency = Some(acc.max_total_latency.map_or(tl, |m| m.max(tl)));
+            }
         }
 
-        let mut out: Vec<WorkflowAggregate> = counts
+        let mut out: Vec<WorkflowAggregate> = accs
             .into_iter()
-            .map(|(k, count)| WorkflowAggregate {
+            .map(|(k, acc)| WorkflowAggregate {
                 group: k.into_iter().collect(),
-                count,
+                count: query.select_count.then_some(acc.count),
+                min_created_at: query
+                    .select_min_created_at
+                    .then_some(acc.min_created)
+                    .flatten(),
+                max_queue_wait_ms: if query.select_max_queue_wait_ms {
+                    acc.max_queue_wait
+                } else {
+                    None
+                },
+                max_total_latency_ms: if query.select_max_total_latency_ms {
+                    acc.max_total_latency
+                } else {
+                    None
+                },
             })
             .collect();
         // Stable order so callers (and tests) see a deterministic result.

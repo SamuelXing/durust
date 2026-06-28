@@ -372,7 +372,10 @@ async fn conductor_handles_registry_and_aggregates() -> Result<()> {
         let wagg = exchange(
             &mut ws,
             json!({"type":"get_workflow_aggregates","request_id":"wa",
-                   "body":{"group_by_status":true,"select_count":true}}),
+                   "body":{"group_by_status":true,"select_count":true,
+                           "select_min_created_at":true,
+                           "select_max_queue_wait_ms":true,
+                           "select_max_total_latency_ms":true}}),
         )
         .await;
         let sagg = exchange(
@@ -438,7 +441,11 @@ async fn conductor_handles_registry_and_aggregates() -> Result<()> {
         .find(|r| r["group"]["status"] == "SUCCESS")
         .expect("a SUCCESS group");
     assert_eq!(success["count"], 1);
-    assert!(success["max_total_latency_ms"].is_null()); // not yet computed
+    // Selected latency aggregates are now computed (a direct run starts
+    // immediately, so queue-wait is ~0 rather than null).
+    assert!(success["min_created_at"].is_number());
+    assert!(success["max_total_latency_ms"].as_i64().unwrap() >= 0);
+    assert!(success["max_queue_wait_ms"].as_i64().unwrap() >= 0);
 
     // step aggregates grouped by function name -> our step 's1'.
     let srows = sagg["output"].as_array().unwrap();

@@ -496,7 +496,7 @@ async fn workflow_aggregates_group_and_filter() -> Result<()> {
     let count_for = |rows: &[WorkflowAggregate], key: &str, val: &str| -> i64 {
         rows.iter()
             .find(|r| r.group.get(key) == Some(&Some(val.to_string())))
-            .map(|r| r.count)
+            .and_then(|r| r.count)
             .unwrap_or(0)
     };
 
@@ -504,6 +504,7 @@ async fn workflow_aggregates_group_and_filter() -> Result<()> {
     let by_status = engine
         .get_workflow_aggregates(&WorkflowAggregateQuery {
             by_status: true,
+            select_count: true,
             ..Default::default()
         })
         .await?;
@@ -514,6 +515,7 @@ async fn workflow_aggregates_group_and_filter() -> Result<()> {
     let by_name = engine
         .get_workflow_aggregates(&WorkflowAggregateQuery {
             by_name: true,
+            select_count: true,
             ..Default::default()
         })
         .await?;
@@ -524,6 +526,7 @@ async fn workflow_aggregates_group_and_filter() -> Result<()> {
     let ok_only = engine
         .get_workflow_aggregates(&WorkflowAggregateQuery {
             by_status: true,
+            select_count: true,
             name: vec!["ok".to_string()],
             ..Default::default()
         })
@@ -533,21 +536,48 @@ async fn workflow_aggregates_group_and_filter() -> Result<()> {
         ok_only[0].group.get("status"),
         Some(&Some("SUCCESS".to_string()))
     );
-    assert_eq!(ok_only[0].count, 2);
+    assert_eq!(ok_only[0].count, Some(2));
 
     // Grouping by status and name together yields one row per (status, name).
     let combined = engine
         .get_workflow_aggregates(&WorkflowAggregateQuery {
             by_status: true,
             by_name: true,
+            select_count: true,
             ..Default::default()
         })
         .await?;
     assert_eq!(combined.len(), 2);
 
-    // A query that groups by nothing is rejected.
+    // Latency aggregates: every workflow has a created_at, a start (direct runs
+    // start immediately, so queue-wait is ~0), and — being terminal — a total
+    // latency. count is null when not selected.
+    let latency = engine
+        .get_workflow_aggregates(&WorkflowAggregateQuery {
+            by_name: true,
+            select_min_created_at: true,
+            select_max_queue_wait_ms: true,
+            select_max_total_latency_ms: true,
+            name: vec!["ok".to_string()],
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(latency.len(), 1);
+    assert_eq!(latency[0].count, None);
+    assert!(latency[0].min_created_at.is_some());
+    assert!(latency[0].max_total_latency_ms.is_some_and(|l| l >= 0));
+    assert!(latency[0].max_queue_wait_ms.is_some_and(|w| w >= 0));
+
+    // A query that groups by nothing, or selects nothing, is rejected.
     assert!(engine
         .get_workflow_aggregates(&WorkflowAggregateQuery::default())
+        .await
+        .is_err());
+    assert!(engine
+        .get_workflow_aggregates(&WorkflowAggregateQuery {
+            by_status: true,
+            ..Default::default()
+        })
         .await
         .is_err());
     Ok(())

@@ -905,6 +905,14 @@ struct WorkflowAggregatesBody {
     group_by_executor_id: bool,
     #[serde(default)]
     group_by_application_version: bool,
+    #[serde(default)]
+    select_count: bool,
+    #[serde(default)]
+    select_min_created_at: bool,
+    #[serde(default)]
+    select_max_queue_wait_ms: bool,
+    #[serde(default)]
+    select_max_total_latency_ms: bool,
     time_bucket_size_ms: Option<i64>,
     #[serde(default)]
     status: StringOrList,
@@ -936,6 +944,10 @@ async fn handle_workflow_aggregates(
         by_queue_name: b.group_by_queue_name,
         by_executor_id: b.group_by_executor_id,
         by_app_version: b.group_by_application_version,
+        select_count: b.select_count,
+        select_min_created_at: b.select_min_created_at,
+        select_max_queue_wait_ms: b.select_max_queue_wait_ms,
+        select_max_total_latency_ms: b.select_max_total_latency_ms,
         time_bucket_ms: b.time_bucket_size_ms,
         status: b.status.vec(),
         name: b.name.vec(),
@@ -1157,6 +1169,7 @@ async fn handle_get_metrics(
     // completed_at), matching the reference metric queries.
     let wq = WorkflowAggregateQuery {
         by_name: true,
+        select_count: true,
         start_time_ms: Some(start),
         end_time_ms: Some(end),
         ..Default::default()
@@ -1174,8 +1187,8 @@ async fn handle_get_metrics(
     match engine.get_workflow_aggregates(&wq).await {
         Ok(rows) => {
             for r in rows {
-                if let Some(Some(name)) = r.group.get("name") {
-                    metrics.push(metric("workflow_count", name, r.count as f64));
+                if let (Some(Some(name)), Some(count)) = (r.group.get("name"), r.count) {
+                    metrics.push(metric("workflow_count", name, count as f64));
                 }
             }
         }
@@ -1431,15 +1444,15 @@ fn format_version(v: &VersionInfo) -> Value {
     })
 }
 
-/// Render a [`WorkflowAggregate`]. The latency/created metrics this SDK does not
-/// yet compute are emitted as `null` (only `count` is populated).
+/// Render a [`WorkflowAggregate`]. Each aggregate is emitted only when the query
+/// selected it; unselected aggregates are `null` (matching the other SDKs).
 fn format_workflow_aggregate(a: &WorkflowAggregate) -> Value {
     json!({
         "group": a.group,
         "count": a.count,
-        "min_created_at": Value::Null,
-        "max_queue_wait_ms": Value::Null,
-        "max_total_latency_ms": Value::Null,
+        "min_created_at": a.min_created_at,
+        "max_queue_wait_ms": a.max_queue_wait_ms,
+        "max_total_latency_ms": a.max_total_latency_ms,
     })
 }
 

@@ -930,10 +930,13 @@ async fn sqlite_workflow_aggregates() -> Result<()> {
     engine.start_typed::<_, ()>("ok", "b", ()).await?;
     let _ = engine.start_typed::<_, ()>("boom", "c", ()).await;
 
-    // Group by status.
+    // Group by status; also select the latency aggregates.
     let by_status = engine
         .get_workflow_aggregates(&WorkflowAggregateQuery {
             by_status: true,
+            select_count: true,
+            select_min_created_at: true,
+            select_max_total_latency_ms: true,
             ..Default::default()
         })
         .await?;
@@ -941,17 +944,20 @@ async fn sqlite_workflow_aggregates() -> Result<()> {
         .iter()
         .find(|r| r.group.get("status") == Some(&Some(STATUS_SUCCESS.to_string())))
         .expect("a SUCCESS group");
-    assert_eq!(success.count, 2);
+    assert_eq!(success.count, Some(2));
+    assert!(success.min_created_at.is_some());
+    assert!(success.max_total_latency_ms.is_some_and(|l| l >= 0));
 
     // A one-hour time bucket collapses everything into a single group.
     let bucketed = engine
         .get_workflow_aggregates(&WorkflowAggregateQuery {
+            select_count: true,
             time_bucket_ms: Some(3_600_000),
             ..Default::default()
         })
         .await?;
     assert_eq!(bucketed.len(), 1);
-    assert_eq!(bucketed[0].count, 3);
+    assert_eq!(bucketed[0].count, Some(3));
     assert!(bucketed[0].group.contains_key("time_bucket"));
 
     let _ = std::fs::remove_file(path);

@@ -334,6 +334,16 @@ pub struct WorkflowAggregateQuery {
     pub by_queue_name: bool,
     pub by_executor_id: bool,
     pub by_app_version: bool,
+    /// Select the per-group row count.
+    pub select_count: bool,
+    /// Select the earliest `created_at` in the group (epoch ms).
+    pub select_min_created_at: bool,
+    /// Select the longest queue wait in the group: `MAX(started_at - created_at)`
+    /// in ms. Workflows that never started (no `started_at`) are ignored.
+    pub select_max_queue_wait_ms: bool,
+    /// Select the longest end-to-end latency in the group:
+    /// `MAX(completed_at - created_at)` in ms. Unfinished workflows are ignored.
+    pub select_max_total_latency_ms: bool,
     /// Also group by `created_at` bucket of this size in milliseconds.
     pub time_bucket_ms: Option<i64>,
     // Filters (all ANDed; empty/`None` ignored).
@@ -383,9 +393,40 @@ impl WorkflowAggregateQuery {
     pub fn is_empty(&self) -> bool {
         self.enabled_columns().is_empty() && self.time_bucket_ms.is_none()
     }
+
+    /// `true` when no aggregate is selected — an invalid query.
+    pub fn no_select(&self) -> bool {
+        !self.select_count
+            && !self.select_min_created_at
+            && !self.select_max_queue_wait_ms
+            && !self.select_max_total_latency_ms
+    }
 }
 
-/// One aggregate group from [`StateProvider::get_workflow_aggregates`].
+/// The selected aggregate expressions for `get_workflow_aggregates`, each as
+/// `EXPR AS alias`, in a stable order (the aliases are read back by the SQL
+/// backends' `row_to_aggregate`). The engine guarantees at least one is selected.
+/// The column names are identical on SQLite and Postgres, so this is shared.
+pub(crate) fn workflow_agg_selects(q: &WorkflowAggregateQuery) -> Vec<&'static str> {
+    let mut sel = Vec::new();
+    if q.select_count {
+        sel.push("COUNT(*) AS cnt");
+    }
+    if q.select_min_created_at {
+        sel.push("MIN(created_at) AS min_created_at");
+    }
+    if q.select_max_queue_wait_ms {
+        sel.push("MAX(started_at_epoch_ms - created_at) AS max_queue_wait_ms");
+    }
+    if q.select_max_total_latency_ms {
+        sel.push("MAX(completed_at - created_at) AS max_total_latency_ms");
+    }
+    sel
+}
+
+/// One aggregate group from [`StateProvider::get_workflow_aggregates`]. Each
+/// aggregate is `Some` only when the query selected it (an unselected aggregate
+/// is `None`, serialized as `null`, matching the other SDKs).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkflowAggregate {
     /// Each enabled grouping dimension → its value for this group. `None` is a
@@ -393,7 +434,14 @@ pub struct WorkflowAggregate {
     /// `time_bucket` value, when present, is the bucket's start in epoch ms.
     pub group: std::collections::BTreeMap<String, Option<String>>,
     /// How many workflows fell into this group.
-    pub count: i64,
+    pub count: Option<i64>,
+    /// Earliest `created_at` in the group (epoch ms).
+    pub min_created_at: Option<i64>,
+    /// Longest queue wait in the group: `MAX(started_at - created_at)` in ms.
+    pub max_queue_wait_ms: Option<i64>,
+    /// Longest end-to-end latency in the group: `MAX(completed_at - created_at)`
+    /// in ms.
+    pub max_total_latency_ms: Option<i64>,
 }
 
 /// A step's status derived from `operation_outputs`: a NULL `error` means the
