@@ -384,7 +384,30 @@ async fn conductor_handles_registry_and_aggregates() -> Result<()> {
                    "body":{"group_by_function_name":true,"select_count":true}}),
         )
         .await;
-        (queues, queue, versions, set_latest, wagg, sagg)
+        // Count-only requests omit every select_* flag; the handler must default
+        // to count (Go/Python parity) rather than rejecting the query.
+        let wagg_count_only = exchange(
+            &mut ws,
+            json!({"type":"get_workflow_aggregates","request_id":"wac",
+                   "body":{"group_by_status":true}}),
+        )
+        .await;
+        let sagg_count_only = exchange(
+            &mut ws,
+            json!({"type":"get_step_aggregates","request_id":"sac",
+                   "body":{"group_by_function_name":true}}),
+        )
+        .await;
+        (
+            queues,
+            queue,
+            versions,
+            set_latest,
+            wagg,
+            sagg,
+            wagg_count_only,
+            sagg_count_only,
+        )
     });
 
     let mut engine =
@@ -414,7 +437,8 @@ async fn conductor_handles_registry_and_aggregates() -> Result<()> {
         },
     )?;
 
-    let (queues, queue, versions, set_latest, wagg, sagg) = server.await.unwrap();
+    let (queues, queue, versions, set_latest, wagg, sagg, wagg_count_only, sagg_count_only) =
+        server.await.unwrap();
 
     // list_queues -> our registered queue (the internal queue is hidden).
     let qs = queues["output"].as_array().unwrap();
@@ -450,6 +474,23 @@ async fn conductor_handles_registry_and_aggregates() -> Result<()> {
     // step aggregates grouped by function name -> our step 's1'.
     let srows = sagg["output"].as_array().unwrap();
     assert!(srows.iter().any(|r| r["group"]["function_name"] == "s1"));
+
+    // Count-only requests (no select_* flags) default to count, not an error.
+    assert!(wagg_count_only["error_message"].is_null());
+    let wco = wagg_count_only["output"].as_array().unwrap();
+    let wco_success = wco
+        .iter()
+        .find(|r| r["group"]["status"] == "SUCCESS")
+        .expect("a SUCCESS group");
+    assert_eq!(wco_success["count"], 1);
+    assert!(wco_success["min_created_at"].is_null()); // unselected -> null
+    assert!(sagg_count_only["error_message"].is_null());
+    let sco = sagg_count_only["output"].as_array().unwrap();
+    let s1 = sco
+        .iter()
+        .find(|r| r["group"]["function_name"] == "s1")
+        .expect("an s1 group");
+    assert_eq!(s1["count"], 1);
 
     conductor.shutdown(Duration::from_secs(2)).await?;
     engine.shutdown(Duration::from_secs(1)).await?;

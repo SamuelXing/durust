@@ -938,7 +938,7 @@ async fn handle_workflow_aggregates(
 ) -> Result<()> {
     let req: WorkflowAggregatesRequest = serde_json::from_str(text)?;
     let b = req.body;
-    let query = WorkflowAggregateQuery {
+    let mut query = WorkflowAggregateQuery {
         by_status: b.group_by_status,
         by_name: b.group_by_name,
         by_queue_name: b.group_by_queue_name,
@@ -959,6 +959,11 @@ async fn handle_workflow_aggregates(
         end_time_ms: b.end_time.map(|t| t.timestamp_millis()),
         limit: None,
     };
+    // Backwards compat: a count-only request omits every select_* flag; default
+    // to count so it returns counts rather than being rejected (matches Go/Python).
+    if query.no_select() {
+        query.select_count = true;
+    }
     let (output, err) = match engine.get_workflow_aggregates(&query).await {
         Ok(rows) => (
             rows.iter()
@@ -1011,7 +1016,7 @@ async fn handle_step_aggregates(
 ) -> Result<()> {
     let req: StepAggregatesRequest = serde_json::from_str(text)?;
     let b = req.body;
-    let query = StepAggregateQuery {
+    let mut query = StepAggregateQuery {
         by_function_name: b.group_by_function_name,
         by_status: b.group_by_status,
         select_count: b.select_count,
@@ -1024,6 +1029,11 @@ async fn handle_step_aggregates(
         completed_before_ms: b.completed_before.map(|t| t.timestamp_millis()),
         limit: None,
     };
+    // Backwards compat: a count-only request omits every select_* flag; default
+    // to count so it returns counts rather than being rejected (matches Go/Python).
+    if query.no_select() {
+        query.select_count = true;
+    }
     let (output, err) = match engine.get_step_aggregates(&query).await {
         Ok(rows) => (
             rows.iter().map(format_step_aggregate).collect::<Vec<_>>(),
