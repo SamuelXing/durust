@@ -809,6 +809,37 @@ impl DurableContext {
         Ok(())
     }
 
+    /// Read the durable stream `key` produced by `workflow_id` (another workflow,
+    /// or this one), blocking until the stream is closed or its producer goes
+    /// inactive. Returns every value in order and whether the stream is closed —
+    /// the consumer side of [`write_stream`](Self::write_stream).
+    ///
+    /// Unlike the write side, this is a **live read, not a durable step**: it is
+    /// not checkpointed, so on replay it re-reads from the start (matching the
+    /// other SDKs, where the producer's writes are durable but a reader is not).
+    pub async fn read_stream<T: DeserializeOwned>(
+        &self,
+        workflow_id: &str,
+        key: &str,
+    ) -> Result<(Vec<T>, bool)> {
+        crate::provider::drain_stream(self.provider.as_ref(), workflow_id, key).await
+    }
+
+    /// Read the currently-available values of stream `key` on `workflow_id` from
+    /// `from_offset`, without blocking — the non-blocking counterpart to
+    /// [`read_stream`](Self::read_stream). Returns the values in order and whether
+    /// the close sentinel has been reached; pass the count read so far as the next
+    /// `from_offset` to poll incrementally. Also a live read (not checkpointed).
+    pub async fn read_stream_snapshot<T: DeserializeOwned>(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        from_offset: i32,
+    ) -> Result<(Vec<T>, bool)> {
+        crate::provider::snapshot_stream(self.provider.as_ref(), workflow_id, key, from_offset)
+            .await
+    }
+
     /// Escape hatch for building application errors inside steps.
     pub fn err(&self, msg: impl Into<String>) -> Error {
         Error::app(msg)

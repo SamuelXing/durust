@@ -3,8 +3,10 @@ use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::tx::{TransactionOptions, TxBody};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::time::Duration;
 
 /// Map a `workflow_status` insert failure to a typed deduplication error when it
 /// is a unique-constraint violation — the queue-scoped dedup index. A primary
@@ -137,6 +139,129 @@ pub(crate) fn group_stream_rows(
         }
     }
     Ok(out)
+}
+
+/// How often [`drain_stream`] re-polls the backend for new stream values while
+/// the producer is still active.
+const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Read stream `key` on `workflow_id` in order, blocking until it is closed (a
+/// producer called `close_stream`) or the producing workflow goes inactive (no
+/// longer `PENDING`/`ENQUEUED`) — after which no more values can arrive. Returns
+/// every value written, in order, and whether the stream is closed. Polls the
+/// backend at [`STREAM_POLL_INTERVAL`]; errors if the workflow does not exist.
+///
+/// This is a *live* read, not a durable step — it is never checkpointed, so a
+/// reader (the engine, the client, or a workflow via `ctx.read_stream`) re-reads
+/// from the start on replay. Shared by all three.
+pub(crate) async fn drain_stream<T: DeserializeOwned>(
+    provider: &dyn StateProvider,
+    workflow_id: &str,
+    key: &str,
+) -> Result<(Vec<T>, bool)> {
+    drain_stream_from(provider, workflow_id, key).await
+}
+
+/// The two backend reads [`drain_stream`] performs, factored into a narrow seam
+/// so the drain loop — including the subtle drain-on-inactive ordering — can be
+/// unit-tested against a scripted backend without standing up a whole
+/// [`StateProvider`]. Blanket-implemented for every provider, so the public
+/// entry point and its callers pass their `&dyn StateProvider` unchanged.
+#[async_trait]
+trait StreamBackend {
+    /// Stream `(workflow_id, key)` entries at `from_offset`, and whether the
+    /// close sentinel has been reached.
+    async fn stream_entries(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        from_offset: i32,
+    ) -> Result<(Vec<Value>, bool)>;
+
+    /// The producing workflow's current status, or `None` if it does not exist.
+    async fn producer_status(&self, workflow_id: &str) -> Result<Option<String>>;
+}
+
+#[async_trait]
+impl<T: StateProvider + ?Sized> StreamBackend for T {
+    async fn stream_entries(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        from_offset: i32,
+    ) -> Result<(Vec<Value>, bool)> {
+        self.read_stream(workflow_id, key, from_offset).await
+    }
+
+    async fn producer_status(&self, workflow_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .get_workflow_status(workflow_id)
+            .await?
+            .map(|s| s.status))
+    }
+}
+
+/// The drain loop itself, generic over the [`StreamBackend`] seam.
+async fn drain_stream_from<T: DeserializeOwned, S: StreamBackend + ?Sized>(
+    source: &S,
+    workflow_id: &str,
+    key: &str,
+) -> Result<(Vec<T>, bool)> {
+    let mut all = Vec::new();
+    let mut offset = 0_i32;
+    // Set once the producer is observed inactive; the loop then makes one more
+    // read pass to drain anything it committed just before terminating, and only
+    // then closes the stream.
+    let mut final_read = false;
+    loop {
+        let (values, closed) = source.stream_entries(workflow_id, key, offset).await?;
+        offset += values.len() as i32;
+        for v in values {
+            all.push(serde_json::from_value(v)?);
+        }
+        if closed {
+            return Ok((all, true));
+        }
+        // A previous pass saw the producer inactive; this pass has now drained
+        // whatever it committed in the meantime, so the stream is complete.
+        if final_read {
+            return Ok((all, true));
+        }
+        // No close sentinel yet: keep reading only while the producer is still
+        // active.
+        match source.producer_status(workflow_id).await? {
+            None => return Err(Error::nonexistent_workflow(workflow_id)),
+            Some(s) if s != STATUS_PENDING && s != STATUS_ENQUEUED => {
+                // The producer is inactive, but it may have committed values
+                // between the read above and this status check. Once it is
+                // terminal all of its writes are committed, so make one more read
+                // pass to drain to the end of the stream before closing, rather
+                // than dropping a value written just before completion.
+                final_read = true;
+                continue;
+            }
+            _ => {}
+        }
+        tokio::time::sleep(STREAM_POLL_INTERVAL).await;
+    }
+}
+
+/// Read the currently-available values of stream `key` on `workflow_id` from
+/// `from_offset`, without blocking. Returns the values in order and whether the
+/// close sentinel has been reached. Pass the count read so far as the next
+/// `from_offset` to poll incrementally.
+pub(crate) async fn snapshot_stream<T: DeserializeOwned>(
+    provider: &dyn StateProvider,
+    workflow_id: &str,
+    key: &str,
+    from_offset: i32,
+) -> Result<(Vec<T>, bool)> {
+    let (values, closed) = provider.read_stream(workflow_id, key, from_offset).await?;
+    let out = values
+        .into_iter()
+        .map(serde_json::from_value)
+        .collect::<std::result::Result<Vec<T>, _>>()?;
+    Ok((out, closed))
 }
 
 /// `true` if `status` is terminal (no further execution will occur).
@@ -1059,7 +1184,64 @@ pub trait StateProvider: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_roles, encode_roles};
+    use super::{decode_roles, drain_stream_from, encode_roles, StreamBackend, STATUS_SUCCESS};
+    use crate::error::Result;
+    use async_trait::async_trait;
+    use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A backend that scripts the lost-value interleaving: the producer's final
+    /// value is invisible on the first stream read but committed by the second,
+    /// while the status is already terminal. With the drain-on-inactive fix the
+    /// loop makes that second read pass; without it the value is dropped.
+    struct ScriptedStream {
+        reads: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl StreamBackend for ScriptedStream {
+        async fn stream_entries(
+            &self,
+            _workflow_id: &str,
+            _key: &str,
+            _from_offset: i32,
+        ) -> Result<(Vec<Value>, bool)> {
+            if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                // First read: the producer commits its final value in the window
+                // between here and the status check below, so it is not visible.
+                Ok((vec![], false))
+            } else {
+                // The post-inactive read pass drains the value the producer
+                // committed just before completing. Still no close sentinel — the
+                // producer finished without calling `close_stream`.
+                Ok((vec![json!("final")], false))
+            }
+        }
+
+        async fn producer_status(&self, _workflow_id: &str) -> Result<Option<String>> {
+            // Terminal: every write the producer made is committed by now.
+            Ok(Some(STATUS_SUCCESS.to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_stream_drains_value_committed_before_producer_inactive() {
+        let source = ScriptedStream {
+            reads: AtomicUsize::new(0),
+        };
+        let (values, closed): (Vec<String>, bool) =
+            drain_stream_from(&source, "wf", "stream").await.unwrap();
+
+        assert!(
+            closed,
+            "stream is reported closed once the producer is terminal"
+        );
+        assert_eq!(
+            values,
+            vec!["final".to_string()],
+            "the value committed just before the producer went inactive must not be dropped",
+        );
+    }
 
     #[test]
     fn roles_round_trip_as_json_array() {

@@ -23,10 +23,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
-/// How often a blocking [`DurableEngine::read_stream`] re-checks the backend for
-/// newly written stream entries while the producer is still active.
-const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(25);
-
 /// How often the schedule reconciler lists persisted schedules and installs or
 /// retires per-schedule firing loops. Short so a freshly created or paused
 /// schedule takes effect promptly.
@@ -1053,28 +1049,7 @@ impl DurableEngine {
         workflow_id: &str,
         key: &str,
     ) -> Result<(Vec<T>, bool)> {
-        let mut all = Vec::new();
-        let mut offset = 0_i32;
-        loop {
-            let (values, closed) = self.provider.read_stream(workflow_id, key, offset).await?;
-            offset += values.len() as i32;
-            for v in values {
-                all.push(serde_json::from_value(v)?);
-            }
-            if closed {
-                return Ok((all, true));
-            }
-            // No close sentinel yet: keep reading only while the producer is
-            // still active. Once it is gone, no more values can arrive.
-            match self.provider.get_workflow_status(workflow_id).await? {
-                None => return Err(Error::nonexistent_workflow(workflow_id)),
-                Some(s) if s.status != STATUS_PENDING && s.status != STATUS_ENQUEUED => {
-                    return Ok((all, true));
-                }
-                _ => {}
-            }
-            tokio::time::sleep(STREAM_POLL_INTERVAL).await;
-        }
+        crate::provider::drain_stream(self.provider.as_ref(), workflow_id, key).await
     }
 
     /// Read the currently-available values of stream `key` on `workflow_id`
@@ -1087,15 +1062,8 @@ impl DurableEngine {
         key: &str,
         from_offset: i32,
     ) -> Result<(Vec<T>, bool)> {
-        let (values, closed) = self
-            .provider
-            .read_stream(workflow_id, key, from_offset)
-            .await?;
-        let out = values
-            .into_iter()
-            .map(serde_json::from_value)
-            .collect::<std::result::Result<Vec<T>, _>>()?;
-        Ok((out, closed))
+        crate::provider::snapshot_stream(self.provider.as_ref(), workflow_id, key, from_offset)
+            .await
     }
 
     /// Cancel a workflow. A non-terminal workflow is set `CANCELLED` and removed
