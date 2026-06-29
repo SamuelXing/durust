@@ -115,6 +115,50 @@ async fn writing_to_closed_stream_errors() -> Result<()> {
     Ok(())
 }
 
+/// A workflow can read another workflow's stream from inside itself via
+/// `ctx.read_stream`. Unlike the writes, the read is live and records no step,
+/// so the consumer's step log stays empty.
+#[tokio::test]
+async fn workflow_reads_another_workflows_stream() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("producer", |ctx: DurableContext, _: ()| async move {
+        for i in 1..=3_i64 {
+            ctx.write_stream("nums", i).await?;
+        }
+        ctx.close_stream("nums").await?;
+        Ok::<_, Error>(())
+    });
+    engine.register(
+        "consumer",
+        |ctx: DurableContext, producer_id: String| async move {
+            let (values, _closed): (Vec<i64>, bool) = ctx.read_stream(&producer_id, "nums").await?;
+            Ok::<_, Error>(values)
+        },
+    );
+
+    engine
+        .run_workflow::<_, ()>("producer", (), WorkflowOptions::with_id("prod"))
+        .await?
+        .get_result()
+        .await?;
+
+    let values: Vec<i64> = engine
+        .run_workflow::<_, Vec<i64>>(
+            "consumer",
+            "prod".to_string(),
+            WorkflowOptions::with_id("cons"),
+        )
+        .await?
+        .get_result()
+        .await?;
+    assert_eq!(values, vec![1, 2, 3]);
+
+    // The read is live, not a durable step: the consumer recorded none.
+    let steps = engine.get_workflow_steps("cons").await?;
+    assert!(steps.is_empty(), "ctx.read_stream records no step");
+    Ok(())
+}
+
 /// `read_stream` drains values as the producer writes them: the reader starts
 /// while the producer is still running and blocks until the close arrives.
 #[tokio::test]

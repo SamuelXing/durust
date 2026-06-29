@@ -3,8 +3,10 @@ use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::tx::{TransactionOptions, TxBody};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::time::Duration;
 
 /// Map a `workflow_status` insert failure to a typed deduplication error when it
 /// is a unique-constraint violation — the queue-scoped dedup index. A primary
@@ -137,6 +139,66 @@ pub(crate) fn group_stream_rows(
         }
     }
     Ok(out)
+}
+
+/// How often [`drain_stream`] re-polls the backend for new stream values while
+/// the producer is still active.
+const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Read stream `key` on `workflow_id` in order, blocking until it is closed (a
+/// producer called `close_stream`) or the producing workflow goes inactive (no
+/// longer `PENDING`/`ENQUEUED`) — after which no more values can arrive. Returns
+/// every value written, in order, and whether the stream is closed. Polls the
+/// backend at [`STREAM_POLL_INTERVAL`]; errors if the workflow does not exist.
+///
+/// This is a *live* read, not a durable step — it is never checkpointed, so a
+/// reader (the engine, the client, or a workflow via `ctx.read_stream`) re-reads
+/// from the start on replay. Shared by all three.
+pub(crate) async fn drain_stream<T: DeserializeOwned>(
+    provider: &dyn StateProvider,
+    workflow_id: &str,
+    key: &str,
+) -> Result<(Vec<T>, bool)> {
+    let mut all = Vec::new();
+    let mut offset = 0_i32;
+    loop {
+        let (values, closed) = provider.read_stream(workflow_id, key, offset).await?;
+        offset += values.len() as i32;
+        for v in values {
+            all.push(serde_json::from_value(v)?);
+        }
+        if closed {
+            return Ok((all, true));
+        }
+        // No close sentinel yet: keep reading only while the producer is still
+        // active. Once it is gone, no more values can arrive.
+        match provider.get_workflow_status(workflow_id).await? {
+            None => return Err(Error::nonexistent_workflow(workflow_id)),
+            Some(s) if s.status != STATUS_PENDING && s.status != STATUS_ENQUEUED => {
+                return Ok((all, true));
+            }
+            _ => {}
+        }
+        tokio::time::sleep(STREAM_POLL_INTERVAL).await;
+    }
+}
+
+/// Read the currently-available values of stream `key` on `workflow_id` from
+/// `from_offset`, without blocking. Returns the values in order and whether the
+/// close sentinel has been reached. Pass the count read so far as the next
+/// `from_offset` to poll incrementally.
+pub(crate) async fn snapshot_stream<T: DeserializeOwned>(
+    provider: &dyn StateProvider,
+    workflow_id: &str,
+    key: &str,
+    from_offset: i32,
+) -> Result<(Vec<T>, bool)> {
+    let (values, closed) = provider.read_stream(workflow_id, key, from_offset).await?;
+    let out = values
+        .into_iter()
+        .map(serde_json::from_value)
+        .collect::<std::result::Result<Vec<T>, _>>()?;
+    Ok((out, closed))
 }
 
 /// `true` if `status` is terminal (no further execution will occur).

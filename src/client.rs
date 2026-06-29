@@ -14,7 +14,7 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{
     ListFilter, StateProvider, StepInfo, VersionInfo, WorkflowStatus, STATUS_DELAYED,
-    STATUS_ENQUEUED, STATUS_PENDING,
+    STATUS_ENQUEUED,
 };
 use crate::schedule::{
     ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus, WorkflowSchedule,
@@ -23,10 +23,6 @@ use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
-
-/// How often [`Client::read_stream`] re-checks for new stream entries while the
-/// producing workflow is still active.
-const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// A registry-less, out-of-process handle over the system database.
 ///
@@ -320,26 +316,7 @@ impl Client {
         workflow_id: &str,
         key: &str,
     ) -> Result<(Vec<T>, bool)> {
-        let mut all = Vec::new();
-        let mut offset = 0_i32;
-        loop {
-            let (values, closed) = self.provider.read_stream(workflow_id, key, offset).await?;
-            offset += values.len() as i32;
-            for v in values {
-                all.push(serde_json::from_value(v)?);
-            }
-            if closed {
-                return Ok((all, true));
-            }
-            match self.provider.get_workflow_status(workflow_id).await? {
-                None => return Err(Error::nonexistent_workflow(workflow_id)),
-                Some(s) if s.status != STATUS_PENDING && s.status != STATUS_ENQUEUED => {
-                    return Ok((all, true));
-                }
-                _ => {}
-            }
-            tokio::time::sleep(STREAM_POLL_INTERVAL).await;
-        }
+        crate::provider::drain_stream(self.provider.as_ref(), workflow_id, key).await
     }
 
     /// Read the currently-available values of stream `key` from `from_offset`
@@ -351,15 +328,8 @@ impl Client {
         key: &str,
         from_offset: i32,
     ) -> Result<(Vec<T>, bool)> {
-        let (values, closed) = self
-            .provider
-            .read_stream(workflow_id, key, from_offset)
-            .await?;
-        let out = values
-            .into_iter()
-            .map(serde_json::from_value)
-            .collect::<std::result::Result<Vec<T>, _>>()?;
-        Ok((out, closed))
+        crate::provider::snapshot_stream(self.provider.as_ref(), workflow_id, key, from_offset)
+            .await
     }
 
     /// Every registered application version, newest first.
