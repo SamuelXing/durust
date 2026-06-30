@@ -687,6 +687,42 @@ pub struct StepInfo {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
+/// The recorded outcome of a durable step: a successful output value, or a
+/// failure. A step's outcome is checkpointed exactly once — on replay it is
+/// returned without re-running, so a step that failed stays failed (and a
+/// non-deterministic step does not silently succeed on a later attempt).
+#[derive(Clone, Debug)]
+pub enum StepOutcome {
+    /// The step succeeded; carries its decoded output.
+    Output(Value),
+    /// The step failed; carries the human message and — for a portable row — the
+    /// structured error, mirroring [`WorkflowStatus::error`]/`error_info`.
+    Failure {
+        message: String,
+        info: Option<crate::PortableWorkflowError>,
+    },
+}
+
+/// Build a [`StepOutcome`] from an `operation_outputs` row's `output`/`error`
+/// columns and recorded serialization format. A non-null `error` is a failure
+/// (decoded with [`crate::serialize::decode_error`]); otherwise the `output` is
+/// the success value. Both null (an impossible row) yields `None`. Shared by the
+/// SQL backends' `get_step_result`/`record_step_result`.
+pub(crate) fn step_outcome_from(
+    fmt: Option<&str>,
+    output: Option<&str>,
+    error: Option<&str>,
+) -> Result<Option<StepOutcome>> {
+    if let Some(err) = error {
+        let (message, info) = crate::serialize::decode_error(fmt, err);
+        return Ok(Some(StepOutcome::Failure { message, info }));
+    }
+    match output {
+        Some(o) => Ok(Some(StepOutcome::Output(crate::serialize::decode(fmt, o)?))),
+        None => Ok(None),
+    }
+}
+
 /// A registered application version (a row of `application_versions`). The
 /// "latest" version is the one with the most recent [`version_timestamp`](Self::version_timestamp).
 #[derive(Clone, Debug)]
@@ -882,14 +918,20 @@ pub trait StateProvider: Send + Sync {
         error: Option<&str>,
     ) -> Result<()>;
 
-    /// Return a previously checkpointed step result, if any.
-    async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<Value>>;
+    /// Return a previously checkpointed step's outcome (output or recorded
+    /// failure), or `None` if the step has not run.
+    async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<StepOutcome>>;
 
-    /// Idempotently record a step result keyed by `(workflow_id, seq)`.
+    /// Idempotently record a step's outcome keyed by `(workflow_id, seq)`: its
+    /// success `value`, or — when `error` is set — its already-encoded failure
+    /// (stored in the `error` column, output left null). A step records exactly
+    /// one of the two.
     ///
-    /// Returns the **canonical** stored value: if a concurrent/duplicate
-    /// execution already wrote this step, the previously-stored value wins and is
-    /// returned, guaranteeing every caller observes the same result.
+    /// Returns the **canonical** stored outcome: if a concurrent/duplicate
+    /// execution already wrote this step, the previously-stored outcome wins and
+    /// is returned, guaranteeing every caller observes the same result (so a step
+    /// that another execution recorded as failed is observed as failed, and vice
+    /// versa).
     ///
     /// `started_at_ms` is when the step's work began (epoch ms); the
     /// implementation stamps `completed_at` itself as the time of the write.
@@ -906,8 +948,9 @@ pub trait StateProvider: Send + Sync {
         seq: i32,
         name: &str,
         value: Value,
+        error: Option<&str>,
         started_at_ms: Option<i64>,
-    ) -> Result<Value>;
+    ) -> Result<StepOutcome>;
 
     /// Run a transactional step: `body`'s SQL writes and this step's
     /// `operation_outputs` checkpoint commit in **one** database transaction, so

@@ -382,7 +382,7 @@ async fn client_resumes_a_cancelled_workflow() -> Result<()> {
         ))
         .await?;
     provider
-        .record_step_result("w", 0, "s0", serde_json::json!(1), None)
+        .record_step_result("w", 0, "s0", serde_json::json!(1), None, None)
         .await?;
     let client = Client::new(provider.clone());
     client.cancel_workflow("w").await?;

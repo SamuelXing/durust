@@ -1,12 +1,12 @@
 use crate::error::{Error, Result};
 use crate::provider::{
     col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows, is_terminal,
-    nonexistent_or, workflow_agg_selects, DequeueRequest, ExportedWorkflow, ListFilter,
-    NotificationInfo, StateProvider, StepAggregate, StepAggregateQuery, StepInfo, VersionInfo,
-    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_INT_COLS,
-    EXPORT_STATUS_STR_COLS, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
-    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
-    STREAM_CLOSED_SENTINEL,
+    nonexistent_or, step_outcome_from, workflow_agg_selects, DequeueRequest, ExportedWorkflow,
+    ListFilter, NotificationInfo, StateProvider, StepAggregate, StepAggregateQuery, StepInfo,
+    StepOutcome, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
+    EXPORT_STATUS_INT_COLS, EXPORT_STATUS_STR_COLS, STATUS_CANCELLED, STATUS_DELAYED,
+    STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
+    STATUS_SUCCESS, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
@@ -255,9 +255,9 @@ impl StateProvider for SqliteProvider {
         Ok(())
     }
 
-    async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<Value>> {
+    async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<StepOutcome>> {
         let row = sqlx::query(
-            "SELECT output, serialization FROM operation_outputs
+            "SELECT output, error, serialization FROM operation_outputs
              WHERE workflow_uuid = ? AND function_id = ?",
         )
         .bind(workflow_id)
@@ -265,9 +265,10 @@ impl StateProvider for SqliteProvider {
         .fetch_optional(&self.pool)
         .await?;
         match row {
-            Some(r) => serialize::decode_opt(
+            Some(r) => step_outcome_from(
                 r.get::<Option<String>, _>("serialization").as_deref(),
                 r.get::<Option<String>, _>("output").as_deref(),
+                r.get::<Option<String>, _>("error").as_deref(),
             ),
             None => Ok(None),
         }
@@ -279,19 +280,27 @@ impl StateProvider for SqliteProvider {
         seq: i32,
         name: &str,
         value: Value,
+        error: Option<&str>,
         started_at_ms: Option<i64>,
-    ) -> Result<Value> {
+    ) -> Result<StepOutcome> {
+        // A failure records its (already-encoded) error with a null output; a
+        // success records the encoded output with a null error.
+        let (output_col, error_col) = match error {
+            Some(e) => (None, Some(e.to_string())),
+            None => (Some(self.serializer.encode(&value)?), None),
+        };
         sqlx::query(
             "INSERT INTO operation_outputs
-                 (workflow_uuid, function_id, function_name, output, serialization,
+                 (workflow_uuid, function_id, function_name, output, error, serialization,
                   started_at_epoch_ms, completed_at_epoch_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
         )
         .bind(workflow_id)
         .bind(seq)
         .bind(name)
-        .bind(self.serializer.encode(&value)?)
+        .bind(output_col)
+        .bind(error_col)
         .bind(self.serializer.name())
         .bind(started_at_ms)
         .bind(Utc::now().timestamp_millis())
@@ -299,18 +308,19 @@ impl StateProvider for SqliteProvider {
         .await?;
 
         let row = sqlx::query(
-            "SELECT output, serialization FROM operation_outputs
+            "SELECT output, error, serialization FROM operation_outputs
              WHERE workflow_uuid = ? AND function_id = ?",
         )
         .bind(workflow_id)
         .bind(seq)
         .fetch_one(&self.pool)
         .await?;
-        Ok(serialize::decode_opt(
+        Ok(step_outcome_from(
             row.get::<Option<String>, _>("serialization").as_deref(),
             row.get::<Option<String>, _>("output").as_deref(),
+            row.get::<Option<String>, _>("error").as_deref(),
         )?
-        .unwrap_or(Value::Null))
+        .unwrap_or(StepOutcome::Output(Value::Null)))
     }
 
     async fn run_transaction_step(
@@ -1675,11 +1685,14 @@ fn row_to_schedule(row: &sqlx::sqlite::SqliteRow) -> Result<WorkflowSchedule> {
 fn row_to_step(row: &sqlx::sqlite::SqliteRow) -> Result<StepInfo> {
     let fmt: Option<String> = row.try_get("serialization").ok().flatten();
     let output: Option<String> = row.try_get("output").ok().flatten();
+    let error: Option<String> = row.try_get("error").ok().flatten();
     Ok(StepInfo {
         step_id: row.get("function_id"),
         name: row.try_get("function_name").unwrap_or_default(),
         output: serialize::decode_opt(fmt.as_deref(), output.as_deref())?,
-        error: row.try_get("error").ok().flatten(),
+        // A recorded failure is decoded to its human message (the envelope's
+        // `message` for a portable row), like `WorkflowStatus.error`.
+        error: error.map(|e| serialize::decode_error(fmt.as_deref(), &e).0),
         child_workflow_id: row.try_get("child_workflow_id").ok().flatten(),
         started_at: row
             .try_get::<Option<i64>, _>("started_at_epoch_ms")

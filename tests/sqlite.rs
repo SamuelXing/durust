@@ -88,6 +88,79 @@ async fn sqlite_recovers_across_restart() -> Result<()> {
     Ok(())
 }
 
+/// A step's *failure* is checkpointed: a workflow that catches a step error and
+/// keeps going observes the **same** recorded error on replay, and the failed
+/// step is not re-run — so a non-deterministic step cannot silently succeed the
+/// second time. Without error checkpointing the step would re-run (here, succeed)
+/// and replay would diverge.
+#[tokio::test]
+async fn sqlite_checkpoints_a_caught_step_failure() -> Result<()> {
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+    let (url, path) = temp_db_url("step-err");
+
+    // The step errors the first time its closure runs, but would succeed on any
+    // later run — so re-running on replay would change the outcome.
+    let register = |engine: &mut DurableEngine| {
+        engine.register("flaky_caught", |ctx: DurableContext, _: ()| async move {
+            let r: Result<i64> = ctx
+                .step("maybe", || async {
+                    let n = RUNS.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        Err(Error::app("transient"))
+                    } else {
+                        Ok(7)
+                    }
+                })
+                .await;
+            // Catch the step error and report which branch we took, so a divergent
+            // replay would surface as a different workflow output.
+            Ok::<_, Error>(if r.is_ok() { "ok" } else { "caught-error" }.to_string())
+        });
+    };
+
+    // Process 1: the step fails, the workflow catches it and completes.
+    {
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        register(&mut engine);
+        let out: String = engine
+            .start_typed("flaky_caught", "wf-step-err", ())
+            .await?;
+        assert_eq!(out, "caught-error");
+
+        // The failed step is recorded with its error.
+        let steps = engine.get_workflow_steps("wf-step-err").await?;
+        let maybe = steps
+            .iter()
+            .find(|s| s.name == "maybe")
+            .expect("step recorded");
+        assert_eq!(maybe.error.as_deref(), Some("transient"));
+        assert!(maybe.output.is_none());
+    }
+
+    // Process 2: a fresh engine over the same file replays. The recorded failure
+    // is returned without re-running the step.
+    {
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        register(&mut engine);
+        let out: String = engine
+            .start_typed("flaky_caught", "wf-step-err", ())
+            .await?;
+        assert_eq!(
+            out, "caught-error",
+            "replay must observe the recorded error"
+        );
+    }
+
+    assert_eq!(
+        RUNS.load(Ordering::SeqCst),
+        1,
+        "a checkpointed failed step is not re-run on replay"
+    );
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 /// A patch decision is durable: replaying the workflow re-reads the marker and
 /// stays on the new path, and the post-patch step runs exactly once.
 #[tokio::test]

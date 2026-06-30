@@ -34,7 +34,7 @@ async fn patch_pre_patch_workflow_takes_old_path() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     // Seed a non-patch step at seq 0, as if the pre-patch code had run it there.
     provider
-        .record_step_result("old", 0, "legacy_step", Value::from(1), None)
+        .record_step_result("old", 0, "legacy_step", Value::from(1), None, None)
         .await?;
 
     let mut engine = DurableEngine::new(provider).await?;

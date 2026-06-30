@@ -38,6 +38,56 @@ async fn step_runs_once_across_replays() -> Result<()> {
     Ok(())
 }
 
+/// A step's *failure* is durable: a workflow that catches a step error and keeps
+/// going observes the same recorded error on replay, and the failed step is not
+/// re-run — so a non-deterministic step cannot succeed the second time.
+#[tokio::test]
+async fn caught_step_failure_replays_without_rerunning() -> Result<()> {
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(provider).await?;
+
+    // Errors on the first closure run, would succeed on any later run.
+    engine.register("flaky_caught", |ctx: DurableContext, _: ()| async move {
+        let r: Result<i64> = ctx
+            .step("maybe", || async {
+                let n = RUNS.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Err(Error::app("transient"))
+                } else {
+                    Ok(7)
+                }
+            })
+            .await;
+        Ok::<_, Error>(if r.is_ok() { "ok" } else { "caught-error" }.to_string())
+    });
+
+    let a: String = engine
+        .start_typed("flaky_caught", "wf-step-err", ())
+        .await?;
+    // Re-execute the same id: the recorded failure replays without re-running.
+    let b: String = engine
+        .start_typed("flaky_caught", "wf-step-err", ())
+        .await?;
+
+    assert_eq!(a, "caught-error");
+    assert_eq!(b, "caught-error", "replay observes the recorded step error");
+    assert_eq!(
+        RUNS.load(Ordering::SeqCst),
+        1,
+        "a checkpointed failed step is not re-run on replay"
+    );
+
+    // The failure is visible in step introspection.
+    let steps = engine.get_workflow_steps("wf-step-err").await?;
+    let maybe = steps
+        .iter()
+        .find(|s| s.name == "maybe")
+        .expect("step recorded");
+    assert_eq!(maybe.error.as_deref(), Some("transient"));
+    Ok(())
+}
+
 /// Multiple steps keep their order and individual results across a replay.
 #[tokio::test]
 async fn multi_step_results_are_stable() -> Result<()> {

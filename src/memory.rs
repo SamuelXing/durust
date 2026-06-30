@@ -2,9 +2,9 @@ use crate::error::{Error, Result};
 use crate::provider::{
     col_i64, col_str, decode_roles, encode_roles, is_terminal, DequeueRequest, ExportedWorkflow,
     ListFilter, NotificationInfo, StateProvider, StepAggregate, StepAggregateQuery, StepInfo,
-    VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED,
-    STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED,
-    STATUS_PENDING, STATUS_SUCCESS, STREAM_CLOSED_SENTINEL,
+    StepOutcome, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
+    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STREAM_CLOSED_SENTINEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::tx::TxBody;
@@ -23,12 +23,13 @@ struct NotificationRow {
 }
 
 /// One recorded operation, mirroring an `operation_outputs` row: it holds either
-/// a step `output` or a `child_workflow_id` (a started child workflow), plus
-/// optional start/finish timestamps (epoch ms).
+/// a step `output`, a recorded `error` (a failed step), or a `child_workflow_id`
+/// (a started child workflow), plus optional start/finish timestamps (epoch ms).
 #[derive(Clone, Default)]
 struct StepRow {
     name: String,
     output: Option<Value>,
+    error: Option<String>,
     child_workflow_id: Option<String>,
     started_at_ms: Option<i64>,
     completed_at_ms: Option<i64>,
@@ -149,11 +150,11 @@ impl StateProvider for InMemoryProvider {
         Ok(())
     }
 
-    async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<Value>> {
+    async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<StepOutcome>> {
         let g = self.inner.lock().await;
         Ok(g.steps
             .get(&(workflow_id.to_string(), seq))
-            .and_then(|r| r.output.clone()))
+            .map(step_row_outcome))
     }
 
     async fn record_step_result(
@@ -162,23 +163,28 @@ impl StateProvider for InMemoryProvider {
         seq: i32,
         name: &str,
         value: Value,
+        error: Option<&str>,
         started_at_ms: Option<i64>,
-    ) -> Result<Value> {
+    ) -> Result<StepOutcome> {
         let mut g = self.inner.lock().await;
-        let canonical = g
+        // A failure records its error with no output; a success records the
+        // output with no error. The single-process store keeps the value as-is.
+        let (output, error_field) = match error {
+            Some(e) => (None, Some(e.to_string())),
+            None => (Some(value), None),
+        };
+        let row = g
             .steps
             .entry((workflow_id.to_string(), seq))
             .or_insert_with(|| StepRow {
                 name: name.to_string(),
-                output: Some(value),
+                output,
+                error: error_field,
                 child_workflow_id: None,
                 started_at_ms,
                 completed_at_ms: Some(Utc::now().timestamp_millis()),
-            })
-            .output
-            .clone()
-            .unwrap_or(Value::Null);
-        Ok(canonical)
+            });
+        Ok(step_row_outcome(row))
     }
 
     async fn run_transaction_step(
@@ -865,7 +871,7 @@ impl StateProvider for InMemoryProvider {
                 step_id: *seq,
                 name: row.name.clone(),
                 output: row.output.clone(),
-                error: None,
+                error: row.error.clone(),
                 child_workflow_id: row.child_workflow_id.clone(),
                 started_at: row.started_at_ms.and_then(DateTime::from_timestamp_millis),
                 completed_at: row
@@ -1205,6 +1211,7 @@ impl StateProvider for InMemoryProvider {
                     StepRow {
                         name: col_str(op, "function_name").unwrap_or_default(),
                         output: col_str(op, "output").and_then(|v| serde_json::from_str(&v).ok()),
+                        error: col_str(op, "error"),
                         child_workflow_id: col_str(op, "child_workflow_id"),
                         started_at_ms: col_i64(op, "started_at_epoch_ms"),
                         completed_at_ms: col_i64(op, "completed_at_epoch_ms"),
@@ -1343,8 +1350,21 @@ fn map_to_status(s: &Map<String, Value>) -> WorkflowStatus {
     }
 }
 
-/// An `operation_outputs` row in portable form. The in-memory backend records no
-/// step error, so `error` is always null.
+/// The [`StepOutcome`] a recorded [`StepRow`] represents: a recorded `error` is a
+/// failure (stored bare — the single-process store does no portable encoding),
+/// otherwise its `output`. Mirrors the SQL backends' `step_outcome_from`.
+fn step_row_outcome(r: &StepRow) -> StepOutcome {
+    match &r.error {
+        Some(e) => StepOutcome::Failure {
+            message: e.clone(),
+            info: None,
+        },
+        None => StepOutcome::Output(r.output.clone().unwrap_or(Value::Null)),
+    }
+}
+
+/// An `operation_outputs` row in portable form, carrying the step's `output` or
+/// recorded `error` (whichever was set).
 fn step_to_map(wf_id: &str, seq: i32, r: &StepRow) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("workflow_uuid".into(), json!(wf_id));
@@ -1354,7 +1374,7 @@ fn step_to_map(wf_id: &str, seq: i32, r: &StepRow) -> Map<String, Value> {
         "output".into(),
         r.output.as_ref().map_or(Value::Null, payload_str),
     );
-    m.insert("error".into(), Value::Null);
+    m.insert("error".into(), json!(r.error));
     m.insert("child_workflow_id".into(), json!(r.child_workflow_id));
     m.insert("started_at_epoch_ms".into(), json!(r.started_at_ms));
     m.insert("completed_at_epoch_ms".into(), json!(r.completed_at_ms));

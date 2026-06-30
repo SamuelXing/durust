@@ -1,8 +1,9 @@
 use crate::engine::{Runtime, WorkflowOptions};
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
-use crate::provider::{ChangeWait, StateProvider, WorkflowStatus, STATUS_CANCELLED};
+use crate::provider::{ChangeWait, StateProvider, StepOutcome, WorkflowStatus, STATUS_CANCELLED};
 use crate::tx::{TransactionOptions, Tx, TxBody};
+use crate::PortableWorkflowError;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::future::{poll_fn, Future};
@@ -314,8 +315,10 @@ impl DurableContext {
             return Ok(stored);
         }
         let started = chrono::Utc::now().timestamp_millis();
-        let result = f().await?;
-        self.checkpoint(seq, name, result, Some(started)).await
+        match f().await {
+            Ok(v) => self.checkpoint(seq, name, v, Some(started)).await,
+            Err(e) => self.record_failure(seq, name, e, Some(started)).await,
+        }
     }
 
     /// Run a durable step with an explicit retry [`StepOptions`] policy.
@@ -336,11 +339,13 @@ impl DurableContext {
         if let Some(stored) = self.replay_or_guard::<T>(seq).await? {
             return Ok(stored);
         }
-        // Run with retries; only the final result/error is observed.
+        // Run with retries; only the final result/error is observed, then
+        // checkpointed — a success as its output, a failure as its error.
         let started = chrono::Utc::now().timestamp_millis();
-        let result = self.run_with_retries(&opts, &mut f).await?;
-        self.checkpoint(seq, &opts.name, result, Some(started))
-            .await
+        match self.run_with_retries(&opts, &mut f).await {
+            Ok(v) => self.checkpoint(seq, &opts.name, v, Some(started)).await,
+            Err(e) => self.record_failure(seq, &opts.name, e, Some(started)).await,
+        }
     }
 
     /// Run a **transactional step**: the closure's SQL writes and this step's
@@ -485,12 +490,14 @@ impl DurableContext {
     /// refuse to start fresh work on a `CANCELLED` workflow. `Ok(Some(v))` means
     /// "return `v`"; `Ok(None)` means "proceed to run the closure".
     async fn replay_or_guard<T: DeserializeOwned>(&self, seq: i32) -> Result<Option<T>> {
-        if let Some(stored) = self
+        if let Some(outcome) = self
             .provider
             .get_step_result(&self.workflow_id, seq)
             .await?
         {
-            return Ok(Some(serde_json::from_value(stored)?));
+            // A recorded failure replays as its error, so a failed step is not
+            // re-run (and a non-deterministic step cannot succeed on replay).
+            return Ok(Some(outcome_value(outcome)?));
         }
         if let Some(status) = self.provider.get_workflow_status(&self.workflow_id).await? {
             if status.status == STATUS_CANCELLED {
@@ -500,8 +507,9 @@ impl DurableContext {
         Ok(None)
     }
 
-    /// Durably record `result` under `(workflow_id, seq)` and return the
-    /// canonical stored value (a racing writer's value wins if there is one).
+    /// Durably record a successful `result` under `(workflow_id, seq)` and return
+    /// the canonical stored value (a racing writer's outcome wins if there is one
+    /// — including a recorded failure, which is then surfaced as an error).
     /// `started_at_ms` is when the step's work began, for duration introspection.
     async fn checkpoint<T: Serialize + DeserializeOwned>(
         &self,
@@ -511,11 +519,41 @@ impl DurableContext {
         started_at_ms: Option<i64>,
     ) -> Result<T> {
         let json = serde_json::to_value(&result)?;
-        let canonical = self
+        let outcome = self
             .provider
-            .record_step_result(&self.workflow_id, seq, name, json, started_at_ms)
+            .record_step_result(&self.workflow_id, seq, name, json, None, started_at_ms)
             .await?;
-        Ok(serde_json::from_value(canonical)?)
+        outcome_value(outcome)
+    }
+
+    /// Durably record a failed step's error under `(workflow_id, seq)`. Returns
+    /// the original `err` once recorded (preserving its concrete type on this
+    /// first execution); if a concurrent execution recorded a *success* first,
+    /// that canonical output is returned instead. On any later replay the recorded
+    /// failure is reconstructed by [`replay_or_guard`], so the step never re-runs.
+    async fn record_failure<T: DeserializeOwned>(
+        &self,
+        seq: i32,
+        name: &str,
+        err: Error,
+        started_at_ms: Option<i64>,
+    ) -> Result<T> {
+        let encoded = crate::serialize::encode_error(self.provider.serializer(), &err);
+        let outcome = self
+            .provider
+            .record_step_result(
+                &self.workflow_id,
+                seq,
+                name,
+                Value::Null,
+                Some(&encoded),
+                started_at_ms,
+            )
+            .await?;
+        match outcome {
+            StepOutcome::Failure { .. } => Err(err),
+            StepOutcome::Output(v) => Ok(serde_json::from_value(v)?),
+        }
     }
 
     /// Drive `f` to success, retrying on error per `opts` with exponential
@@ -580,11 +618,11 @@ impl DurableContext {
             .get_step_result(&self.workflow_id, seq)
             .await?
         {
-            Some(stored) => Ok(serde_json::from_value(stored)?),
+            Some(outcome) => outcome_value(outcome),
             None => {
                 let proposed = chrono::Utc::now()
                     + chrono::Duration::from_std(dur).unwrap_or_else(|_| chrono::Duration::zero());
-                let canonical = self
+                let outcome = self
                     .provider
                     .record_step_result(
                         &self.workflow_id,
@@ -592,9 +630,10 @@ impl DurableContext {
                         "DBOS.sleep",
                         serde_json::to_value(proposed)?,
                         None,
+                        None,
                     )
                     .await?;
-                Ok(serde_json::from_value(canonical)?)
+                outcome_value(outcome)
             }
         }
     }
@@ -619,7 +658,7 @@ impl DurableContext {
             .insert_notification(destination_id, topic, serde_json::to_value(message)?)
             .await?;
         self.provider
-            .record_step_result(&self.workflow_id, seq, "DBOS.send", Value::Null, None)
+            .record_step_result(&self.workflow_id, seq, "DBOS.send", Value::Null, None, None)
             .await?;
         Ok(())
     }
@@ -662,7 +701,14 @@ impl DurableContext {
             let now = chrono::Utc::now();
             if now >= deadline {
                 self.provider
-                    .record_step_result(&self.workflow_id, seq, "DBOS.recv", Value::Null, None)
+                    .record_step_result(
+                        &self.workflow_id,
+                        seq,
+                        "DBOS.recv",
+                        Value::Null,
+                        None,
+                        None,
+                    )
                     .await?;
                 return Ok(None);
             }
@@ -691,7 +737,14 @@ impl DurableContext {
             .upsert_event(&self.workflow_id, key, serde_json::to_value(value)?)
             .await?;
         self.provider
-            .record_step_result(&self.workflow_id, seq, "DBOS.setEvent", Value::Null, None)
+            .record_step_result(
+                &self.workflow_id,
+                seq,
+                "DBOS.setEvent",
+                Value::Null,
+                None,
+                None,
+            )
             .await?;
         Ok(())
     }
@@ -720,11 +773,11 @@ impl DurableContext {
                 .get_event_value(target_workflow_id, key)
                 .await?
             {
-                let canonical = self
+                let outcome = self
                     .provider
-                    .record_step_result(&self.workflow_id, seq, "DBOS.getEvent", value, None)
+                    .record_step_result(&self.workflow_id, seq, "DBOS.getEvent", value, None, None)
                     .await?;
-                return Ok(Some(serde_json::from_value(canonical)?));
+                return Ok(Some(outcome_value(outcome)?));
             }
 
             let deadline = match deadline {
@@ -734,7 +787,14 @@ impl DurableContext {
             let now = chrono::Utc::now();
             if now >= deadline {
                 self.provider
-                    .record_step_result(&self.workflow_id, seq, "DBOS.getEvent", Value::Null, None)
+                    .record_step_result(
+                        &self.workflow_id,
+                        seq,
+                        "DBOS.getEvent",
+                        Value::Null,
+                        None,
+                        None,
+                    )
                     .await?;
                 return Ok(None);
             }
@@ -780,6 +840,7 @@ impl DurableContext {
                 "DBOS.writeStream",
                 Value::Null,
                 None,
+                None,
             )
             .await?;
         Ok(())
@@ -803,6 +864,7 @@ impl DurableContext {
                 seq,
                 "DBOS.closeStream",
                 Value::Null,
+                None,
                 None,
             )
             .await?;
@@ -872,3 +934,22 @@ const LISTEN_NOTIFY_BACKSTOP: Duration = Duration::from_secs(5);
 /// A shared identifier, so a patch decision a worker in any language recorded is
 /// read back consistently.
 const PATCH_PREFIX: &str = "DBOS.patch-";
+
+/// Turn a recorded step outcome into the typed value a step returns: a recorded
+/// output is deserialized; a recorded failure is reconstructed into its error
+/// (so a replayed failed step returns the same error without re-running).
+fn outcome_value<T: DeserializeOwned>(outcome: StepOutcome) -> Result<T> {
+    match outcome {
+        StepOutcome::Output(v) => Ok(serde_json::from_value(v)?),
+        StepOutcome::Failure { message, info } => Err(reconstruct_error(message, info)),
+    }
+}
+
+/// Rebuild an [`Error`] from a recorded step failure — the structured
+/// [`Error::Portable`] when the row carried one, else a plain application error.
+fn reconstruct_error(message: String, info: Option<PortableWorkflowError>) -> Error {
+    match info {
+        Some(pe) => Error::Portable(pe),
+        None => Error::app(message),
+    }
+}
