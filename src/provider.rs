@@ -703,6 +703,23 @@ pub enum StepOutcome {
     },
 }
 
+impl StepOutcome {
+    /// The value this outcome represents: a recorded `Output` is returned as
+    /// `Ok`, a recorded `Failure` as the reconstructed `Err` — the structured
+    /// [`Error::Portable`] when the row carried one, else a plain application
+    /// error. Used to surface a replayed step result (output or error) to its
+    /// caller.
+    pub(crate) fn into_value_result(self) -> Result<Value> {
+        match self {
+            StepOutcome::Output(v) => Ok(v),
+            StepOutcome::Failure { message, info } => Err(match info {
+                Some(pe) => Error::Portable(pe),
+                None => Error::app(message),
+            }),
+        }
+    }
+}
+
 /// Build a [`StepOutcome`] from an `operation_outputs` row's `output`/`error`
 /// columns and recorded serialization format. A non-null `error` is a failure
 /// (decoded with [`crate::serialize::decode_error`]); otherwise the `output` is
@@ -954,13 +971,17 @@ pub trait StateProvider: Send + Sync {
 
     /// Run a transactional step: `body`'s SQL writes and this step's
     /// `operation_outputs` checkpoint commit in **one** database transaction, so
-    /// the writes happen exactly once. Returns the step's JSON output — `body`'s
-    /// on the first run, or the stored one on replay (when `body` is not run).
-    /// On a `body` error the transaction rolls back (no checkpoint), so the step
-    /// re-runs on replay, matching ordinary steps. A transaction-level conflict
-    /// (serialization failure / deadlock) under a higher `isolation` restarts the
-    /// whole transaction on a fresh one, re-running `body`. SQL backends only;
-    /// the in-memory provider returns an error.
+    /// the writes happen exactly once. Returns the step's recorded outcome — its
+    /// output as `Ok` (`body`'s on the first run, the stored one on replay), or a
+    /// recorded failure as `Err`.
+    ///
+    /// On a `body` error the body's writes **roll back** (the step stays atomic),
+    /// but the error is then recorded *outside* the aborted transaction, so the
+    /// failed step is durable: a replay returns the recorded error without
+    /// re-running `body` (like an ordinary step). A transaction-level conflict
+    /// (serialization failure / deadlock) is *not* recorded — it restarts the
+    /// whole transaction on a fresh one, re-running `body`. SQL backends only; the
+    /// in-memory provider returns an error.
     async fn run_transaction_step(
         &self,
         workflow_id: &str,

@@ -3,7 +3,6 @@ use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{ChangeWait, StateProvider, StepOutcome, WorkflowStatus, STATUS_CANCELLED};
 use crate::tx::{TransactionOptions, Tx, TxBody};
-use crate::PortableWorkflowError;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::future::{poll_fn, Future};
@@ -936,20 +935,8 @@ const LISTEN_NOTIFY_BACKSTOP: Duration = Duration::from_secs(5);
 const PATCH_PREFIX: &str = "DBOS.patch-";
 
 /// Turn a recorded step outcome into the typed value a step returns: a recorded
-/// output is deserialized; a recorded failure is reconstructed into its error
-/// (so a replayed failed step returns the same error without re-running).
+/// output is deserialized; a recorded failure is surfaced as its reconstructed
+/// error (so a replayed failed step returns the same error without re-running).
 fn outcome_value<T: DeserializeOwned>(outcome: StepOutcome) -> Result<T> {
-    match outcome {
-        StepOutcome::Output(v) => Ok(serde_json::from_value(v)?),
-        StepOutcome::Failure { message, info } => Err(reconstruct_error(message, info)),
-    }
-}
-
-/// Rebuild an [`Error`] from a recorded step failure — the structured
-/// [`Error::Portable`] when the row carried one, else a plain application error.
-fn reconstruct_error(message: String, info: Option<PortableWorkflowError>) -> Error {
-    match info {
-        Some(pe) => Error::Portable(pe),
-        None => Error::app(message),
-    }
+    Ok(serde_json::from_value(outcome.into_value_result()?)?)
 }

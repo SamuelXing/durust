@@ -1829,6 +1829,66 @@ async fn pg_transaction_serializable_retries_on_conflict() -> Result<()> {
     Ok(())
 }
 
+/// A transactional step's failure is checkpointed across a real restart: a fresh
+/// engine over the same database replays the recorded error without re-running
+/// the body.
+#[tokio::test]
+async fn pg_checkpoints_a_caught_transaction_failure() -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static TX_RUNS: AtomicUsize = AtomicUsize::new(0);
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_checkpoints_a_caught_transaction_failure: DATABASE_URL unset");
+        return Ok(());
+    };
+    TX_RUNS.store(0, Ordering::SeqCst);
+    let id = format!("wf-txn-err-{}", uuid::Uuid::new_v4());
+
+    let register = |engine: &mut DurableEngine| {
+        engine.register("txn_flaky", |ctx: DurableContext, _: ()| async move {
+            let r: Result<i64> = ctx
+                .transaction::<i64, _>("maybe", |_tx| {
+                    Box::pin(async move {
+                        let n = TX_RUNS.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            Err(Error::app("transient"))
+                        } else {
+                            Ok(7)
+                        }
+                    })
+                })
+                .await;
+            Ok::<_, Error>(if r.is_ok() { "ok" } else { "caught-error" }.to_string())
+        });
+    };
+
+    {
+        let mut engine =
+            DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
+        register(&mut engine);
+        let out: String = engine.start_typed("txn_flaky", &id, ()).await?;
+        assert_eq!(out, "caught-error");
+        let steps = engine.get_workflow_steps(&id).await?;
+        let maybe = steps
+            .iter()
+            .find(|s| s.name == "maybe")
+            .expect("step recorded");
+        assert_eq!(maybe.error.as_deref(), Some("transient"));
+    }
+    {
+        let mut engine =
+            DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
+        register(&mut engine);
+        let out: String = engine.start_typed("txn_flaky", &id, ()).await?;
+        assert_eq!(out, "caught-error", "replay observes the recorded error");
+    }
+    assert_eq!(
+        TX_RUNS.load(Ordering::SeqCst),
+        1,
+        "a checkpointed failed transaction step is not re-run on replay"
+    );
+    Ok(())
+}
+
 /// export_workflow / import_workflow round-trip a workflow's full durable state
 /// (status, steps, events, streams) through Postgres after deletion.
 #[tokio::test]
