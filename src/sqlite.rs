@@ -1881,6 +1881,22 @@ fn push_agg_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, q: &'a WorkflowAggreg
         clause(qb);
         qb.push("created_at <= ").push_bind(t);
     }
+    if let Some(t) = q.completed_after_ms {
+        clause(qb);
+        qb.push("completed_at >= ").push_bind(t);
+    }
+    if let Some(t) = q.completed_before_ms {
+        clause(qb);
+        qb.push("completed_at <= ").push_bind(t);
+    }
+    if let Some(t) = q.dequeued_after_ms {
+        clause(qb);
+        qb.push("started_at_epoch_ms >= ").push_bind(t);
+    }
+    if let Some(t) = q.dequeued_before_ms {
+        clause(qb);
+        qb.push("started_at_epoch_ms <= ").push_bind(t);
+    }
 }
 
 /// Materialize one `get_workflow_aggregates` group row: read each enabled

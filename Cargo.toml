@@ -32,7 +32,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 tokio-util = { version = "0.7", default-features = false }
 durust-macros = { path = "durust-macros", version = "0.1" }
 # Postgres backend. If your sqlx version complains about features, see README.
-sqlx = { version = "0.7", features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "json", "chrono", "migrate"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "json", "chrono", "migrate"] }
 # Crash-injection hooks (e.g. in the schedule fire loop). Without the
 # `failpoints` feature every `fail_point!` compiles to a no-op, so this is
 # zero-cost in normal builds; tests/examples turn the feature on (below).

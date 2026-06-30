@@ -928,6 +928,10 @@ struct WorkflowAggregatesBody {
     workflow_id_prefix: StringOrList,
     start_time: Option<DateTime<Utc>>,
     end_time: Option<DateTime<Utc>>,
+    completed_after: Option<DateTime<Utc>>,
+    completed_before: Option<DateTime<Utc>>,
+    dequeued_after: Option<DateTime<Utc>>,
+    dequeued_before: Option<DateTime<Utc>>,
 }
 
 async fn handle_workflow_aggregates(
@@ -957,6 +961,10 @@ async fn handle_workflow_aggregates(
         workflow_id_prefix: b.workflow_id_prefix.first(),
         start_time_ms: b.start_time.map(|t| t.timestamp_millis()),
         end_time_ms: b.end_time.map(|t| t.timestamp_millis()),
+        completed_after_ms: b.completed_after.map(|t| t.timestamp_millis()),
+        completed_before_ms: b.completed_before.map(|t| t.timestamp_millis()),
+        dequeued_after_ms: b.dequeued_after.map(|t| t.timestamp_millis()),
+        dequeued_before_ms: b.dequeued_before.map(|t| t.timestamp_millis()),
         limit: None,
     };
     // Backwards compat: a count-only request omits every select_* flag; default
