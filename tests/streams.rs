@@ -209,6 +209,42 @@ async fn async_stream_errors_on_missing_workflow() -> Result<()> {
     Ok(())
 }
 
+/// The async stream drains every value even when the producer finishes *without*
+/// closing the stream — the inactive-producer termination must still make a final
+/// read pass, so a value committed just before the producer went terminal is not
+/// dropped (the lost-value race the blocking `read_stream` also guards against).
+#[tokio::test]
+async fn async_stream_drains_when_producer_finishes_without_close() -> Result<()> {
+    use durust::StreamExt;
+
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("p_noclose", |ctx: DurableContext, _: ()| async move {
+        ctx.write_stream("s", "a".to_string()).await?;
+        ctx.write_stream("s", "b".to_string()).await?;
+        Ok::<_, Error>(())
+    });
+
+    // The producer is already terminal before the reader starts, so the stream
+    // ends via the inactive-producer path rather than a close sentinel.
+    engine
+        .run_workflow::<_, ()>("p_noclose", (), WorkflowOptions::with_id("pnc"))
+        .await?
+        .get_result()
+        .await?;
+
+    let mut got = Vec::new();
+    let mut values = engine.read_stream_values::<String>("pnc", "s");
+    while let Some(item) = values.next().await {
+        got.push(item?);
+    }
+    assert_eq!(
+        got,
+        vec!["a".to_string(), "b".to_string()],
+        "no value dropped when the producer goes inactive without closing"
+    );
+    Ok(())
+}
+
 /// `read_stream` drains values as the producer writes them: the reader starts
 /// while the producer is still running and blocks until the close arrives.
 #[tokio::test]
