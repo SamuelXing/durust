@@ -511,6 +511,28 @@ impl StateProvider for InMemoryProvider {
             if query.end_time_ms.is_some_and(|t| created > t) {
                 continue;
             }
+            // A `completed_*`/`dequeued_*` bound excludes a workflow that has not
+            // completed / been dequeued (NULL column), matching the SQL backends.
+            if let Some(t) = query.completed_after_ms {
+                if w.completed_at_ms.is_none_or(|c| c < t) {
+                    continue;
+                }
+            }
+            if let Some(t) = query.completed_before_ms {
+                if w.completed_at_ms.is_none_or(|c| c > t) {
+                    continue;
+                }
+            }
+            if let Some(t) = query.dequeued_after_ms {
+                if w.started_at_ms.is_none_or(|d| d < t) {
+                    continue;
+                }
+            }
+            if let Some(t) = query.dequeued_before_ms {
+                if w.started_at_ms.is_none_or(|d| d > t) {
+                    continue;
+                }
+            }
 
             // Build this workflow's group key over the enabled dimensions.
             let mut key: Vec<(String, Option<String>)> = cols

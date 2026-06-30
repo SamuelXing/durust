@@ -485,8 +485,16 @@ pub struct WorkflowAggregateQuery {
     pub executor_ids: Vec<String>,
     pub queue_names: Vec<String>,
     pub workflow_id_prefix: Option<String>,
+    /// Lower/upper bound on `created_at` (epoch ms).
     pub start_time_ms: Option<i64>,
     pub end_time_ms: Option<i64>,
+    /// Lower/upper bound on `completed_at` (epoch ms).
+    pub completed_after_ms: Option<i64>,
+    pub completed_before_ms: Option<i64>,
+    /// Lower/upper bound on `started_at` — when the workflow was dequeued/started
+    /// (epoch ms).
+    pub dequeued_after_ms: Option<i64>,
+    pub dequeued_before_ms: Option<i64>,
     /// Cap on the number of group rows returned.
     pub limit: Option<i64>,
 }

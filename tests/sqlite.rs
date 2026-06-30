@@ -1033,6 +1033,31 @@ async fn sqlite_workflow_aggregates() -> Result<()> {
     assert_eq!(bucketed[0].count, Some(3));
     assert!(bucketed[0].group.contains_key("time_bucket"));
 
+    // The completed_*/dequeued_* filters narrow which rows are counted.
+    let now = chrono::Utc::now().timestamp_millis();
+    let hour = 3_600_000;
+    let sum =
+        |rows: Vec<durust::WorkflowAggregate>| -> i64 { rows.iter().filter_map(|r| r.count).sum() };
+    let recent = engine
+        .get_workflow_aggregates(&WorkflowAggregateQuery {
+            by_status: true,
+            select_count: true,
+            completed_after_ms: Some(now - hour),
+            completed_before_ms: Some(now + hour),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(sum(recent), 3, "all three completed within the window");
+    let future = engine
+        .get_workflow_aggregates(&WorkflowAggregateQuery {
+            by_status: true,
+            select_count: true,
+            dequeued_after_ms: Some(now + hour),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(sum(future), 0, "none dequeued in the future");
+
     let _ = std::fs::remove_file(path);
     Ok(())
 }

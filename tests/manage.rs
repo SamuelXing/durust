@@ -583,6 +583,75 @@ async fn workflow_aggregates_group_and_filter() -> Result<()> {
     Ok(())
 }
 
+/// Aggregate counts honor the `completed_*`/`dequeued_*` filters: a window that
+/// contains the run keeps it, a future-only window excludes it.
+#[tokio::test]
+async fn workflow_aggregates_completed_and_dequeued_filter() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("ok", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(())
+    });
+    engine.start_typed::<_, ()>("ok", "w", ()).await?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let hour = 3_600_000;
+
+    async fn total(engine: &DurableEngine, q: WorkflowAggregateQuery) -> i64 {
+        engine
+            .get_workflow_aggregates(&q)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.count)
+            .sum()
+    }
+
+    // Completed within the last hour → counted.
+    assert_eq!(
+        total(
+            &engine,
+            WorkflowAggregateQuery {
+                by_status: true,
+                select_count: true,
+                completed_after_ms: Some(now - hour),
+                completed_before_ms: Some(now + hour),
+                ..Default::default()
+            }
+        )
+        .await,
+        1
+    );
+    // Completed only in the future → excluded.
+    assert_eq!(
+        total(
+            &engine,
+            WorkflowAggregateQuery {
+                by_status: true,
+                select_count: true,
+                completed_after_ms: Some(now + hour),
+                ..Default::default()
+            }
+        )
+        .await,
+        0
+    );
+    // Dequeued (started) within the last hour → counted (a direct run stamps it).
+    assert_eq!(
+        total(
+            &engine,
+            WorkflowAggregateQuery {
+                by_status: true,
+                select_count: true,
+                dequeued_after_ms: Some(now - hour),
+                dequeued_before_ms: Some(now + hour),
+                ..Default::default()
+            }
+        )
+        .await,
+        1
+    );
+    Ok(())
+}
+
 /// Step aggregates count per function name and report the max step duration;
 /// select/group validation is enforced.
 #[tokio::test]
