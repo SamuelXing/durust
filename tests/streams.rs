@@ -159,6 +159,56 @@ async fn workflow_reads_another_workflows_stream() -> Result<()> {
     Ok(())
 }
 
+/// `read_stream_values` yields each value as an asynchronous `Stream`, delivering
+/// them in order while the producer is still running and ending once it closes.
+#[tokio::test]
+async fn async_stream_yields_values_incrementally() -> Result<()> {
+    use durust::StreamExt;
+
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("slow_producer", |ctx: DurableContext, _: ()| async move {
+        ctx.write_stream("s", 1_i64).await?;
+        ctx.sleep(Duration::from_millis(40)).await?;
+        ctx.write_stream("s", 2_i64).await?;
+        ctx.sleep(Duration::from_millis(40)).await?;
+        ctx.write_stream("s", 3_i64).await?;
+        ctx.close_stream("s").await?;
+        Ok::<_, Error>(())
+    });
+
+    let mut producer = engine
+        .run_workflow::<_, ()>("slow_producer", (), WorkflowOptions::with_id("p6"))
+        .await?;
+
+    // Pull from the async stream as values are committed; it ends at close.
+    let mut got = Vec::new();
+    let mut values = engine.read_stream_values::<i64>("p6", "s");
+    while let Some(item) = values.next().await {
+        got.push(item?);
+    }
+    assert_eq!(got, vec![1, 2, 3]);
+
+    producer.get_result().await?;
+    Ok(())
+}
+
+/// A reader on the async stream of a nonexistent workflow gets a single terminal
+/// `Err`, then the stream ends.
+#[tokio::test]
+async fn async_stream_errors_on_missing_workflow() -> Result<()> {
+    use durust::StreamExt;
+
+    let engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    let mut values = engine.read_stream_values::<i64>("nope", "s");
+    let first = values.next().await;
+    assert!(
+        matches!(first, Some(Err(_))),
+        "missing workflow yields a terminal Err"
+    );
+    assert!(values.next().await.is_none(), "stream ends after the Err");
+    Ok(())
+}
+
 /// `read_stream` drains values as the producer writes them: the reader starts
 /// while the producer is still running and blocks until the close arrives.
 #[tokio::test]

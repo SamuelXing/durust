@@ -914,6 +914,29 @@ impl DurableContext {
             .await
     }
 
+    /// Read the durable stream `key` on `workflow_id` as an asynchronous
+    /// [`Stream`](futures_util::Stream), yielding each value in order as it is
+    /// committed — the incremental counterpart to [`read_stream`](Self::read_stream),
+    /// which instead blocks and returns the whole stream at once. The stream ends
+    /// when the producer closes it or goes inactive; a decode or backend failure is
+    /// the final `Err` item. Also a live read (not checkpointed). Consume it with
+    /// [`StreamExt::next`](futures_util::StreamExt::next):
+    ///
+    /// ```ignore
+    /// use durust::StreamExt;
+    /// let mut values = ctx.read_stream_values::<String>(id, "events");
+    /// while let Some(v) = values.next().await {
+    ///     println!("{}", v?);
+    /// }
+    /// ```
+    pub fn read_stream_values<T: DeserializeOwned + 'static>(
+        &self,
+        workflow_id: &str,
+        key: &str,
+    ) -> impl futures_util::Stream<Item = Result<T>> + '_ {
+        crate::provider::stream_values(self.provider.as_ref(), workflow_id, key)
+    }
+
     /// Escape hatch for building application errors inside steps.
     pub fn err(&self, msg: impl Into<String>) -> Error {
         Error::app(msg)

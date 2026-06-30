@@ -332,6 +332,21 @@ impl Client {
             .await
     }
 
+    /// Read a workflow's stream `key` as an asynchronous
+    /// [`Stream`](futures_util::Stream), yielding each value in order as it is
+    /// committed — the incremental counterpart to [`read_stream`](Self::read_stream),
+    /// which blocks and returns the whole stream at once. The stream ends when the
+    /// producer closes it or goes inactive; a decode or backend failure (or a
+    /// missing workflow) is the final `Err` item. Consume it with
+    /// [`StreamExt::next`](futures_util::StreamExt::next).
+    pub fn read_stream_values<T: DeserializeOwned + 'static>(
+        &self,
+        workflow_id: &str,
+        key: &str,
+    ) -> impl futures_util::Stream<Item = Result<T>> + '_ {
+        crate::provider::stream_values(self.provider.as_ref(), workflow_id, key)
+    }
+
     /// Every registered application version, newest first.
     pub async fn list_application_versions(&self) -> Result<Vec<VersionInfo>> {
         self.provider.list_application_versions().await

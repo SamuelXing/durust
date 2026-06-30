@@ -61,6 +61,9 @@ pub use engine::{
     WorkflowRegistration,
 };
 pub use error::{Error, ErrorCode, Result};
+/// Re-exported so callers can consume the asynchronous stream returned by
+/// `read_stream_values` (`StreamExt::next`) without depending on `futures` directly.
+pub use futures_util::{Stream, StreamExt};
 pub use handle::WorkflowHandle;
 pub use memory::InMemoryProvider;
 pub use postgres::PostgresProvider;

@@ -265,6 +265,107 @@ pub(crate) async fn snapshot_stream<T: DeserializeOwned>(
     Ok((out, closed))
 }
 
+/// Read stream `key` on `workflow_id` as an asynchronous [`Stream`], yielding
+/// each value in order as it is committed — the incremental counterpart to
+/// [`drain_stream`], which instead blocks and returns the whole stream at once.
+/// The stream ends (`None`) when the producer closes the stream or goes inactive
+/// (the same termination [`drain_stream`] uses, including the final drain pass);
+/// a decode failure, a backend error, or a missing workflow is yielded as a
+/// single terminal `Err`, after which the stream ends.
+///
+/// Like [`drain_stream`] this is a *live* read, never checkpointed: a workflow
+/// reader re-reads from the start on replay. The returned stream borrows
+/// `source`, and is lazy — it polls the backend only as the consumer pulls.
+pub(crate) fn stream_values<'a, T>(
+    source: &'a dyn StateProvider,
+    workflow_id: &str,
+    key: &str,
+) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<T>> + 'a>>
+where
+    T: DeserializeOwned + 'a,
+{
+    /// Drives the incremental drain across `unfold` steps. `buffer` holds values
+    /// read but not yet yielded; `final_read` mirrors [`drain_stream`]'s
+    /// one-more-pass after the producer is seen inactive; `done` latches the end
+    /// after a terminal `Err`. The backend is reached through the blanket
+    /// [`StreamBackend`] impl on `dyn StateProvider`.
+    struct State<'a> {
+        source: &'a dyn StateProvider,
+        workflow_id: String,
+        key: String,
+        offset: i32,
+        buffer: std::collections::VecDeque<Value>,
+        final_read: bool,
+        done: bool,
+    }
+
+    let init = State {
+        source,
+        workflow_id: workflow_id.to_string(),
+        key: key.to_string(),
+        offset: 0,
+        buffer: std::collections::VecDeque::new(),
+        final_read: false,
+        done: false,
+    };
+
+    Box::pin(futures_util::stream::unfold(init, |mut st| async move {
+        if st.done {
+            return None;
+        }
+        loop {
+            // Emit anything already read before touching the backend again.
+            if let Some(v) = st.buffer.pop_front() {
+                return match serde_json::from_value::<T>(v) {
+                    Ok(t) => Some((Ok(t), st)),
+                    Err(e) => {
+                        st.done = true;
+                        Some((Err(Error::from(e)), st))
+                    }
+                };
+            }
+            // Buffer drained: read the next batch from the current offset.
+            let (values, closed) = match st
+                .source
+                .stream_entries(&st.workflow_id, &st.key, st.offset)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    st.done = true;
+                    return Some((Err(e), st));
+                }
+            };
+            st.offset += values.len() as i32;
+            st.buffer.extend(values);
+            if !st.buffer.is_empty() {
+                continue; // hand the freshly-read values to the buffer arm above
+            }
+            if closed || st.final_read {
+                return None;
+            }
+            // No values and no close yet: keep going only while the producer is
+            // active, with a final drain pass once it is observed inactive.
+            match st.source.producer_status(&st.workflow_id).await {
+                Err(e) => {
+                    st.done = true;
+                    return Some((Err(e), st));
+                }
+                Ok(None) => {
+                    st.done = true;
+                    return Some((Err(Error::nonexistent_workflow(&st.workflow_id)), st));
+                }
+                Ok(Some(s)) if s != STATUS_PENDING && s != STATUS_ENQUEUED => {
+                    st.final_read = true;
+                    continue;
+                }
+                Ok(_) => {}
+            }
+            tokio::time::sleep(STREAM_POLL_INTERVAL).await;
+        }
+    }))
+}
+
 /// `true` if `status` is terminal (no further execution will occur).
 pub fn is_terminal(status: &str) -> bool {
     matches!(

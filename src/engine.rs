@@ -1066,6 +1066,21 @@ impl DurableEngine {
             .await
     }
 
+    /// Read the durable stream `key` on `workflow_id` as an asynchronous
+    /// [`Stream`](futures_util::Stream), yielding each value in order as it is
+    /// committed — the incremental counterpart to [`read_stream`](Self::read_stream),
+    /// which blocks and returns the whole stream at once. The stream ends when the
+    /// producer closes it or goes inactive; a decode or backend failure (or a
+    /// missing workflow) is the final `Err` item. A live read, not checkpointed.
+    /// Consume it with [`StreamExt::next`](futures_util::StreamExt::next).
+    pub fn read_stream_values<T: DeserializeOwned + 'static>(
+        &self,
+        workflow_id: &str,
+        key: &str,
+    ) -> impl futures_util::Stream<Item = Result<T>> + '_ {
+        crate::provider::stream_values(self.provider.as_ref(), workflow_id, key)
+    }
+
     /// Cancel a workflow. A non-terminal workflow is set `CANCELLED` and removed
     /// from its queue; a running workflow stops at its next step (cooperative
     /// cancellation).
