@@ -1350,8 +1350,6 @@ fn map_to_status(s: &Map<String, Value>) -> WorkflowStatus {
     }
 }
 
-/// An `operation_outputs` row in portable form. The in-memory backend records no
-/// step error, so `error` is always null.
 /// The [`StepOutcome`] a recorded [`StepRow`] represents: a recorded `error` is a
 /// failure (stored bare — the single-process store does no portable encoding),
 /// otherwise its `output`. Mirrors the SQL backends' `step_outcome_from`.
@@ -1365,6 +1363,8 @@ fn step_row_outcome(r: &StepRow) -> StepOutcome {
     }
 }
 
+/// An `operation_outputs` row in portable form, carrying the step's `output` or
+/// recorded `error` (whichever was set).
 fn step_to_map(wf_id: &str, seq: i32, r: &StepRow) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("workflow_uuid".into(), json!(wf_id));
