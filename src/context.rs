@@ -243,9 +243,9 @@ impl DurableContext {
     /// checkpointed. On replay the same child is re-attached instead of being
     /// started again, so the child runs at most once per logical call.
     ///
-    /// The child inherits this workflow's identity ([`AuthContext`]) and records
-    /// its `parent_workflow_id`. Pass `opts.queue` to route the child through a
-    /// queue instead of running it inline.
+    /// The child inherits this workflow's identity ([`AuthContext`]) unless
+    /// `opts` sets an explicit one, and records its `parent_workflow_id`. Pass
+    /// `opts.queue` to route the child through a queue instead of running it inline.
     pub async fn start_workflow<I, O>(
         &self,
         name: &str,
@@ -277,6 +277,19 @@ impl DurableContext {
         opts.workflow_id = Some(child_id.clone());
         let input_json = serde_json::to_value(input)?;
 
+        // An explicit identity on `opts` overrides the inherited parent identity;
+        // with no auth set (the common case) the child inherits this workflow's.
+        let opts_auth = AuthContext {
+            authenticated_user: opts.authenticated_user.clone(),
+            assumed_role: opts.assumed_role.clone(),
+            authenticated_roles: opts.authenticated_roles.clone(),
+        };
+        let child_auth = if opts_auth.is_empty() {
+            self.auth.clone()
+        } else {
+            opts_auth
+        };
+
         self.runtime
             .spawn_child(
                 &child_id,
@@ -284,7 +297,7 @@ impl DurableContext {
                 input_json,
                 opts,
                 &self.workflow_id,
-                self.auth.clone(),
+                child_auth,
             )
             .await?;
         self.provider

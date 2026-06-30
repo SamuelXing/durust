@@ -31,6 +31,52 @@ const DEBOUNCER_TOPIC: &str = "_dbos_debouncer_topic";
 /// assumes the collector already finished and starts a fresh one.
 const ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// The subset of [`WorkflowOptions`] carried to the collector so the debounced
+/// target runs with the caller's queue / priority / auth / version — not just
+/// its id. Serializable (unlike `WorkflowOptions`, which holds `Duration`s and a
+/// dedup policy that are meaningless for the target); the debouncer owns the
+/// target id, dedup, and delay, so those are intentionally not threaded.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(crate) struct TargetOptions {
+    queue: Option<String>,
+    priority: i32,
+    partition_key: Option<String>,
+    app_version: Option<String>,
+    timeout_ms: Option<i64>,
+    authenticated_user: Option<String>,
+    assumed_role: Option<String>,
+    authenticated_roles: Vec<String>,
+}
+
+impl TargetOptions {
+    fn from_options(o: &WorkflowOptions) -> Self {
+        Self {
+            queue: o.queue.clone(),
+            priority: o.priority,
+            partition_key: o.partition_key.clone(),
+            app_version: o.app_version.clone(),
+            timeout_ms: o.timeout.map(|d| d.as_millis() as i64),
+            authenticated_user: o.authenticated_user.clone(),
+            assumed_role: o.assumed_role.clone(),
+            authenticated_roles: o.authenticated_roles.clone(),
+        }
+    }
+
+    /// Rebuild a [`WorkflowOptions`] for the target, pinned to `target_id`.
+    fn into_options(self, target_id: &str) -> WorkflowOptions {
+        let mut opts = WorkflowOptions::with_id(target_id);
+        opts.queue = self.queue;
+        opts.priority = self.priority;
+        opts.partition_key = self.partition_key;
+        opts.app_version = self.app_version;
+        opts.timeout = self.timeout_ms.map(|ms| Duration::from_millis(ms as u64));
+        opts.authenticated_user = self.authenticated_user;
+        opts.assumed_role = self.assumed_role;
+        opts.authenticated_roles = self.authenticated_roles;
+        opts
+    }
+}
+
 /// Input to the internal debouncer workflow. Carries the target it will start
 /// and the first input; later inputs arrive as [`DebounceMessage`]s.
 #[derive(Clone, Serialize, Deserialize)]
@@ -40,6 +86,8 @@ pub(crate) struct DebouncerInput {
     delay_ms: i64,
     timeout_ms: i64,
     initial_input: Value,
+    #[serde(default)]
+    target_opts: TargetOptions,
 }
 
 /// A pushed-back input sent to a running collector.
@@ -100,13 +148,11 @@ pub(crate) async fn internal_debouncer(ctx: DurableContext, input: DebouncerInpu
         }
     }
 
-    // Start the target once, under the id every producer was handed.
-    ctx.start_workflow::<Value, Value>(
-        &input.target_name,
-        current_input,
-        WorkflowOptions::with_id(&input.target_id),
-    )
-    .await?;
+    // Start the target once, under the id every producer was handed and with
+    // the caller's queue / priority / auth / version threaded through.
+    let opts = input.target_opts.into_options(&input.target_id);
+    ctx.start_workflow::<Value, Value>(&input.target_name, current_input, opts)
+        .await?;
     Ok(())
 }
 
@@ -116,6 +162,7 @@ pub struct Debouncer<'e> {
     engine: &'e DurableEngine,
     target: String,
     timeout: Duration,
+    target_opts: TargetOptions,
 }
 
 impl<'e> Debouncer<'e> {
@@ -124,6 +171,7 @@ impl<'e> Debouncer<'e> {
             engine,
             target: target.into(),
             timeout: Duration::ZERO,
+            target_opts: TargetOptions::default(),
         }
     }
 
@@ -131,6 +179,15 @@ impl<'e> Debouncer<'e> {
     /// `Duration::ZERO` (the default) means no cap.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Run the debounced target with these [`WorkflowOptions`] — its queue,
+    /// priority, partition key, application version, timeout, and authenticated
+    /// identity. The target's id is owned by the debouncer (set per `key`), so
+    /// `workflow_id`/`dedup_id`/`delay` on `opts` are ignored.
+    pub fn options(mut self, opts: WorkflowOptions) -> Self {
+        self.target_opts = TargetOptions::from_options(&opts);
         self
     }
 
@@ -160,6 +217,7 @@ impl<'e> Debouncer<'e> {
                 delay_ms,
                 timeout_ms,
                 initial_input: input_val.clone(),
+                target_opts: self.target_opts.clone(),
             };
             // First call for this key wins the dedup slot and starts the collector.
             match self

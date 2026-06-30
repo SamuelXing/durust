@@ -1,7 +1,9 @@
 //! Workflow debouncing: rapid repeated triggers grouped by a key coalesce into
 //! a single delayed run with the latest input.
 
-use durust::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowHandle};
+use durust::{
+    DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowHandle, WorkflowOptions,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,6 +44,45 @@ async fn debounce_coalesces_to_latest_input() -> Result<()> {
     let out = h3.get_result().await?;
     assert_eq!(out, "c", "the debounced run used the latest input");
     assert_eq!(RUNS.load(Ordering::SeqCst), 1, "exactly one run");
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// The debounced target runs with the caller's `WorkflowOptions` — its
+/// authenticated identity and application version — not just an id.
+#[tokio::test]
+async fn debounce_threads_target_options() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("notify", |ctx: DurableContext, msg: String| async move {
+        // Echo the identity the target sees, proving auth threaded through.
+        Ok::<_, Error>(format!(
+            "{}:{}",
+            ctx.authenticated_user().unwrap_or(""),
+            msg
+        ))
+    });
+    engine.launch().await?;
+
+    let opts = WorkflowOptions::default()
+        .authenticated_user("alice")
+        .app_version("9.9.9");
+    let mut h: WorkflowHandle<String> = engine
+        .debouncer("notify")
+        .options(opts)
+        .debounce("k", Duration::from_millis(50), "x".to_string())
+        .await?;
+    let out = h.get_result().await?;
+    assert_eq!(out, "alice:x", "the target ran under the threaded identity");
+
+    // The target's persisted row carries the threaded version + auth.
+    let status = engine
+        .retrieve_workflow::<String>(h.id())
+        .await?
+        .get_status()
+        .await?;
+    assert_eq!(status.authenticated_user.as_deref(), Some("alice"));
+    assert_eq!(status.app_version, "9.9.9");
 
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
