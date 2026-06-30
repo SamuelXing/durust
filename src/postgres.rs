@@ -562,9 +562,10 @@ impl StateProvider for PostgresProvider {
                     sqlx::query(&stmt).execute(&mut *tx).await?;
                 }
                 // Replay: if this step already committed, return its recorded
-                // output and do not run the body.
+                // outcome (output as Ok, a recorded failure as Err) without
+                // running the body.
                 if let Some(r) = sqlx::query(
-                    "SELECT output, serialization FROM operation_outputs
+                    "SELECT output, error, serialization FROM operation_outputs
                      WHERE workflow_uuid = $1 AND function_id = $2",
                 )
                 .bind(workflow_id)
@@ -572,37 +573,71 @@ impl StateProvider for PostgresProvider {
                 .fetch_optional(&mut *tx)
                 .await?
                 {
-                    return Ok(serialize::decode_opt(
-                        r.get::<Option<String>, _>("serialization").as_deref(),
+                    let fmt: Option<String> = r.get("serialization");
+                    if let Some(so) = step_outcome_from(
+                        fmt.as_deref(),
                         r.get::<Option<String>, _>("output").as_deref(),
-                    )?
-                    .unwrap_or(Value::Null));
+                        r.get::<Option<String>, _>("error").as_deref(),
+                    )? {
+                        return so.into_value_result();
+                    }
                 }
-                // Run the user's body against this transaction. On error we
-                // return, dropping `tx` (rollback), so nothing it wrote persists.
-                let value = {
+                // Run the user's body against this transaction.
+                let body_result = {
                     let mut h = Tx::postgres(&mut tx);
-                    body(&mut h).await?
+                    body(&mut h).await
                 };
-                // Checkpoint in the same transaction, then commit atomically.
-                sqlx::query(
-                    "INSERT INTO operation_outputs
-                         (workflow_uuid, function_id, function_name, output, serialization,
-                          started_at_epoch_ms, completed_at_epoch_ms)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7)
-                     ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
-                )
-                .bind(workflow_id)
-                .bind(seq)
-                .bind(name)
-                .bind(self.serializer.encode(&value)?)
-                .bind(self.serializer.name())
-                .bind(started_at_ms)
-                .bind(Utc::now().timestamp_millis())
-                .execute(&mut *tx)
-                .await?;
-                tx.commit().await?;
-                Ok::<Value, Error>(value)
+                match body_result {
+                    // Success: checkpoint the output in the same transaction, so
+                    // the body's writes and the checkpoint commit atomically.
+                    Ok(value) => {
+                        sqlx::query(
+                            "INSERT INTO operation_outputs
+                                 (workflow_uuid, function_id, function_name, output, serialization,
+                                  started_at_epoch_ms, completed_at_epoch_ms)
+                             VALUES ($1, $2, $3, $4, $5, $6, $7)
+                             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
+                        )
+                        .bind(workflow_id)
+                        .bind(seq)
+                        .bind(name)
+                        .bind(self.serializer.encode(&value)?)
+                        .bind(self.serializer.name())
+                        .bind(started_at_ms)
+                        .bind(Utc::now().timestamp_millis())
+                        .execute(&mut *tx)
+                        .await?;
+                        tx.commit().await?;
+                        Ok(value)
+                    }
+                    // A transaction conflict is retried on a fresh transaction;
+                    // dropping `tx` rolls back the body's writes. Not recorded.
+                    Err(e) if e.is_tx_conflict() => Err(e),
+                    // A genuine body error: roll back the body's writes (the step
+                    // stays atomic), then record the error *outside* the aborted
+                    // transaction so the failed step is durable and not re-run on
+                    // replay. The original error is surfaced to the caller.
+                    Err(e) => {
+                        tx.rollback().await?;
+                        sqlx::query(
+                            "INSERT INTO operation_outputs
+                                 (workflow_uuid, function_id, function_name, error, serialization,
+                                  started_at_epoch_ms, completed_at_epoch_ms)
+                             VALUES ($1, $2, $3, $4, $5, $6, $7)
+                             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
+                        )
+                        .bind(workflow_id)
+                        .bind(seq)
+                        .bind(name)
+                        .bind(serialize::encode_error(self.serializer, &e))
+                        .bind(self.serializer.name())
+                        .bind(started_at_ms)
+                        .bind(Utc::now().timestamp_millis())
+                        .execute(&self.pool)
+                        .await?;
+                        Err(e)
+                    }
+                }
             }
             .await;
 

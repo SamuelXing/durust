@@ -1736,6 +1736,64 @@ async fn sqlite_transaction_step_rolls_back_on_error() -> Result<()> {
     Ok(())
 }
 
+/// A transactional step's *failure* is checkpointed (outside the rolled-back
+/// body tx): a workflow that catches it and a fresh engine that replays both
+/// observe the recorded error without re-running the body — so a non-deterministic
+/// transaction step cannot silently succeed the second time.
+#[tokio::test]
+async fn sqlite_checkpoints_a_caught_transaction_failure() -> Result<()> {
+    static TX_RUNS: AtomicUsize = AtomicUsize::new(0);
+    let (url, path) = temp_db_url("txn-err");
+
+    let register = |engine: &mut DurableEngine| {
+        engine.register("txn_flaky", |ctx: DurableContext, _: ()| async move {
+            let r: Result<i64> = ctx
+                .transaction::<i64, _>("maybe", |_tx| {
+                    Box::pin(async move {
+                        let n = TX_RUNS.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            Err(Error::app("transient"))
+                        } else {
+                            Ok(7)
+                        }
+                    })
+                })
+                .await;
+            Ok::<_, Error>(if r.is_ok() { "ok" } else { "caught-error" }.to_string())
+        });
+    };
+
+    {
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        register(&mut engine);
+        let out: String = engine.start_typed("txn_flaky", "wf-txn-err", ()).await?;
+        assert_eq!(out, "caught-error");
+        let steps = engine.get_workflow_steps("wf-txn-err").await?;
+        let maybe = steps
+            .iter()
+            .find(|s| s.name == "maybe")
+            .expect("step recorded");
+        assert_eq!(maybe.error.as_deref(), Some("transient"));
+    }
+    {
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        register(&mut engine);
+        let out: String = engine.start_typed("txn_flaky", "wf-txn-err", ()).await?;
+        assert_eq!(
+            out, "caught-error",
+            "replay observes the recorded transaction error"
+        );
+    }
+    assert_eq!(
+        TX_RUNS.load(Ordering::SeqCst),
+        1,
+        "a checkpointed failed transaction step is not re-run on replay"
+    );
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 /// export_workflow captures a workflow's full durable state (status, steps,
 /// events, streams); import_workflow restores it byte-for-byte after deletion.
 #[tokio::test]
