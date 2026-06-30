@@ -1,0 +1,54 @@
+name: parity-sync
+
+# Weekly sweep of the four upstream DBOS Transact SDKs (ts/py/go/java): fetch
+# recently merged PRs + updated issues, then have Claude Code classify the
+# parity-relevant ones and file deduplicated tracking issues in this repo.
+#
+# Prerequisites (repo settings → Secrets and variables → Actions):
+#   - ANTHROPIC_API_KEY  — required, for the classify step.
+# The built-in GITHUB_TOKEN can read the public upstream repos and create issues
+# here, so no PAT is needed.
+
+on:
+  schedule:
+    - cron: "0 14 * * 1" # Mondays 14:00 UTC
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "Override lookback start (YYYY-MM-DD) for a one-off sweep"
+        required: false
+      lookback_days:
+        description: "Days to look back (default 21)"
+        required: false
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: parity-sync
+  cancel-in-progress: false
+
+jobs:
+  parity-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch upstream activity
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SYNC_SINCE: ${{ github.event.inputs.since }}
+          LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days }}
+        run: bash .github/parity-sync/fetch.sh upstream.json
+
+      - name: Classify and file tracking issues
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt_file: .github/parity-sync/classify-and-file.md
+          # gh is preinstalled on the runner; the classifier drives it for
+          # dedup + issue/label creation. Scope tools tightly.
+          claude_args: '--allowedTools "Bash(gh:*),Read"'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
