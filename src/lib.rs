@@ -74,7 +74,7 @@ pub use queue::{RateLimiter, WorkflowQueue};
 pub use schedule::{
     ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus, WorkflowSchedule,
 };
-pub use serialize::{PortableWorkflowArgs, PortableWorkflowError, Serializer};
+pub use serialize::{PortableWorkflowArgs, PortableWorkflowError, Serializer, SerializerCodec};
 pub use sqlite::SqliteProvider;
 pub use tx::{IsolationLevel, Param, Row, TransactionOptions, Tx, TxBody};
 

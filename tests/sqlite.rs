@@ -1460,6 +1460,111 @@ async fn sqlite_portable_input_envelope() -> Result<()> {
     Ok(())
 }
 
+/// A user-supplied serializer codec encodes stored values in its own format and
+/// is routed back on read by the format tag, so a workflow's input, step output,
+/// and result round-trip through it on SQLite.
+#[tokio::test]
+async fn sqlite_custom_serializer_roundtrips() -> Result<()> {
+    use durust::{Serializer, SerializerCodec};
+    use std::sync::Arc;
+
+    /// Stores values as `hex:<lowercase-hex-of-the-JSON-bytes>` — deliberately
+    /// unlike the built-in base64/plain-JSON forms so the raw column proves the
+    /// custom codec ran.
+    struct HexCodec;
+    impl SerializerCodec for HexCodec {
+        fn name(&self) -> &str {
+            "DBOS_HEX"
+        }
+        fn encode(&self, value: &serde_json::Value) -> Result<String> {
+            let bytes = serde_json::to_vec(value).map_err(Error::from)?;
+            let mut s = String::from("hex:");
+            for b in bytes {
+                s.push_str(&format!("{b:02x}"));
+            }
+            Ok(s)
+        }
+        fn decode(&self, stored: &str) -> Result<serde_json::Value> {
+            let hex = stored.strip_prefix("hex:").ok_or_else(|| {
+                Error::Serialization("custom value missing hex: prefix".to_string())
+            })?;
+            let bytes: std::result::Result<Vec<u8>, _> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+                .collect();
+            let bytes = bytes.map_err(|e| Error::Serialization(format!("bad hex: {e}")))?;
+            serde_json::from_slice(&bytes).map_err(Error::from)
+        }
+    }
+
+    let (url, path) = temp_db_url("custom-ser");
+    let provider = SqliteProvider::connect(&url)
+        .await?
+        .with_serializer(Serializer::custom(Arc::new(HexCodec)));
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    engine.register("greet", |ctx: DurableContext, name: String| async move {
+        // A step output also flows through the custom codec.
+        let upper = ctx
+            .step("shout", {
+                let name = name.clone();
+                move || {
+                    let name = name.clone();
+                    async move { Ok::<_, Error>(name.to_uppercase()) }
+                }
+            })
+            .await?;
+        Ok::<_, Error>(format!("hi {upper}"))
+    });
+
+    let out: String = engine
+        .run_workflow::<_, String>(
+            "greet",
+            "ada".to_string(),
+            WorkflowOptions::with_id("wf-hex"),
+        )
+        .await?
+        .get_result()
+        .await?;
+    assert_eq!(out, "hi ADA");
+
+    // The raw columns are stored in the custom hex format, tagged DBOS_HEX.
+    let pool = sqlx::SqlitePool::connect(&url).await?;
+    let (raw_input, raw_output, fmt): (String, Option<String>, String) = sqlx::query_as(
+        "SELECT inputs, output, serialization FROM workflow_status WHERE workflow_uuid = ?",
+    )
+    .bind("wf-hex")
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(fmt, "DBOS_HEX");
+    assert!(
+        raw_input.starts_with("hex:"),
+        "input stored via custom codec"
+    );
+    assert!(raw_output.as_deref().is_some_and(|o| o.starts_with("hex:")));
+
+    // Read back through the provider: input, output, and the recorded step all
+    // decode via the configured codec.
+    let status = engine
+        .retrieve_workflow::<String>("wf-hex")
+        .await?
+        .get_status()
+        .await?;
+    assert_eq!(status.input, serde_json::json!("ada"));
+    assert_eq!(status.output, Some(serde_json::json!("hi ADA")));
+
+    let steps = engine.get_workflow_steps("wf-hex").await?;
+    let shout = steps
+        .iter()
+        .find(|s| s.name == "shout")
+        .expect("step recorded");
+    assert_eq!(shout.output, Some(serde_json::json!("ADA")));
+
+    drop(pool);
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 /// On SQLite, the client's `ReturnExisting` dedup policy returns the workflow
 /// already holding the slot, while the default rejects the collision.
 #[tokio::test]

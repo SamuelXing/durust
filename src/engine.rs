@@ -1662,7 +1662,7 @@ async fn run_to_completion(
             // Encode the error in the provider's format: a portable provider
             // stores the cross-language envelope (carrying a structured
             // `Error::Portable`'s name/code/data), others store the bare message.
-            let stored = crate::serialize::encode_error(provider.serializer(), &e);
+            let stored = crate::serialize::encode_error(&provider.serializer(), &e);
             provider
                 .set_workflow_status(&id, STATUS_ERROR, None, Some(&stored))
                 .await?;

@@ -252,7 +252,7 @@ fn ms_to_dt(ms: i64) -> DateTime<Utc> {
 
 /// Map a `workflow_status` row to a [`WorkflowStatus`], decoding `inputs` and
 /// `output` per the row's recorded serialization format.
-fn row_to_status(row: &sqlx::postgres::PgRow) -> WorkflowStatus {
+fn row_to_status(serializer: &Serializer, row: &sqlx::postgres::PgRow) -> WorkflowStatus {
     let fmt: Option<String> = row.try_get("serialization").ok().flatten();
     let fmt = fmt.as_deref();
     let inputs: Option<String> = row.try_get("inputs").ok().flatten();
@@ -263,11 +263,13 @@ fn row_to_status(row: &sqlx::postgres::PgRow) -> WorkflowStatus {
         id: row.get("workflow_uuid"),
         name: row.get("name"),
         status: row.get("status"),
-        input: serialize::decode_input_opt(fmt, inputs.as_deref())
+        input: serialize::decode_input_opt(serializer, fmt, inputs.as_deref())
             .ok()
             .flatten()
             .unwrap_or(Value::Null),
-        output: serialize::decode_opt(fmt, output.as_deref()).ok().flatten(),
+        output: serialize::decode_opt(serializer, fmt, output.as_deref())
+            .ok()
+            .flatten(),
         error,
         error_info,
         executor_id: row.get("executor_id"),
@@ -327,7 +329,7 @@ impl StateProvider for PostgresProvider {
     }
 
     fn serializer(&self) -> serialize::Serializer {
-        self.serializer
+        self.serializer.clone()
     }
 
     async fn await_change(&self, wait: ChangeWait<'_>, within: Duration) {
@@ -355,7 +357,7 @@ impl StateProvider for PostgresProvider {
         )
         .bind(&s.id)
         .bind(&s.name)
-        .bind(serialize::encode_input(self.serializer, &s.input)?)
+        .bind(serialize::encode_input(&self.serializer, &s.input)?)
         .bind(&s.status)
         .bind(&s.executor_id)
         .bind(&s.app_version)
@@ -383,7 +385,7 @@ impl StateProvider for PostgresProvider {
         .bind(&s.id)
         .fetch_one(&self.pool)
         .await?;
-        Ok(row_to_status(&row))
+        Ok(row_to_status(&self.serializer, &row))
     }
 
     async fn get_deduplicated_workflow(
@@ -409,7 +411,7 @@ impl StateProvider for PostgresProvider {
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|r| row_to_status(&r)))
+        Ok(row.map(|r| row_to_status(&self.serializer, &r)))
     }
 
     async fn set_workflow_status(
@@ -476,6 +478,7 @@ impl StateProvider for PostgresProvider {
         .await?;
         match row {
             Some(r) => step_outcome_from(
+                &self.serializer,
                 r.get::<Option<String>, _>("serialization").as_deref(),
                 r.get::<Option<String>, _>("output").as_deref(),
                 r.get::<Option<String>, _>("error").as_deref(),
@@ -527,6 +530,7 @@ impl StateProvider for PostgresProvider {
         .fetch_one(&self.pool)
         .await?;
         Ok(step_outcome_from(
+            &self.serializer,
             row.get::<Option<String>, _>("serialization").as_deref(),
             row.get::<Option<String>, _>("output").as_deref(),
             row.get::<Option<String>, _>("error").as_deref(),
@@ -575,6 +579,7 @@ impl StateProvider for PostgresProvider {
                 {
                     let fmt: Option<String> = r.get("serialization");
                     if let Some(so) = step_outcome_from(
+                        &self.serializer,
                         fmt.as_deref(),
                         r.get::<Option<String>, _>("output").as_deref(),
                         r.get::<Option<String>, _>("error").as_deref(),
@@ -629,7 +634,7 @@ impl StateProvider for PostgresProvider {
                         .bind(workflow_id)
                         .bind(seq)
                         .bind(name)
-                        .bind(serialize::encode_error(self.serializer, &e))
+                        .bind(serialize::encode_error(&self.serializer, &e))
                         .bind(self.serializer.name())
                         .bind(started_at_ms)
                         .bind(Utc::now().timestamp_millis())
@@ -777,7 +782,10 @@ impl StateProvider for PostgresProvider {
         .await?;
 
         tx.commit().await?;
-        Ok(rows.iter().map(row_to_status).collect())
+        Ok(rows
+            .iter()
+            .map(|r| row_to_status(&self.serializer, r))
+            .collect())
     }
 
     async fn transition_delayed_workflows(&self, now_ms: i64) -> Result<u64> {
@@ -879,7 +887,11 @@ impl StateProvider for PostgresProvider {
         .await?;
 
         tx.commit().await?;
-        Ok(Some(serialize::decode(fmt.as_deref(), &message)?))
+        Ok(Some(serialize::decode(
+            &self.serializer,
+            fmt.as_deref(),
+            &message,
+        )?))
     }
 
     async fn upsert_event(&self, workflow_id: &str, key: &str, value: Value) -> Result<()> {
@@ -908,7 +920,11 @@ impl StateProvider for PostgresProvider {
         .fetch_optional(&self.pool)
         .await?;
         match row {
-            Some((value, fmt)) => Ok(Some(serialize::decode(fmt.as_deref(), &value)?)),
+            Some((value, fmt)) => Ok(Some(serialize::decode(
+                &self.serializer,
+                fmt.as_deref(),
+                &value,
+            )?)),
             None => Ok(None),
         }
     }
@@ -930,7 +946,10 @@ impl StateProvider for PostgresProvider {
             qb.push(" OFFSET ").push_bind(off);
         }
         let rows = qb.build().fetch_all(&self.pool).await?;
-        Ok(rows.iter().map(row_to_status).collect())
+        Ok(rows
+            .iter()
+            .map(|r| row_to_status(&self.serializer, r))
+            .collect())
     }
 
     async fn get_workflow_aggregates(
@@ -1308,7 +1327,9 @@ impl StateProvider for PostgresProvider {
         .bind(workflow_id)
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(row_to_step).collect()
+        rows.iter()
+            .map(|r| row_to_step(&self.serializer, r))
+            .collect()
     }
 
     async fn get_step_name(&self, workflow_id: &str, seq: i32) -> Result<Option<String>> {
@@ -1415,7 +1436,7 @@ impl StateProvider for PostgresProvider {
                 closed = true;
                 break;
             }
-            values.push(serialize::decode(fmt.as_deref(), &value)?);
+            values.push(serialize::decode(&self.serializer, fmt.as_deref(), &value)?);
         }
         Ok((values, closed))
     }
@@ -1429,7 +1450,12 @@ impl StateProvider for PostgresProvider {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(key, value, fmt)| Ok((key, serialize::decode(fmt.as_deref(), &value)?)))
+            .map(|(key, value, fmt)| {
+                Ok((
+                    key,
+                    serialize::decode(&self.serializer, fmt.as_deref(), &value)?,
+                ))
+            })
             .collect()
     }
 
@@ -1449,7 +1475,7 @@ impl StateProvider for PostgresProvider {
             .map(|(topic, message, fmt, created_at_ms, consumed)| {
                 Ok(NotificationInfo {
                     topic: (!topic.is_empty()).then_some(topic),
-                    message: serialize::decode(fmt.as_deref(), &message)?,
+                    message: serialize::decode(&self.serializer, fmt.as_deref(), &message)?,
                     created_at_ms,
                     consumed,
                 })
@@ -1465,7 +1491,7 @@ impl StateProvider for PostgresProvider {
         .bind(workflow_id)
         .fetch_all(&self.pool)
         .await?;
-        group_stream_rows(rows)
+        group_stream_rows(&self.serializer, rows)
     }
 
     async fn create_schedule(&self, schedule: &WorkflowSchedule) -> Result<()> {
@@ -1968,14 +1994,14 @@ fn row_to_schedule(row: &sqlx::postgres::PgRow) -> Result<WorkflowSchedule> {
 
 /// Map an `operation_outputs` row to a [`StepInfo`], decoding `output` per the
 /// row's recorded serialization format.
-fn row_to_step(row: &sqlx::postgres::PgRow) -> Result<StepInfo> {
+fn row_to_step(serializer: &Serializer, row: &sqlx::postgres::PgRow) -> Result<StepInfo> {
     let fmt: Option<String> = row.try_get("serialization").ok().flatten();
     let output: Option<String> = row.try_get("output").ok().flatten();
     let error: Option<String> = row.try_get("error").ok().flatten();
     Ok(StepInfo {
         step_id: row.get("function_id"),
         name: row.try_get("function_name").unwrap_or_default(),
-        output: serialize::decode_opt(fmt.as_deref(), output.as_deref())?,
+        output: serialize::decode_opt(serializer, fmt.as_deref(), output.as_deref())?,
         // A recorded failure is decoded to its human message (the envelope's
         // `message` for a portable row), like `WorkflowStatus.error`.
         error: error.map(|e| serialize::decode_error(fmt.as_deref(), &e).0),

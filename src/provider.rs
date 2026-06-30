@@ -122,6 +122,7 @@ impl ChangeWait<'_> {
 /// appears, with an empty value list). Shared by the SQL backends'
 /// `list_workflow_streams`.
 pub(crate) fn group_stream_rows(
+    serializer: &crate::serialize::Serializer,
     rows: Vec<(String, String, Option<String>)>,
 ) -> Result<Vec<(String, Vec<Value>)>> {
     let mut out: Vec<(String, Vec<Value>)> = Vec::new();
@@ -132,7 +133,7 @@ pub(crate) fn group_stream_rows(
             }
             continue;
         }
-        let decoded = crate::serialize::decode(fmt.as_deref(), &value)?;
+        let decoded = crate::serialize::decode(serializer, fmt.as_deref(), &value)?;
         match out.last_mut() {
             Some((k, vals)) if *k == key => vals.push(decoded),
             _ => out.push((key, vec![decoded])),
@@ -734,6 +735,7 @@ impl StepOutcome {
 /// the success value. Both null (an impossible row) yields `None`. Shared by the
 /// SQL backends' `get_step_result`/`record_step_result`.
 pub(crate) fn step_outcome_from(
+    serializer: &crate::serialize::Serializer,
     fmt: Option<&str>,
     output: Option<&str>,
     error: Option<&str>,
@@ -743,7 +745,9 @@ pub(crate) fn step_outcome_from(
         return Ok(Some(StepOutcome::Failure { message, info }));
     }
     match output {
-        Some(o) => Ok(Some(StepOutcome::Output(crate::serialize::decode(fmt, o)?))),
+        Some(o) => Ok(Some(StepOutcome::Output(crate::serialize::decode(
+            serializer, fmt, o,
+        )?))),
         None => Ok(None),
     }
 }

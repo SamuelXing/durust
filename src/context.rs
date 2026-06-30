@@ -550,7 +550,7 @@ impl DurableContext {
         err: Error,
         started_at_ms: Option<i64>,
     ) -> Result<T> {
-        let encoded = crate::serialize::encode_error(self.provider.serializer(), &err);
+        let encoded = crate::serialize::encode_error(&self.provider.serializer(), &err);
         let outcome = self
             .provider
             .record_step_result(

@@ -20,6 +20,8 @@ use crate::error::{Error, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::fmt;
+use std::sync::Arc;
 
 /// Cross-language wire format: plain JSON, readable by any DBOS SDK.
 pub const PORTABLE: &str = "portable_json";
@@ -28,28 +30,66 @@ pub const DBOS_JSON: &str = "DBOS_JSON";
 /// Sentinel the default format writes for a nil value.
 const NIL_MARKER: &str = "__DBOS_NIL";
 
-/// A serialization format for workflow data. Cheap to copy; held by each
+/// A user-supplied serialization codec, plugged in via [`Serializer::custom`].
+///
+/// Implement this to store workflow data in a format other than the built-in
+/// JSON variants — e.g. an encrypted, compressed, or binary encoding. The codec
+/// works in JSON [`Value`] space: [`encode`](Self::encode) turns a value into the
+/// TEXT written to the `serialization`-tagged column, and [`decode`](Self::decode)
+/// reverses it. [`name`](Self::name) is the tag written alongside each value, so a
+/// reader configured with the *same* codec can recognize and decode rows it wrote;
+/// it must differ from the built-in `DBOS_JSON`/`portable_json` names.
+pub trait SerializerCodec: Send + Sync {
+    /// The format tag written to the `serialization` column for values this codec
+    /// encodes. Used to route decoding back to this codec.
+    fn name(&self) -> &str;
+    /// Encode a JSON value to the TEXT stored in the database.
+    fn encode(&self, value: &Value) -> Result<String>;
+    /// Decode TEXT this codec previously wrote back into a JSON value.
+    fn decode(&self, stored: &str) -> Result<Value>;
+}
+
+/// A serialization format for workflow data. Cheap to clone; held by each
 /// provider as the format it *encodes* with (decoding is format-directed).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Default)]
 pub enum Serializer {
     /// `DBOS_JSON`: base64-encoded JSON. The default.
     #[default]
     Json,
     /// `portable_json`: plain JSON, readable across DBOS languages.
     Portable,
+    /// A user-supplied [`SerializerCodec`], installed with [`Serializer::custom`].
+    Custom(Arc<dyn SerializerCodec>),
+}
+
+impl fmt::Debug for Serializer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Serializer::Json => f.write_str("Json"),
+            Serializer::Portable => f.write_str("Portable"),
+            Serializer::Custom(c) => write!(f, "Custom({:?})", c.name()),
+        }
+    }
 }
 
 impl Serializer {
+    /// Wrap a user-supplied [`SerializerCodec`] as a [`Serializer`]. Pass the
+    /// result to a provider's `with_serializer` to store values in a custom format.
+    pub fn custom(codec: Arc<dyn SerializerCodec>) -> Self {
+        Serializer::Custom(codec)
+    }
+
     /// The format name stored in the `serialization` column.
-    pub fn name(self) -> &'static str {
+    pub fn name(&self) -> &str {
         match self {
             Serializer::Json => DBOS_JSON,
             Serializer::Portable => PORTABLE,
+            Serializer::Custom(c) => c.name(),
         }
     }
 
     /// Encode a JSON value to its stored TEXT form.
-    pub fn encode(self, value: &Value) -> Result<String> {
+    pub fn encode(&self, value: &Value) -> Result<String> {
         match self {
             Serializer::Portable => {
                 if value.is_null() {
@@ -63,20 +103,32 @@ impl Serializer {
                 }
                 Ok(STANDARD.encode(serde_json::to_vec(value)?))
             }
+            Serializer::Custom(c) => c.encode(value),
         }
     }
 }
 
 /// Decode a stored TEXT value using the format recorded in its `serialization`
-/// column. `None`, `""`, and `DBOS_JSON` all select the default (base64 JSON);
-/// `portable_json` selects plain JSON. Any other name errors.
-pub fn decode(format: Option<&str>, stored: &str) -> Result<Value> {
+/// column, falling back to `serializer` for any format the built-ins don't
+/// recognize. `portable_json` always decodes as plain JSON and `None`/`""`/
+/// `DBOS_JSON` as the default base64 JSON — regardless of `serializer`, so rows
+/// written by another SDK still read. A format matching a configured custom
+/// codec's name routes to that codec; any other name errors.
+pub fn decode(serializer: &Serializer, format: Option<&str>, stored: &str) -> Result<Value> {
     match format.unwrap_or("") {
         PORTABLE => {
             if stored == "null" {
                 return Ok(Value::Null);
             }
             Ok(serde_json::from_str(stored)?)
+        }
+        // A configured custom codec decodes the rows it wrote (checked before the
+        // base64-JSON default so a codec may even reuse that name if it must).
+        other if matches!(serializer, Serializer::Custom(c) if c.name() == other) => {
+            match serializer {
+                Serializer::Custom(c) => c.decode(stored),
+                _ => unreachable!(),
+            }
         }
         "" | DBOS_JSON => {
             if stored == NIL_MARKER {
@@ -89,16 +141,20 @@ pub fn decode(format: Option<&str>, stored: &str) -> Result<Value> {
         }
         other => Err(Error::Serialization(format!(
             "value uses serialization format {other:?}, which this SDK cannot decode; \
-             use {PORTABLE} for cross-language interop"
+             use {PORTABLE} for cross-language interop, or configure a matching custom serializer"
         ))),
     }
 }
 
 /// Decode an optional stored value, defaulting absent/undecodable rows to `Null`
 /// is *not* done here — callers that want lenient behavior handle the `Err`.
-pub fn decode_opt(format: Option<&str>, stored: Option<&str>) -> Result<Option<Value>> {
+pub fn decode_opt(
+    serializer: &Serializer,
+    format: Option<&str>,
+    stored: Option<&str>,
+) -> Result<Option<Value>> {
     match stored {
-        Some(s) => Ok(Some(decode(format, s)?)),
+        Some(s) => Ok(Some(decode(serializer, format, s)?)),
         None => Ok(None),
     }
 }
@@ -156,8 +212,8 @@ fn as_envelope(value: &Value) -> Option<PortableWorkflowArgs> {
 /// [`PortableWorkflowArgs`] — is kept as-is). Other formats store it directly,
 /// exactly like [`Serializer::encode`]. The envelope struct is serialized
 /// directly so its bytes are `positionalArgs`-first.
-pub fn encode_input(serializer: Serializer, value: &Value) -> Result<String> {
-    if serializer == Serializer::Portable {
+pub fn encode_input(serializer: &Serializer, value: &Value) -> Result<String> {
+    if matches!(serializer, Serializer::Portable) {
         let envelope =
             as_envelope(value).unwrap_or_else(|| PortableWorkflowArgs::single(value.clone()));
         return Ok(serde_json::to_string(&envelope)?);
@@ -169,8 +225,8 @@ pub fn encode_input(serializer: Serializer, value: &Value) -> Result<String> {
 /// envelope is unwrapped to its first positional arg — what a single-input
 /// workflow receives — tolerating a missing/empty `namedArgs` or `positionalArgs`
 /// (⇒ `Null`). Other formats decode exactly like [`decode`].
-pub fn decode_input(format: Option<&str>, stored: &str) -> Result<Value> {
-    let value = decode(format, stored)?;
+pub fn decode_input(serializer: &Serializer, format: Option<&str>, stored: &str) -> Result<Value> {
+    let value = decode(serializer, format, stored)?;
     if format == Some(PORTABLE) {
         Ok(first_positional(value))
     } else {
@@ -179,9 +235,13 @@ pub fn decode_input(format: Option<&str>, stored: &str) -> Result<Value> {
 }
 
 /// `decode_input` over an optional column (mirrors [`decode_opt`]).
-pub fn decode_input_opt(format: Option<&str>, stored: Option<&str>) -> Result<Option<Value>> {
+pub fn decode_input_opt(
+    serializer: &Serializer,
+    format: Option<&str>,
+    stored: Option<&str>,
+) -> Result<Option<Value>> {
     match stored {
-        Some(s) => Ok(Some(decode_input(format, s)?)),
+        Some(s) => Ok(Some(decode_input(serializer, format, s)?)),
         None => Ok(None),
     }
 }
@@ -231,8 +291,8 @@ pub struct PortableWorkflowError {
 /// other SDKs' `serializeWorkflowError`, called at workflow completion — so only
 /// the error outcome is encoded here; cancellation/timeout reasons are stored bare
 /// by their own call sites.
-pub fn encode_error(serializer: Serializer, err: &Error) -> String {
-    if serializer == Serializer::Portable {
+pub fn encode_error(serializer: &Serializer, err: &Error) -> String {
+    if matches!(serializer, Serializer::Portable) {
         let env = match err {
             Error::Portable(pe) => pe.clone(),
             other => PortableWorkflowError {
@@ -290,9 +350,9 @@ mod tests {
         let enc = Serializer::Json.encode(&v).unwrap();
         // base64, not plain JSON.
         assert!(!enc.starts_with('{'));
-        assert_eq!(decode(Some(DBOS_JSON), &enc).unwrap(), v);
+        assert_eq!(decode(&Serializer::Json, Some(DBOS_JSON), &enc).unwrap(), v);
         // Empty/None format name falls back to DBOS_JSON.
-        assert_eq!(decode(None, &enc).unwrap(), v);
+        assert_eq!(decode(&Serializer::Json, None, &enc).unwrap(), v);
     }
 
     #[test]
@@ -300,31 +360,40 @@ mod tests {
         let v = json!({"a": 1});
         let enc = Serializer::Portable.encode(&v).unwrap();
         assert_eq!(enc, r#"{"a":1}"#);
-        assert_eq!(decode(Some(PORTABLE), &enc).unwrap(), v);
+        assert_eq!(decode(&Serializer::Json, Some(PORTABLE), &enc).unwrap(), v);
     }
 
     #[test]
     fn nil_markers_roundtrip() {
         assert_eq!(Serializer::Json.encode(&Value::Null).unwrap(), NIL_MARKER);
         assert_eq!(Serializer::Portable.encode(&Value::Null).unwrap(), "null");
-        assert_eq!(decode(Some(DBOS_JSON), NIL_MARKER).unwrap(), Value::Null);
-        assert_eq!(decode(Some(PORTABLE), "null").unwrap(), Value::Null);
+        assert_eq!(
+            decode(&Serializer::Json, Some(DBOS_JSON), NIL_MARKER).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            decode(&Serializer::Json, Some(PORTABLE), "null").unwrap(),
+            Value::Null
+        );
     }
 
     #[test]
     fn unknown_format_errors() {
-        assert!(decode(Some("DBOS_PICKLE"), "abc").is_err());
-        assert!(decode(Some("some_other_format"), "abc").is_err());
+        assert!(decode(&Serializer::Json, Some("DBOS_PICKLE"), "abc").is_err());
+        assert!(decode(&Serializer::Json, Some("some_other_format"), "abc").is_err());
     }
 
     #[test]
     fn portable_input_wraps_single_value() {
         // A plain workflow input becomes the single positional arg —
         // positionalArgs first, then namedArgs (`{}` when empty).
-        let enc = encode_input(Serializer::Portable, &json!("hello")).unwrap();
+        let enc = encode_input(&Serializer::Portable, &json!("hello")).unwrap();
         assert_eq!(enc, r#"{"positionalArgs":["hello"],"namedArgs":{}}"#);
         // Decoding returns the bare value a single-input workflow receives.
-        assert_eq!(decode_input(Some(PORTABLE), &enc).unwrap(), json!("hello"));
+        assert_eq!(
+            decode_input(&Serializer::Json, Some(PORTABLE), &enc).unwrap(),
+            json!("hello")
+        );
     }
 
     #[test]
@@ -344,7 +413,7 @@ mod tests {
             named_args: Map::new(),
         };
         let enc =
-            encode_input(Serializer::Portable, &serde_json::to_value(&args).unwrap()).unwrap();
+            encode_input(&Serializer::Portable, &serde_json::to_value(&args).unwrap()).unwrap();
         assert_eq!(
             enc,
             r#"{"positionalArgs":["hello-interop",42,"2025-06-15T10:30:00.000Z",["alpha","beta","gamma"],{"key1":"value1","key2":99,"nested":{"deep":true}},true,null],"namedArgs":{}}"#
@@ -362,7 +431,7 @@ mod tests {
             named_args: named,
         };
         let enc =
-            encode_input(Serializer::Portable, &serde_json::to_value(&args).unwrap()).unwrap();
+            encode_input(&Serializer::Portable, &serde_json::to_value(&args).unwrap()).unwrap();
         assert_eq!(enc, r#"{"positionalArgs":[1],"namedArgs":{"name":"test"}}"#);
     }
 
@@ -375,11 +444,19 @@ mod tests {
             r#"{"namedArgs":{},"positionalArgs":["x"]}"#,
             r#"{"positionalArgs":["x"]}"#, // minimal: no namedArgs
         ] {
-            assert_eq!(decode_input(Some(PORTABLE), stored).unwrap(), json!("x"));
+            assert_eq!(
+                decode_input(&Serializer::Json, Some(PORTABLE), stored).unwrap(),
+                json!("x")
+            );
         }
         // Empty positional args ⇒ null (a no-arg call).
         assert_eq!(
-            decode_input(Some(PORTABLE), r#"{"positionalArgs":[],"namedArgs":{}}"#).unwrap(),
+            decode_input(
+                &Serializer::Json,
+                Some(PORTABLE),
+                r#"{"positionalArgs":[],"namedArgs":{}}"#
+            )
+            .unwrap(),
             Value::Null
         );
     }
@@ -388,7 +465,7 @@ mod tests {
     fn portable_error_wraps_under_generic_name() {
         // An untyped error becomes the cross-language envelope under the generic
         // name — message present, code/data omitted (matching Go and Python bytes).
-        let enc = encode_error(Serializer::Portable, &Error::app("boom"));
+        let enc = encode_error(&Serializer::Portable, &Error::app("boom"));
         assert_eq!(enc, r#"{"name":"Portable Error","message":"boom"}"#);
         // It decodes back to the human message plus the structured envelope.
         let (msg, info) = decode_error(Some(PORTABLE), &enc);
@@ -409,7 +486,7 @@ mod tests {
             code: Some(json!(400)),
             data: Some(json!({"field": "email"})),
         });
-        let enc = encode_error(Serializer::Portable, &err);
+        let enc = encode_error(&Serializer::Portable, &err);
         let (msg, info) = decode_error(Some(PORTABLE), &enc);
         assert_eq!(msg, "invalid input");
         let info = info.expect("typed portable error decodes");
@@ -422,9 +499,9 @@ mod tests {
     fn json_error_stays_bare() {
         // Default (non-portable) mode stores and reads the plain message — no
         // envelope, no structured info — even for a typed error.
-        assert_eq!(encode_error(Serializer::Json, &Error::app("boom")), "boom");
+        assert_eq!(encode_error(&Serializer::Json, &Error::app("boom")), "boom");
         assert_eq!(
-            encode_error(Serializer::Json, &Error::portable("Validation", "boom")),
+            encode_error(&Serializer::Json, &Error::portable("Validation", "boom")),
             "boom"
         );
         assert_eq!(
@@ -463,12 +540,18 @@ mod tests {
     fn json_input_is_not_enveloped() {
         // Default (non-portable) mode stores the input directly — no envelope —
         // and decodes it back unchanged.
-        let enc = encode_input(Serializer::Json, &json!("hello")).unwrap();
+        let enc = encode_input(&Serializer::Json, &json!("hello")).unwrap();
         assert_eq!(enc, Serializer::Json.encode(&json!("hello")).unwrap());
-        assert_eq!(decode_input(Some(DBOS_JSON), &enc).unwrap(), json!("hello"));
+        assert_eq!(
+            decode_input(&Serializer::Json, Some(DBOS_JSON), &enc).unwrap(),
+            json!("hello")
+        );
         // An envelope-shaped value is left intact in JSON mode (never unwrapped).
         let shaped = json!({"positionalArgs": ["x"], "namedArgs": {}});
-        let enc2 = encode_input(Serializer::Json, &shaped).unwrap();
-        assert_eq!(decode_input(Some(DBOS_JSON), &enc2).unwrap(), shaped);
+        let enc2 = encode_input(&Serializer::Json, &shaped).unwrap();
+        assert_eq!(
+            decode_input(&Serializer::Json, Some(DBOS_JSON), &enc2).unwrap(),
+            shaped
+        );
     }
 }
