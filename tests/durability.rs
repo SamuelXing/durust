@@ -3,6 +3,7 @@
 use durust::{DurableContext, DurableEngine, Error, InMemoryProvider, Result};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// A step's side effect must run exactly once even if the workflow is executed
 /// again under the same id (the core durable-execution guarantee).
@@ -110,5 +111,57 @@ async fn multi_step_results_are_stable() -> Result<()> {
     // Replay yields the identical answer.
     let out2: i64 = engine.start_typed("pipeline", "wf-2", 10_i64).await?;
     assert_eq!(out2, 21);
+    Ok(())
+}
+
+/// A durable `sleep` is a checkpoint, not a real delay: the first run records the
+/// absolute wake instant, so a replay reads it back and returns immediately
+/// instead of sleeping again — a workflow that napped before a crash does not
+/// re-wait the whole duration on recovery. (Mirrors the other SDKs' durable-sleep
+/// recovery guarantee.)
+#[tokio::test]
+async fn durable_sleep_is_not_repeated_on_replay() -> Result<()> {
+    static AFTER_SLEEP: AtomicUsize = AtomicUsize::new(0);
+    let nap = Duration::from_millis(500);
+
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(provider).await?;
+    engine.register("napper", move |ctx: DurableContext, _: ()| async move {
+        ctx.sleep(nap).await?;
+        // A checkpointed step after the sleep, to prove the body resumed past it.
+        ctx.step("after_nap", || async {
+            AFTER_SLEEP.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, Error>(1_i64)
+        })
+        .await?;
+        Ok::<_, Error>(())
+    });
+
+    // First execution actually waits out the nap and records the wake instant.
+    let t0 = Instant::now();
+    engine.start_typed::<_, ()>("napper", "wf-nap", ()).await?;
+    let first = t0.elapsed();
+    assert!(
+        first >= Duration::from_millis(400),
+        "first run should really sleep (~500ms), took {first:?}"
+    );
+
+    // Replaying the same id reads the stored wake instant — already in the past —
+    // so it must return promptly rather than sleeping another ~500ms.
+    let t1 = Instant::now();
+    engine.start_typed::<_, ()>("napper", "wf-nap", ()).await?;
+    let replay = t1.elapsed();
+    assert!(
+        replay < Duration::from_millis(200),
+        "replay must not re-sleep the durable timer, took {replay:?}"
+    );
+
+    // The post-sleep step ran exactly once (recorded on the first run, replayed
+    // from its checkpoint on the second).
+    assert_eq!(
+        AFTER_SLEEP.load(Ordering::SeqCst),
+        1,
+        "the step after the sleep runs once across the replay"
+    );
     Ok(())
 }
