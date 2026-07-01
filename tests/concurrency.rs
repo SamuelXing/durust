@@ -57,6 +57,42 @@ async fn select_returns_first_to_complete() -> Result<()> {
     Ok(())
 }
 
+/// Many independent workflows run concurrently and each completes with its own
+/// correct result, its single step running exactly once — an isolation/scale
+/// check that ids, checkpoints, and outputs never cross-contaminate under load.
+#[tokio::test]
+async fn many_concurrent_workflows_stay_isolated() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("square", |ctx: DurableContext, n: i64| async move {
+        // A checkpointed step, so each workflow records its own operation output.
+        let r = ctx
+            .step("sq", move || async move { Ok::<_, Error>(n * n) })
+            .await?;
+        Ok::<_, Error>(r)
+    });
+    let engine = Arc::new(engine);
+
+    const N: i64 = 200;
+    let mut handles = Vec::new();
+    for i in 0..N {
+        let e = engine.clone();
+        handles.push(tokio::spawn(async move {
+            let out: i64 = e.start_typed("square", &format!("wf-{i}"), i).await?;
+            Ok::<_, Error>((i, out))
+        }));
+    }
+    for h in handles {
+        let (i, out) = h.await.expect("workflow task panicked")?;
+        assert_eq!(out, i * i, "workflow {i} returned the wrong result");
+    }
+
+    // Each workflow recorded exactly its own one step (a spot check).
+    for id in ["wf-0", "wf-7", "wf-199"] {
+        assert_eq!(engine.get_workflow_steps(id).await?.len(), 1);
+    }
+    Ok(())
+}
+
 /// `select` over no branches is a programming error, surfaced as a failure.
 #[tokio::test]
 async fn select_with_no_branches_errors() -> Result<()> {
