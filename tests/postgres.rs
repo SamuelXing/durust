@@ -2013,6 +2013,57 @@ async fn pg_recv_wakes_via_listen_notify() -> Result<()> {
     Ok(())
 }
 
+/// On Postgres, an idempotent send is deduplicated by the `notifications`
+/// primary key: two sends sharing a key insert one row (the retry hits
+/// `ON CONFLICT DO NOTHING`), while a distinct key inserts its own.
+#[tokio::test]
+async fn pg_send_with_idempotency_key_delivers_once() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_send_with_idempotency_key_delivers_once: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let id = format!("wf-idem-{tag}");
+
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("sink", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(())
+    });
+    // A completed destination that can still receive messages.
+    engine
+        .run_workflow::<_, ()>("sink", (), WorkflowOptions::with_id(&id))
+        .await?
+        .get_result()
+        .await?;
+
+    engine
+        .send_with_idempotency_key(&id, "a".to_string(), "t", "k1")
+        .await?;
+    engine
+        .send_with_idempotency_key(&id, "a-again".to_string(), "t", "k1")
+        .await?;
+    engine
+        .send_with_idempotency_key(&id, "b".to_string(), "t", "k2")
+        .await?;
+
+    // Exactly two messages persisted, in send order; the duplicate was dropped.
+    let m1 = provider.consume_notification(&id, "t", 0, "probe").await?;
+    let m2 = provider.consume_notification(&id, "t", 1, "probe").await?;
+    let m3 = provider.consume_notification(&id, "t", 2, "probe").await?;
+    assert_eq!(m1, Some(serde_json::json!("a")));
+    assert_eq!(m2, Some(serde_json::json!("b")));
+    assert_eq!(
+        m3, None,
+        "the duplicate keyed send was dropped by ON CONFLICT"
+    );
+
+    engine
+        .delete_workflows(std::slice::from_ref(&id), false)
+        .await?;
+    Ok(())
+}
+
 /// A blocked get_event wakes via LISTEN/NOTIFY when another workflow sets the
 /// event, returning well within the backstop interval.
 #[tokio::test]
