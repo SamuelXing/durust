@@ -12,6 +12,10 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
+/// Predicate deciding whether a step error is retryable — see
+/// [`StepOptions::retry_if`]. Returning `false` stops retries at once.
+pub type RetryPredicate = Arc<dyn Fn(&Error) -> bool + Send + Sync>;
+
 /// Retry policy for a durable step.
 ///
 /// Defaults: no retries, factor 2.0, 100ms base, 5s cap.
@@ -27,6 +31,11 @@ pub struct StepOptions {
     pub base_interval: Duration,
     /// Upper bound on any single backoff delay.
     pub max_interval: Duration,
+    /// Optional predicate deciding whether a given step error is retryable. When
+    /// it returns `false` the step is *not* retried — the error propagates
+    /// immediately even if `max_retries` attempts remain, so a permanent failure
+    /// fails fast. `None` (the default) retries every error up to `max_retries`.
+    pub retry_if: Option<RetryPredicate>,
 }
 
 impl StepOptions {
@@ -38,6 +47,7 @@ impl StepOptions {
             backoff_factor: 2.0,
             base_interval: Duration::from_millis(100),
             max_interval: Duration::from_secs(5),
+            retry_if: None,
         }
     }
 
@@ -62,6 +72,23 @@ impl StepOptions {
     /// Set the maximum retry delay.
     pub fn max_interval(mut self, d: Duration) -> Self {
         self.max_interval = d;
+        self
+    }
+
+    /// Set a predicate that decides whether a step error is retryable. It is
+    /// consulted on every failure before backoff; returning `false` stops retries
+    /// at once (the error propagates), so permanent errors don't burn attempts:
+    ///
+    /// ```ignore
+    /// let opts = StepOptions::new("fetch")
+    ///     .max_retries(5)
+    ///     .retry_if(|e: &Error| e.is_retryable());
+    /// ```
+    pub fn retry_if<P>(mut self, predicate: P) -> Self
+    where
+        P: Fn(&Error) -> bool + Send + Sync + 'static,
+    {
+        self.retry_if = Some(Arc::new(predicate));
         self
     }
 }
@@ -580,7 +607,10 @@ impl DurableContext {
             match f().await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
-                    if attempt >= opts.max_retries {
+                    // A predicate that rejects the error stops retries immediately,
+                    // regardless of remaining attempts (fail fast on permanent errors).
+                    let retryable = opts.retry_if.as_ref().is_none_or(|p| p(&e));
+                    if !retryable || attempt >= opts.max_retries {
                         return Err(e);
                     }
                     let backoff =
