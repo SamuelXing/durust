@@ -1,0 +1,39 @@
+name: security
+
+# Vulnerability scan of the dependency tree — the Rust analog of the Go SDK's
+# govulncheck. Deliberately NOT a PR gate: a freshly published advisory should
+# never block unrelated work from landing on main. It runs on a weekly schedule,
+# on demand, and whenever the dependency manifests change.
+
+on:
+  schedule:
+    # Mondays 06:00 UTC.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '**/Cargo.toml'
+      - '.github/workflows/security.yml'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Cargo.lock is gitignored, so materialize one for the scan.
+      - name: generate lockfile
+        run: cargo generate-lockfile
+      - name: install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: audit
+        run: cargo audit
