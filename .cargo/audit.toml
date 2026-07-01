@@ -1,0 +1,14 @@
+# cargo-audit configuration (read by the scheduled `security` workflow and any
+# local `cargo audit`). Keep this list minimal and documented — every entry is a
+# vulnerability we are knowingly accepting because it cannot currently be fixed.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — "Marvin Attack": a timing sidechannel in the `rsa`
+    # crate, pulled transitively by sqlx-postgres for RSA-based Postgres
+    # authentication. There is no fixed release of `rsa` yet, so it cannot be
+    # resolved by a version bump. Low real-world risk here: the sidechannel is
+    # only reachable during RSA-key Postgres auth; the SCRAM/md5 auth paths do
+    # not touch it. Remove this once `rsa` ships a constant-time fix.
+    "RUSTSEC-2023-0071",
+]
