@@ -300,8 +300,7 @@ async fn bulk_cancel_and_resume() -> Result<()> {
             ))
             .await?;
     }
-    let done: () = engine.start_typed("noop", "wf-done", ()).await?;
-    let _ = done;
+    let () = engine.start_typed("noop", "wf-done", ()).await?;
 
     // Cancel a subset plus a missing id and the completed one (both skipped).
     engine

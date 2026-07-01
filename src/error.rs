@@ -1,7 +1,7 @@
 use crate::serialize::PortableWorkflowError;
 use thiserror::Error;
 
-/// A stable, programmatic classification of an [`Error`], returned by
+/// A stable, programmatic classification of an [`Error`](enum@Error), returned by
 /// [`Error::code`]. Lets callers branch on *what kind* of failure occurred
 /// without matching every concrete variant. Non-exhaustive: new codes may be
 /// added as the SDK grows, so always include a `_` arm when matching.

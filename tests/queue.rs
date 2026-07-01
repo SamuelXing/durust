@@ -211,8 +211,10 @@ async fn delay_requires_queue() -> Result<()> {
     engine.register("noop", |_ctx: DurableContext, _: ()| async move {
         Ok::<_, Error>(())
     });
-    let mut opts = WorkflowOptions::default();
-    opts.delay = Some(Duration::from_millis(10));
+    let opts = WorkflowOptions {
+        delay: Some(Duration::from_millis(10)),
+        ..Default::default()
+    };
     let res = engine.run_workflow::<_, ()>("noop", (), opts).await;
     assert!(res.is_err());
     Ok(())

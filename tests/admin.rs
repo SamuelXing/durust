@@ -23,7 +23,11 @@ async fn http(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, 
     stream.read_to_end(&mut buf).await.unwrap();
     let text = String::from_utf8_lossy(&buf).to_string();
     let status: u16 = text.split_whitespace().nth(1).unwrap().parse().unwrap();
-    let resp_body = text.splitn(2, "\r\n\r\n").nth(1).unwrap_or("").to_string();
+    let resp_body = text
+        .split_once("\r\n\r\n")
+        .map(|x| x.1)
+        .unwrap_or("")
+        .to_string();
     (status, resp_body)
 }
 

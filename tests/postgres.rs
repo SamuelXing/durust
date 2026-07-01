@@ -1586,6 +1586,9 @@ async fn pg_apply_schedules_is_atomic() -> Result<()> {
     let other = format!("{prefix}other");
     let dup = format!("dup-{tag}");
     let provider = PostgresProvider::connect(&url).await?;
+    // This test drives the provider directly (no engine), so run migrations here —
+    // every engine-backed test gets the schema via `DurableEngine::new`.
+    provider.init().await?;
 
     let make = |id: String, name: String, cron: &str| WorkflowSchedule {
         schedule_id: id,

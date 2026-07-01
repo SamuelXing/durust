@@ -1108,7 +1108,7 @@ impl StateProvider for InMemoryProvider {
     async fn list_application_versions(&self) -> Result<Vec<VersionInfo>> {
         let g = self.inner.lock().await;
         let mut out: Vec<VersionInfo> = g.versions.values().cloned().collect();
-        out.sort_by(|a, b| b.version_timestamp.cmp(&a.version_timestamp));
+        out.sort_by_key(|v| std::cmp::Reverse(v.version_timestamp));
         Ok(out)
     }
 

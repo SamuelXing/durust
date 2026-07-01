@@ -994,7 +994,7 @@ pub trait StateProvider: Send + Sync {
     /// encoded at the engine because they carry a structured type the
     /// [`set_workflow_status`](Self::set_workflow_status) `&str` channel cannot —
     /// so a portable provider writes the cross-language error envelope. Defaults
-    /// to [`Serializer::Json`] (bare error strings); the SQL providers return
+    /// to [`Serializer::Json`](crate::Serializer::Json) (bare error strings); the SQL providers return
     /// their configured serializer.
     fn serializer(&self) -> crate::serialize::Serializer {
         crate::serialize::Serializer::Json
