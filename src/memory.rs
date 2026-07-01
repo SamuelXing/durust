@@ -15,6 +15,9 @@ use std::collections::HashMap;
 use tokio::sync::Mutex;
 
 struct NotificationRow {
+    /// Primary key mirroring the SQL backends: derived from a send's idempotency
+    /// key (`{key}::{dest}`) or a fresh uuid. Used to drop duplicate keyed sends.
+    message_uuid: String,
     destination_id: String,
     topic: String,
     message: Value,
@@ -316,13 +319,28 @@ impl StateProvider for InMemoryProvider {
         destination_id: &str,
         topic: &str,
         message: Value,
+        idempotency_key: Option<&str>,
     ) -> Result<()> {
         let mut g = self.inner.lock().await;
         // Mirror the SQL backends' FK on destination_uuid → workflow_status.
         if !g.workflows.contains_key(destination_id) {
             return Err(Error::nonexistent_workflow(destination_id));
         }
+        // A keyed send derives its primary key so a retry is a no-op
+        // (at-most-once); an unkeyed send gets a fresh id every time.
+        let message_uuid = match idempotency_key {
+            Some(k) => format!("{k}::{destination_id}"),
+            None => uuid::Uuid::new_v4().to_string(),
+        };
+        if idempotency_key.is_some()
+            && g.notifications
+                .iter()
+                .any(|n| n.message_uuid == message_uuid)
+        {
+            return Ok(());
+        }
         g.notifications.push(NotificationRow {
+            message_uuid,
             destination_id: destination_id.to_string(),
             topic: topic.to_string(),
             message,

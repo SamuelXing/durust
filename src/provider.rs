@@ -1127,11 +1127,17 @@ pub trait StateProvider: Send + Sync {
 
     /// Append a message for `destination_id` on `topic`. Errors if the
     /// destination workflow does not exist (FK violation in the SQL backends).
+    ///
+    /// When `idempotency_key` is `Some`, the row's primary key is derived from it
+    /// (`{key}::{destination_id}`) and a repeated insert is a silent no-op, so a
+    /// caller that retries the send delivers the message **at most once**; `None`
+    /// assigns a fresh id, so every send delivers.
     async fn insert_notification(
         &self,
         destination_id: &str,
         topic: &str,
         message: Value,
+        idempotency_key: Option<&str>,
     ) -> Result<()>;
 
     /// Atomically claim the **oldest unconsumed** message for

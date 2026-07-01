@@ -866,7 +866,28 @@ impl DurableEngine {
         topic: &str,
     ) -> Result<()> {
         self.provider
-            .insert_notification(destination_id, topic, serde_json::to_value(message)?)
+            .insert_notification(destination_id, topic, serde_json::to_value(message)?, None)
+            .await
+    }
+
+    /// Like [`send`](Self::send) but idempotent: the message is delivered **at
+    /// most once** for a given `idempotency_key` and destination, so a caller that
+    /// retries after a transient failure never double-delivers. Two sends with the
+    /// same key to the same workflow collapse to one; distinct keys each deliver.
+    pub async fn send_with_idempotency_key<T: Serialize>(
+        &self,
+        destination_id: &str,
+        message: T,
+        topic: &str,
+        idempotency_key: &str,
+    ) -> Result<()> {
+        self.provider
+            .insert_notification(
+                destination_id,
+                topic,
+                serde_json::to_value(message)?,
+                Some(idempotency_key),
+            )
             .await
     }
 
