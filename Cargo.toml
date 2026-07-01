@@ -25,7 +25,7 @@ flate2 = "1"
 axum = "0.7"
 # Conductor websocket client (opt-in via `Conductor::start`). rustls to match the
 # rest of the TLS stack; `futures-util` drives the split Sink/Stream.
-tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 # CancellationToken for structured, level-triggered shutdown of the conductor
 # connection loop (and the sub-tasks later parts will spawn).
@@ -41,7 +41,7 @@ fail = "0.5"
 [dev-dependencies]
 tracing-subscriber = "0.3"
 # A local websocket server for the conductor client tests.
-tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 # Arm the failpoints above during tests and the `order` crash-recovery demo.
 # Cargo unifies features within a build, so this enables `fail/failpoints` for
