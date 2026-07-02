@@ -955,7 +955,9 @@ async fn pg_schedule_crud() -> Result<()> {
             "0 0 0 * * *",
             ScheduleOptions::new()
                 .context(&serde_json::json!({"region": "us"}))
-                .queue_name("internal"),
+                .queue_name("internal")
+                .automatic_backfill(true)
+                .cron_timezone("America/New_York"),
         )
         .await?;
 
@@ -967,6 +969,9 @@ async fn pg_schedule_crud() -> Result<()> {
         got.context.as_ref().and_then(|v| v.get("region")),
         Some(&serde_json::json!("us"))
     );
+    // Every configured option round-trips through get_schedule.
+    assert!(got.automatic_backfill, "automatic_backfill round-trips");
+    assert_eq!(got.cron_timezone.as_deref(), Some("America/New_York"));
 
     // A duplicate name is rejected.
     assert!(engine
@@ -1716,6 +1721,102 @@ async fn pg_transaction_step() -> Result<()> {
     assert_eq!(bal2, 90, "exactly-once: re-running does not debit again");
 
     // Clean up the user table and the workflow rows.
+    let drop_wf = format!("wf-drop-{tag}");
+    let _: () = engine.start_typed("drop", &drop_wf, table.clone()).await?;
+    provider.delete_workflows(&[wf, drop_wf], false).await?;
+    Ok(())
+}
+
+/// A transactional step whose body writes a row and then returns an application
+/// error rolls the write back on Postgres: a later step reads the original value.
+/// This is the shared-system-DB-pool path — where Go's `runAsTxn` instead commits
+/// the partial write (its `runastxn_partial_write` repro documents that as a bug).
+/// Rust records the error *outside* the body's transaction, so the body's tx
+/// aborts cleanly and nothing it wrote persists.
+#[tokio::test]
+async fn pg_transaction_step_rolls_back_on_error() -> Result<()> {
+    use durust::params;
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_transaction_step_rolls_back_on_error: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let table = format!("kv_{tag}");
+    let wf = format!("wf-txnrb-{tag}");
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+
+    engine.register("rb", |ctx: DurableContext, table: String| async move {
+        let t = table.clone();
+        ctx.transaction::<(), _>("setup", move |tx| {
+            let t = t.clone();
+            Box::pin(async move {
+                tx.execute(
+                    &format!("CREATE TABLE IF NOT EXISTS {t} (id INT PRIMARY KEY, v BIGINT)"),
+                    &params![],
+                )
+                .await?;
+                tx.execute(
+                    &format!("INSERT INTO {t} (id, v) VALUES (1, 0) ON CONFLICT (id) DO NOTHING"),
+                    &params![],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await?;
+
+        // Write, then return an application error: the body's write must roll back
+        // with its transaction — the error is recorded separately, not committed
+        // inside the aborted body tx.
+        let t = table.clone();
+        let failed = ctx
+            .transaction::<(), _>("bad", move |tx| {
+                let t = t.clone();
+                Box::pin(async move {
+                    tx.execute(&format!("UPDATE {t} SET v = 999 WHERE id = 1"), &params![])
+                        .await?;
+                    Err(Error::app("business rule violated"))
+                })
+            })
+            .await
+            .is_err();
+
+        let t = table.clone();
+        let v: i64 = ctx
+            .transaction("read", move |tx| {
+                let t = t.clone();
+                Box::pin(async move {
+                    let row = tx
+                        .query_one(&format!("SELECT v FROM {t} WHERE id = 1"), &params![])
+                        .await?;
+                    Ok(row.get::<i64>("v"))
+                })
+            })
+            .await?;
+        Ok::<_, Error>((failed, v))
+    });
+
+    engine.register("drop", |ctx: DurableContext, table: String| async move {
+        ctx.transaction::<(), _>("drop", move |tx| {
+            let table = table.clone();
+            Box::pin(async move {
+                tx.execute(&format!("DROP TABLE IF EXISTS {table}"), &params![])
+                    .await?;
+                Ok(())
+            })
+        })
+        .await?;
+        Ok::<_, Error>(())
+    });
+
+    let (failed, v): (bool, i64) = engine.start_typed("rb", &wf, table.clone()).await?;
+    assert!(failed, "the failing transaction returned its error");
+    assert_eq!(
+        v, 0,
+        "the failed transaction's write rolled back on Postgres"
+    );
+
     let drop_wf = format!("wf-drop-{tag}");
     let _: () = engine.start_typed("drop", &drop_wf, table.clone()).await?;
     provider.delete_workflows(&[wf, drop_wf], false).await?;

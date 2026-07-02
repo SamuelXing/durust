@@ -192,6 +192,53 @@ async fn client_set_workflow_delay_pulls_in() -> Result<()> {
     Ok(())
 }
 
+/// `set_workflow_delay_until` reschedules a far-future DELAYED workflow to an
+/// absolute instant (rather than a relative duration), and a running dispatcher
+/// then claims it promptly.
+#[tokio::test]
+async fn client_set_workflow_delay_until_pulls_in() -> Result<()> {
+    static RAN: AtomicUsize = AtomicUsize::new(0);
+    let provider = Arc::new(InMemoryProvider::new());
+
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("ping", |_ctx: DurableContext, _: ()| async move {
+        RAN.fetch_add(1, Ordering::SeqCst);
+        Ok::<_, Error>(())
+    });
+    engine.register_queue(WorkflowQueue::new("q"));
+    engine.launch().await?;
+
+    let client = Client::new(provider.clone());
+    let opts = WorkflowOptions {
+        workflow_id: Some("du1".to_string()),
+        delay: Some(Duration::from_secs(60)),
+        ..Default::default()
+    };
+    client.enqueue::<_, ()>("q", "ping", (), opts).await?;
+
+    // Reschedule to an absolute time just past now.
+    let at = chrono::Utc::now() + chrono::Duration::milliseconds(10);
+    assert!(client.set_workflow_delay_until("du1", at).await?);
+
+    for _ in 0..100 {
+        if RAN.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(RAN.load(Ordering::SeqCst), 1, "rescheduled workflow ran");
+
+    // A missing / non-DELAYED id is a no-op.
+    assert!(
+        !client
+            .set_workflow_delay_until("nope", chrono::Utc::now())
+            .await?
+    );
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
 /// The client reads a durable stream a workflow produced.
 #[tokio::test]
 async fn client_reads_a_stream() -> Result<()> {
