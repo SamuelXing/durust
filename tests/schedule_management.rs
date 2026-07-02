@@ -6,7 +6,7 @@
 use chrono::{TimeZone, Utc};
 use durust::{
     ApplySchedule, DurableContext, DurableEngine, Error, InMemoryProvider, Result, ScheduleFilter,
-    ScheduleOptions, WorkflowHandle,
+    ScheduleOptions, StateProvider, WorkflowHandle,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -189,5 +189,55 @@ async fn timezone_shifts_the_fired_instant() -> Result<()> {
             .is_err(),
         "invalid timezone rejected"
     );
+    Ok(())
+}
+
+/// A schedule with `automatic_backfill` catches up ticks it missed while down:
+/// on launch the reconciler backfills from the recorded `last_fired_at` to now,
+/// so a fresh engine runs the missed ticks rather than only firing live. Without
+/// the flag those ticks would be silently dropped.
+#[tokio::test]
+async fn automatic_backfill_catches_up_missed_ticks_on_launch() -> Result<()> {
+    static WORK: AtomicUsize = AtomicUsize::new(0);
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("beat", |_ctx: DurableContext, _at: String| async move {
+        WORK.fetch_add(1, Ordering::SeqCst);
+        Ok::<_, Error>(())
+    });
+    // Fire every second, with automatic backfill enabled.
+    engine
+        .create_schedule(
+            "beat",
+            "beat",
+            "* * * * * *",
+            ScheduleOptions::new().automatic_backfill(true),
+        )
+        .await?;
+    // Simulate the schedule having last fired ~10s ago, before a restart: those
+    // ~10 missed ticks must be caught up when the reconciler installs the loop.
+    let ten_ago = (Utc::now() - chrono::Duration::seconds(10)).timestamp_millis();
+    provider.set_schedule_last_fired("beat", ten_ago).await?;
+
+    engine.launch().await?;
+
+    // The reconciler backfills the missed ticks immediately (onto the internal
+    // queue), so the count climbs fast. A live loop alone fires ~1/sec, so
+    // reaching 5 well before ~5 seconds have passed can only be the catch-up.
+    let mut caught_up = false;
+    for _ in 0..150 {
+        if WORK.load(Ordering::SeqCst) >= 5 {
+            caught_up = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        caught_up,
+        "automatic backfill should catch up the missed ticks on launch (got {})",
+        WORK.load(Ordering::SeqCst)
+    );
+
+    engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
