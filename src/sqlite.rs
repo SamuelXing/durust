@@ -1790,53 +1790,49 @@ fn push_list_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a ListFilt
         qb.push(sep);
         sep = " AND ";
     };
-    if !filter.workflow_ids.is_empty() {
+    // `col IN (?, ?, …)` for a non-empty value set (OR-match).
+    let mut push_in = |qb: &mut QueryBuilder<'a, Sqlite>, col: &str, vals: &'a [String]| {
+        if vals.is_empty() {
+            return;
+        }
         clause(qb);
-        qb.push("workflow_uuid IN (");
+        qb.push(col).push(" IN (");
         let mut sebs = qb.separated(", ");
-        for id in &filter.workflow_ids {
-            sebs.push_bind(id.as_str());
+        for v in vals {
+            sebs.push_bind(v.as_str());
         }
         sebs.push_unseparated(")");
-    }
-    if let Some(prefix) = &filter.workflow_id_prefix {
+    };
+    push_in(qb, "workflow_uuid", &filter.workflow_ids);
+    push_in(qb, "name", &filter.name);
+    push_in(qb, "status", &filter.status);
+    push_in(qb, "queue_name", &filter.queue_name);
+    push_in(qb, "application_version", &filter.app_version);
+    push_in(qb, "executor_id", &filter.executor_ids);
+    push_in(qb, "authenticated_user", &filter.authenticated_users);
+    push_in(qb, "forked_from", &filter.forked_from);
+    push_in(qb, "parent_workflow_id", &filter.parent_workflow_ids);
+    if !filter.workflow_id_prefix.is_empty() {
         clause(qb);
-        qb.push("workflow_uuid LIKE ")
-            .push_bind(format!("{prefix}%"));
-    }
-    if let Some(name) = &filter.name {
-        clause(qb);
-        qb.push("name = ").push_bind(name.as_str());
-    }
-    if !filter.status.is_empty() {
-        clause(qb);
-        qb.push("status IN (");
-        let mut sebs = qb.separated(", ");
-        for s in &filter.status {
-            sebs.push_bind(s.as_str());
+        qb.push("(");
+        let mut first = true;
+        for prefix in &filter.workflow_id_prefix {
+            if !first {
+                qb.push(" OR ");
+            }
+            first = false;
+            qb.push("workflow_uuid LIKE ")
+                .push_bind(format!("{prefix}%"));
         }
-        sebs.push_unseparated(")");
+        qb.push(")");
     }
-    if let Some(q) = &filter.queue_name {
+    if let Some(wf) = filter.was_forked_from {
         clause(qb);
-        qb.push("queue_name = ").push_bind(q.as_str());
-    }
-    if let Some(v) = &filter.app_version {
-        clause(qb);
-        qb.push("application_version = ").push_bind(v.as_str());
-    }
-    if !filter.executor_ids.is_empty() {
-        clause(qb);
-        qb.push("executor_id IN (");
-        let mut sebs = qb.separated(", ");
-        for e in &filter.executor_ids {
-            sebs.push_bind(e.as_str());
-        }
-        sebs.push_unseparated(")");
-    }
-    if let Some(f) = &filter.forked_from {
-        clause(qb);
-        qb.push("forked_from = ").push_bind(f.as_str());
+        qb.push(if wf {
+            "was_forked_from = TRUE"
+        } else {
+            "(was_forked_from = FALSE OR was_forked_from IS NULL)"
+        });
     }
     if let Some(t) = filter.start_time_ms {
         clause(qb);

@@ -1047,7 +1047,7 @@ async fn pg_schedule_backfill_apply_trigger() -> Result<()> {
 
     let prefix = format!("sched-{name}-");
     let filter = ListFilter {
-        workflow_id_prefix: Some(prefix.clone()),
+        workflow_id_prefix: vec![prefix.clone()],
         ..Default::default()
     };
     for _ in 0..100 {
@@ -1231,7 +1231,7 @@ async fn pg_client_manages_workflows() -> Result<()> {
     client.cancel_workflow(&cancel_id).await?;
     let one = client
         .list_workflows(&ListFilter {
-            workflow_id_prefix: Some(cancel_id.clone()),
+            workflow_id_prefix: vec![cancel_id.clone()],
             ..Default::default()
         })
         .await?;
@@ -1242,7 +1242,7 @@ async fn pg_client_manages_workflows() -> Result<()> {
         .await?;
     assert!(client
         .list_workflows(&ListFilter {
-            workflow_id_prefix: Some(cancel_id),
+            workflow_id_prefix: vec![cancel_id],
             ..Default::default()
         })
         .await?
@@ -1338,7 +1338,7 @@ async fn pg_client_backfills_and_triggers_a_schedule() -> Result<()> {
     assert_eq!(ids.len(), 3, "one tick per day");
 
     let backfilled = ListFilter {
-        workflow_id_prefix: Some(format!("sched-{name}-")),
+        workflow_id_prefix: vec![format!("sched-{name}-")],
         ..Default::default()
     };
     let rows = client.list_workflows(&backfilled).await?;
@@ -1356,7 +1356,7 @@ async fn pg_client_backfills_and_triggers_a_schedule() -> Result<()> {
     assert!(h.id().starts_with(&format!("sched-{name}-trigger-")));
     let trig = client
         .list_workflows(&ListFilter {
-            workflow_id_prefix: Some(format!("sched-{name}-trigger-")),
+            workflow_id_prefix: vec![format!("sched-{name}-trigger-")],
             ..Default::default()
         })
         .await?;
@@ -1440,7 +1440,7 @@ async fn pg_enqueue_dedup_and_app_version() -> Result<()> {
         .await?;
     let rows = client
         .list_workflows(&ListFilter {
-            workflow_id_prefix: Some(ver_id.clone()),
+            workflow_id_prefix: vec![ver_id.clone()],
             ..Default::default()
         })
         .await?;
@@ -2213,5 +2213,133 @@ async fn pg_get_event_wakes_via_listen_notify() -> Result<()> {
     engine
         .delete_workflows(&[reader_id, setter_id], false)
         .await?;
+    Ok(())
+}
+
+/// Multi-value list filters go through the SQL WHERE builder (`IN`/`= ANY`,
+/// `LIKE ANY`) and `was_forked_from` on Postgres: OR-matching several names,
+/// prefixes, and authenticated users, and isolating forks.
+#[tokio::test]
+async fn pg_list_filters_multi_value() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_list_filters_multi_value: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4().to_string();
+    let mut engine = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
+    engine.register("mvf_a", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n)
+    });
+    engine.register("mvf_b", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n)
+    });
+    engine.register("mvf_c", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n)
+    });
+    engine.launch().await?;
+
+    let a_id = format!("mvf-a-{tag}");
+    let b_id = format!("mvf-b-{tag}");
+    let c_id = format!("mvf-c-{tag}");
+    engine
+        .run_workflow::<_, i64>(
+            "mvf_a",
+            1i64,
+            WorkflowOptions::with_id(&a_id).authenticated_user("alice"),
+        )
+        .await?
+        .get_result()
+        .await?;
+    engine
+        .run_workflow::<_, i64>(
+            "mvf_b",
+            2i64,
+            WorkflowOptions::with_id(&b_id).authenticated_user("bob"),
+        )
+        .await?
+        .get_result()
+        .await?;
+    engine
+        .run_workflow::<_, i64>(
+            "mvf_c",
+            3i64,
+            WorkflowOptions::with_id(&c_id).authenticated_user("carol"),
+        )
+        .await?
+        .get_result()
+        .await?;
+
+    // OR across names (mvf_a, mvf_b) scoped to this run's ids.
+    let by_name = engine
+        .list_workflows(&ListFilter {
+            name: vec!["mvf_a".to_string(), "mvf_b".to_string()],
+            workflow_ids: vec![a_id.clone(), b_id.clone(), c_id.clone()],
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(by_name.len(), 2, "IN-match on name");
+
+    // OR across id prefixes (LIKE ANY).
+    let by_prefix = engine
+        .list_workflows(&ListFilter {
+            workflow_id_prefix: vec![format!("mvf-a-{tag}"), format!("mvf-c-{tag}")],
+            ..Default::default()
+        })
+        .await?;
+    let mut got: Vec<&str> = by_prefix.iter().map(|w| w.id.as_str()).collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![a_id.as_str(), c_id.as_str()],
+        "LIKE ANY on prefix"
+    );
+
+    // OR across authenticated users.
+    let by_user = engine
+        .list_workflows(&ListFilter {
+            authenticated_users: vec!["alice".to_string(), "carol".to_string()],
+            workflow_ids: vec![a_id.clone(), b_id.clone(), c_id.clone()],
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(by_user.len(), 2, "= ANY on authenticated_user");
+
+    // Fork a-id: the ORIGINAL a-id becomes was_forked_from=true (a fork was
+    // taken from it); the new fork and the untouched b/c are not.
+    let fork_id = format!("mvf-fork-{tag}");
+    engine
+        .fork_workflow::<i64>(&a_id, 0, WorkflowOptions::with_id(&fork_id))
+        .await?;
+    let sources = engine
+        .list_workflows(&ListFilter {
+            was_forked_from: Some(true),
+            workflow_ids: vec![a_id.clone(), b_id.clone(), c_id.clone(), fork_id.clone()],
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(
+        sources.len(),
+        1,
+        "only the fork's source is was_forked_from"
+    );
+    assert_eq!(sources[0].id, a_id);
+    // The fork itself and the untouched b/c are not sources.
+    let not_sources = engine
+        .list_workflows(&ListFilter {
+            was_forked_from: Some(false),
+            workflow_ids: vec![b_id.clone(), c_id.clone(), fork_id.clone()],
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(
+        not_sources.len(),
+        3,
+        "non-source rows are was_forked_from=false"
+    );
+
+    engine
+        .delete_workflows(&[a_id, b_id, c_id, fork_id], false)
+        .await?;
+    engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }

@@ -320,7 +320,7 @@ async fn handle_message(
             let filter = ListFilter {
                 status: vec![STATUS_PENDING.to_string()],
                 executor_ids: vec![req.executor_id],
-                app_version: Some(req.application_version),
+                app_version: vec![req.application_version],
                 limit: Some(1),
                 ..Default::default()
             };
@@ -1537,12 +1537,17 @@ struct ListBody {
     #[serde(default)]
     executor_id: StringOrList,
     #[serde(default)]
+    authenticated_user: StringOrList,
+    #[serde(default)]
     forked_from: StringOrList,
+    #[serde(default)]
+    parent_workflow_id: StringOrList,
     #[serde(default)]
     queue_name: StringOrList,
     #[serde(default)]
     workflow_id_prefix: StringOrList,
     has_parent: Option<bool>,
+    was_forked_from: Option<bool>,
     start_time: Option<DateTime<Utc>>,
     end_time: Option<DateTime<Utc>>,
     completed_after: Option<DateTime<Utc>>,
@@ -1565,13 +1570,16 @@ impl ListBody {
     fn to_filter(&self, force_queued: bool) -> ListFilter {
         let mut f = ListFilter {
             workflow_ids: self.workflow_uuids.clone(),
-            name: self.workflow_name.first(),
+            name: self.workflow_name.vec(),
             status: self.status.vec(),
-            app_version: self.application_version.first(),
+            app_version: self.application_version.vec(),
             executor_ids: self.executor_id.vec(),
-            forked_from: self.forked_from.first(),
-            queue_name: self.queue_name.first(),
-            workflow_id_prefix: self.workflow_id_prefix.first(),
+            authenticated_users: self.authenticated_user.vec(),
+            forked_from: self.forked_from.vec(),
+            parent_workflow_ids: self.parent_workflow_id.vec(),
+            was_forked_from: self.was_forked_from,
+            queue_name: self.queue_name.vec(),
+            workflow_id_prefix: self.workflow_id_prefix.vec(),
             has_parent: self.has_parent,
             start_time_ms: self.start_time.map(|t| t.timestamp_millis()),
             end_time_ms: self.end_time.map(|t| t.timestamp_millis()),

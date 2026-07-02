@@ -40,7 +40,7 @@ async fn client_enqueues_work_an_engine_runs() -> Result<()> {
     // The client observes the persisted row and its step.
     let rows = client
         .list_workflows(&ListFilter {
-            workflow_id_prefix: Some("job-".to_string()),
+            workflow_id_prefix: vec!["job-".to_string()],
             ..Default::default()
         })
         .await?;
@@ -388,7 +388,7 @@ async fn client_created_schedule_fires_on_engine() -> Result<()> {
     );
     let rows = client
         .list_workflows(&ListFilter {
-            workflow_id_prefix: Some("sched-tick-".to_string()),
+            workflow_id_prefix: vec!["sched-tick-".to_string()],
             ..Default::default()
         })
         .await?;
@@ -612,7 +612,7 @@ async fn client_backfills_a_schedule_onto_the_internal_queue() -> Result<()> {
     assert_eq!(ids.len(), 3, "one tick per day in the window");
 
     let prefix = || ListFilter {
-        workflow_id_prefix: Some("sched-daily-".to_string()),
+        workflow_id_prefix: vec!["sched-daily-".to_string()],
         ..Default::default()
     };
     let rows = client.list_workflows(&prefix()).await?;
@@ -655,7 +655,7 @@ async fn client_enqueue_dedup_and_app_version() -> Result<()> {
         .await?;
     let rows = client
         .list_workflows(&ListFilter {
-            workflow_id_prefix: Some("j".into()),
+            workflow_id_prefix: vec!["j".into()],
             ..Default::default()
         })
         .await?;
@@ -707,7 +707,7 @@ async fn client_enqueue_dedup_and_app_version() -> Result<()> {
     // Only the first row holds the slot.
     let dq = client
         .list_workflows(&ListFilter {
-            queue_name: Some("dq".into()),
+            queue_name: vec!["dq".into()],
             ..Default::default()
         })
         .await?;

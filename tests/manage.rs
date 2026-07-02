@@ -29,7 +29,7 @@ async fn retrieve_and_list() -> Result<()> {
 
     let all = engine
         .list_workflows(&ListFilter {
-            name: Some("add".to_string()),
+            name: vec!["add".to_string()],
             ..Default::default()
         })
         .await?;
@@ -46,7 +46,7 @@ async fn retrieve_and_list() -> Result<()> {
     // Prefix + limit.
     let one = engine
         .list_workflows(&ListFilter {
-            workflow_id_prefix: Some("wf-".to_string()),
+            workflow_id_prefix: vec!["wf-".to_string()],
             limit: Some(1),
             ..Default::default()
         })
@@ -161,6 +161,87 @@ async fn fork_reuses_checkpoints() -> Result<()> {
 
     let row = provider.get_workflow_status("wf-fork").await?.unwrap();
     assert_eq!(row.forked_from.as_deref(), Some("wf-orig"));
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// list_workflows OR-matches multi-valued filters (name, id-prefix) and filters
+/// on `was_forked_from` — a workflow created by a fork vs. an original.
+#[tokio::test]
+async fn list_filters_or_match_and_was_forked_from() -> Result<()> {
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("alpha", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n)
+    });
+    engine.register("beta", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n)
+    });
+    engine.register("gamma", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n)
+    });
+    engine.launch().await?;
+
+    engine.start_typed::<_, i64>("alpha", "a-1", 1).await?;
+    engine.start_typed::<_, i64>("beta", "b-1", 2).await?;
+    engine.start_typed::<_, i64>("gamma", "g-1", 3).await?;
+
+    // OR across names: alpha or beta, not gamma.
+    let by_name = engine
+        .list_workflows(&ListFilter {
+            name: vec!["alpha".to_string(), "beta".to_string()],
+            ..Default::default()
+        })
+        .await?;
+    let mut names: Vec<&str> = by_name.iter().map(|w| w.name.as_str()).collect();
+    names.sort();
+    assert_eq!(names, vec!["alpha", "beta"], "OR-match on name");
+
+    // OR across id prefixes: a- or g-, not b-.
+    let by_prefix = engine
+        .list_workflows(&ListFilter {
+            workflow_id_prefix: vec!["a-".to_string(), "g-".to_string()],
+            ..Default::default()
+        })
+        .await?;
+    let mut ids: Vec<&str> = by_prefix.iter().map(|w| w.id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["a-1", "g-1"], "OR-match on id prefix");
+
+    // Fork "a-1": the ORIGINAL "a-1" is now marked `was_forked_from` (a fork was
+    // taken from it); the new "a-fork" is not.
+    engine
+        .fork_workflow::<i64>("a-1", 0, WorkflowOptions::with_id("a-fork"))
+        .await?;
+
+    let sources = engine
+        .list_workflows(&ListFilter {
+            was_forked_from: Some(true),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(
+        sources.len(),
+        1,
+        "only the fork's source is was_forked_from"
+    );
+    assert_eq!(sources[0].id, "a-1");
+
+    let not_sources = engine
+        .list_workflows(&ListFilter {
+            was_forked_from: Some(false),
+            ..Default::default()
+        })
+        .await?;
+    assert!(
+        not_sources.iter().all(|w| w.id != "a-1"),
+        "was_forked_from=false excludes the source"
+    );
+    assert!(
+        not_sources.iter().any(|w| w.id == "a-fork"),
+        "the fork itself is not a source"
+    );
+
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }

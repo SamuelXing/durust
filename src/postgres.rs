@@ -2035,43 +2035,40 @@ fn push_list_filters<'a>(qb: &mut QueryBuilder<'a, Postgres>, filter: &'a ListFi
         qb.push(sep);
         sep = " AND ";
     };
-    if !filter.workflow_ids.is_empty() {
+    // `col = ANY($n)` for a non-empty value set (OR-match).
+    let mut push_in = |qb: &mut QueryBuilder<'a, Postgres>, col: &str, vals: &'a [String]| {
+        if vals.is_empty() {
+            return;
+        }
         clause(qb);
-        qb.push("workflow_uuid = ANY(")
-            .push_bind(filter.workflow_ids.clone());
+        qb.push(col).push(" = ANY(").push_bind(vals).push(")");
+    };
+    push_in(qb, "workflow_uuid", &filter.workflow_ids);
+    push_in(qb, "name", &filter.name);
+    push_in(qb, "status", &filter.status);
+    push_in(qb, "queue_name", &filter.queue_name);
+    push_in(qb, "application_version", &filter.app_version);
+    push_in(qb, "executor_id", &filter.executor_ids);
+    push_in(qb, "authenticated_user", &filter.authenticated_users);
+    push_in(qb, "forked_from", &filter.forked_from);
+    push_in(qb, "parent_workflow_id", &filter.parent_workflow_ids);
+    if !filter.workflow_id_prefix.is_empty() {
+        clause(qb);
+        let patterns: Vec<String> = filter
+            .workflow_id_prefix
+            .iter()
+            .map(|p| format!("{p}%"))
+            .collect();
+        qb.push("workflow_uuid LIKE ANY(").push_bind(patterns);
         qb.push(")");
     }
-    if let Some(prefix) = &filter.workflow_id_prefix {
+    if let Some(wf) = filter.was_forked_from {
         clause(qb);
-        qb.push("workflow_uuid LIKE ")
-            .push_bind(format!("{prefix}%"));
-    }
-    if let Some(name) = &filter.name {
-        clause(qb);
-        qb.push("name = ").push_bind(name.clone());
-    }
-    if !filter.status.is_empty() {
-        clause(qb);
-        qb.push("status = ANY(").push_bind(filter.status.clone());
-        qb.push(")");
-    }
-    if let Some(q) = &filter.queue_name {
-        clause(qb);
-        qb.push("queue_name = ").push_bind(q.clone());
-    }
-    if let Some(v) = &filter.app_version {
-        clause(qb);
-        qb.push("application_version = ").push_bind(v.clone());
-    }
-    if !filter.executor_ids.is_empty() {
-        clause(qb);
-        qb.push("executor_id = ANY(")
-            .push_bind(filter.executor_ids.clone());
-        qb.push(")");
-    }
-    if let Some(f) = &filter.forked_from {
-        clause(qb);
-        qb.push("forked_from = ").push_bind(f.clone());
+        qb.push(if wf {
+            "was_forked_from = TRUE"
+        } else {
+            "(was_forked_from = FALSE OR was_forked_from IS NULL)"
+        });
     }
     if let Some(t) = filter.start_time_ms {
         clause(qb);
