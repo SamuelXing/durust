@@ -238,10 +238,14 @@ fn sample_report() -> Report {
 }
 
 /// A deeply-nested value (struct with vectors, a map, an option, and nested
-/// structs) survives a step checkpoint intact: the workflow output reconstructs
-/// the exact structure, and a replay yields the identical value from the
-/// checkpoint without re-running the step. Exercises real TEXT (de)serialization
-/// on SQLite, not just in-memory clones.
+/// structs) survives real TEXT (de)serialization on SQLite intact — not just an
+/// in-memory clone: the step serializes it into its checkpoint and the workflow
+/// output, and it reconstructs to the exact structure on read.
+///
+/// Re-submitting the same id returns the stored output without running the body
+/// again (OAOO completion), so the builder step stays at a single execution. That
+/// is start-time dedup, not mid-flight step-checkpoint replay — the body is not
+/// re-executed here.
 #[tokio::test]
 async fn nested_value_round_trips_through_step_checkpoint() -> Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -264,13 +268,14 @@ async fn nested_value_round_trips_through_step_checkpoint() -> Result<()> {
     let a: Report = engine.start_typed("report", "wf-nested", ()).await?;
     assert_eq!(a, sample_report());
 
-    // Replay reconstructs the identical structure from the stored checkpoint.
+    // Re-submitting the same id returns the stored output, deserialized back to
+    // the identical structure, without re-running the body.
     let b: Report = engine.start_typed("report", "wf-nested", ()).await?;
     assert_eq!(b, sample_report());
     assert_eq!(
         BUILDS.load(Ordering::SeqCst),
         1,
-        "the step ran once; the replay read the nested value from its checkpoint"
+        "the step ran once; the resubmit returns the stored output, not a re-run"
     );
 
     drop(engine);
