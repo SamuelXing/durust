@@ -1997,3 +1997,84 @@ async fn sqlite_export_import_round_trip() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// Genuine mid-flight replay: recovering a `PENDING` workflow re-executes the
+/// workflow body but replays each already-checkpointed step from storage instead
+/// of re-running it.
+///
+/// This is the path the double-`start(sameId)` conformance tests can't reach:
+/// re-submitting a *completed* id short-circuits via once-and-only-once (the
+/// stored output is returned, the body never re-runs). Here the row is forced
+/// back to `PENDING` — simulating a crash between the step checkpoint and
+/// completion — so recovery genuinely re-runs the body; the step's checkpoint,
+/// read back through real SQLite storage, must suppress its side effect.
+#[tokio::test]
+async fn sqlite_recovery_replays_checkpointed_step_without_rerunning() -> Result<()> {
+    use durust::{StateProvider, STATUS_PENDING};
+
+    static BODY_RUNS: AtomicUsize = AtomicUsize::new(0);
+    static STEP_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    let (url, path) = temp_db_url("recover-replay");
+    let id = "wf-rec";
+
+    // Register the same workflow on each engine instance (a fresh "process").
+    let register = |engine: &mut DurableEngine| {
+        engine.register("replay_me", |ctx: DurableContext, _: ()| async move {
+            // Runs on every execution of the body (including a replay).
+            BODY_RUNS.fetch_add(1, Ordering::SeqCst);
+            let half = ctx
+                .step("compute", || async {
+                    // Runs only when the step actually executes, never on replay.
+                    STEP_RUNS.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, Error>(21_i64)
+                })
+                .await?;
+            Ok::<_, Error>(half * 2)
+        });
+    };
+
+    // First run to completion: body runs once, the step runs and checkpoints.
+    {
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        register(&mut engine);
+        let out: i64 = engine.start_typed("replay_me", id, ()).await?;
+        assert_eq!(out, 42);
+    }
+    assert_eq!(BODY_RUNS.load(Ordering::SeqCst), 1);
+    assert_eq!(STEP_RUNS.load(Ordering::SeqCst), 1);
+
+    // Simulate a crash mid-flight: flip the now-SUCCESS row back to PENDING so
+    // recovery treats it as unfinished. Its step checkpoint stays in storage.
+    let provider = SqliteProvider::connect(&url).await?;
+    provider
+        .set_workflow_status(id, STATUS_PENDING, None, None)
+        .await?;
+
+    // A fresh engine (new process) recovers the PENDING workflow.
+    {
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        register(&mut engine);
+        assert_eq!(engine.recover().await?, 1, "the PENDING workflow recovers");
+    }
+
+    // The body re-executed — a genuine replay, not an OAOO short-circuit...
+    assert_eq!(
+        BODY_RUNS.load(Ordering::SeqCst),
+        2,
+        "recovery re-runs the workflow body"
+    );
+    // ...but the checkpointed step was replayed from SQLite, not re-run.
+    assert_eq!(
+        STEP_RUNS.load(Ordering::SeqCst),
+        1,
+        "the checkpointed step is replayed from storage, not re-executed"
+    );
+    // ...and the workflow completes SUCCESS with the same result.
+    let status = provider.get_workflow_status(id).await?.expect("row exists");
+    assert_eq!(status.status, STATUS_SUCCESS);
+    assert_eq!(status.output, Some(serde_json::json!(42)));
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
