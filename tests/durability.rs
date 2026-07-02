@@ -3,6 +3,7 @@
 use durust::{DurableContext, DurableEngine, Error, InMemoryProvider, Result};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// A step's side effect must run exactly once even if the workflow is executed
 /// again under the same id (the core durable-execution guarantee).
@@ -110,5 +111,62 @@ async fn multi_step_results_are_stable() -> Result<()> {
     // Replay yields the identical answer.
     let out2: i64 = engine.start_typed("pipeline", "wf-2", 10_i64).await?;
     assert_eq!(out2, 21);
+    Ok(())
+}
+
+/// Re-submitting a completed workflow that slept returns its result immediately
+/// and does not run the body again — so it never sleeps a second time. The first
+/// run really waits out the nap and completes; a second `start` under the same id
+/// is short-circuited by once-and-only-once completion (the terminal output is
+/// returned by polling), so the post-sleep step also stays at a single execution.
+///
+/// This exercises the OAOO completion guarantee, not mid-flight durable-sleep
+/// replay: the body is not re-executed here, so the recorded wake instant is not
+/// re-read. (Exercising the sleep checkpoint on replay would require forcing a
+/// re-run of a still-`PENDING` workflow, as the recovery tests do.)
+#[tokio::test]
+async fn durable_sleep_is_not_repeated_on_replay() -> Result<()> {
+    static AFTER_SLEEP: AtomicUsize = AtomicUsize::new(0);
+    let nap = Duration::from_millis(500);
+
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(provider).await?;
+    engine.register("napper", move |ctx: DurableContext, _: ()| async move {
+        ctx.sleep(nap).await?;
+        // A checkpointed step after the sleep, to prove the body resumed past it.
+        ctx.step("after_nap", || async {
+            AFTER_SLEEP.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, Error>(1_i64)
+        })
+        .await?;
+        Ok::<_, Error>(())
+    });
+
+    // First execution actually waits out the nap and records the wake instant.
+    let t0 = Instant::now();
+    engine.start_typed::<_, ()>("napper", "wf-nap", ()).await?;
+    let first = t0.elapsed();
+    assert!(
+        first >= Duration::from_millis(400),
+        "first run should really sleep (~500ms), took {first:?}"
+    );
+
+    // Re-submitting the same id: the workflow is already terminal, so it returns
+    // the stored output at once instead of re-running the body (and re-sleeping).
+    let t1 = Instant::now();
+    engine.start_typed::<_, ()>("napper", "wf-nap", ()).await?;
+    let resubmit = t1.elapsed();
+    assert!(
+        resubmit < Duration::from_millis(200),
+        "a completed workflow must not re-sleep on resubmit, took {resubmit:?}"
+    );
+
+    // The post-sleep step ran exactly once: recorded on the first run, and the
+    // body was not executed again on the resubmit.
+    assert_eq!(
+        AFTER_SLEEP.load(Ordering::SeqCst),
+        1,
+        "the step after the sleep runs once; the resubmit does not re-run the body"
+    );
     Ok(())
 }

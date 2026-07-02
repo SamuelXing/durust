@@ -173,6 +173,38 @@ async fn set_event_and_get_event() -> Result<()> {
     Ok(())
 }
 
+/// Distinct event keys coexist, and re-setting a key overwrites it: a reader sees
+/// the latest value for an updated key and the independent value for another —
+/// last-write-wins per key (mirrors the other SDKs' set/get-event semantics).
+#[tokio::test]
+async fn set_event_keys_are_independent_and_last_write_wins() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("multi_event", |ctx: DurableContext, _: ()| async move {
+        ctx.set_event("phase", "start").await?;
+        ctx.set_event("progress", 10_i64).await?;
+        // Overwrite one key; the other must be untouched.
+        ctx.set_event("phase", "done").await?;
+        Ok::<_, Error>(())
+    });
+
+    engine
+        .start_typed::<_, ()>("multi_event", "wf-ev", ())
+        .await?;
+
+    // The overwritten key reads back its latest value.
+    let phase: Option<String> = engine
+        .get_event("wf-ev", "phase", Duration::from_secs(1))
+        .await?;
+    assert_eq!(phase.as_deref(), Some("done"), "last write wins for a key");
+
+    // The independent key keeps its own value.
+    let progress: Option<i64> = engine
+        .get_event("wf-ev", "progress", Duration::from_secs(1))
+        .await?;
+    assert_eq!(progress, Some(10), "a distinct key is unaffected");
+    Ok(())
+}
+
 /// get_event on a key that is never set returns None after the timeout, both
 /// from outside and inside a workflow.
 #[tokio::test]
