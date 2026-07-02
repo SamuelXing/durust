@@ -114,11 +114,16 @@ async fn multi_step_results_are_stable() -> Result<()> {
     Ok(())
 }
 
-/// A durable `sleep` is a checkpoint, not a real delay: the first run records the
-/// absolute wake instant, so a replay reads it back and returns immediately
-/// instead of sleeping again — a workflow that napped before a crash does not
-/// re-wait the whole duration on recovery. (Mirrors the other SDKs' durable-sleep
-/// recovery guarantee.)
+/// Re-submitting a completed workflow that slept returns its result immediately
+/// and does not run the body again — so it never sleeps a second time. The first
+/// run really waits out the nap and completes; a second `start` under the same id
+/// is short-circuited by once-and-only-once completion (the terminal output is
+/// returned by polling), so the post-sleep step also stays at a single execution.
+///
+/// This exercises the OAOO completion guarantee, not mid-flight durable-sleep
+/// replay: the body is not re-executed here, so the recorded wake instant is not
+/// re-read. (Exercising the sleep checkpoint on replay would require forcing a
+/// re-run of a still-`PENDING` workflow, as the recovery tests do.)
 #[tokio::test]
 async fn durable_sleep_is_not_repeated_on_replay() -> Result<()> {
     static AFTER_SLEEP: AtomicUsize = AtomicUsize::new(0);
@@ -146,22 +151,22 @@ async fn durable_sleep_is_not_repeated_on_replay() -> Result<()> {
         "first run should really sleep (~500ms), took {first:?}"
     );
 
-    // Replaying the same id reads the stored wake instant — already in the past —
-    // so it must return promptly rather than sleeping another ~500ms.
+    // Re-submitting the same id: the workflow is already terminal, so it returns
+    // the stored output at once instead of re-running the body (and re-sleeping).
     let t1 = Instant::now();
     engine.start_typed::<_, ()>("napper", "wf-nap", ()).await?;
-    let replay = t1.elapsed();
+    let resubmit = t1.elapsed();
     assert!(
-        replay < Duration::from_millis(200),
-        "replay must not re-sleep the durable timer, took {replay:?}"
+        resubmit < Duration::from_millis(200),
+        "a completed workflow must not re-sleep on resubmit, took {resubmit:?}"
     );
 
-    // The post-sleep step ran exactly once (recorded on the first run, replayed
-    // from its checkpoint on the second).
+    // The post-sleep step ran exactly once: recorded on the first run, and the
+    // body was not executed again on the resubmit.
     assert_eq!(
         AFTER_SLEEP.load(Ordering::SeqCst),
         1,
-        "the step after the sleep runs once across the replay"
+        "the step after the sleep runs once; the resubmit does not re-run the body"
     );
     Ok(())
 }
