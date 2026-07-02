@@ -1798,7 +1798,11 @@ impl StateProvider for PostgresProvider {
             .bind(col_str(s, "parent_workflow_id"))
             .bind(col_i64(s, "delay_until_epoch_ms"))
             .bind(col_str(s, "serialization"))
-            .bind(col_str(s, "forked_from").is_some())
+            // `was_forked_from` marks a fork *source*, not the fork — the export
+            // schema omits the column, so it is reconstructed from the fork links
+            // after the batch is inserted (see below), never derived from this
+            // row's own `forked_from`.
+            .bind(false)
             .execute(&mut *tx)
             .await?;
 
@@ -1858,6 +1862,21 @@ impl StateProvider for PostgresProvider {
                 .execute(&mut *tx)
                 .await?;
             }
+        }
+        // Reconstruct `was_forked_from`: any workflow an imported fork points at
+        // (via `forked_from`) is a fork source, so mark it — mirroring what
+        // `fork_workflow` stamps and what the in-memory backend derives.
+        let sources: Vec<String> = workflows
+            .iter()
+            .filter_map(|wf| col_str(&wf.workflow_status, "forked_from"))
+            .collect();
+        if !sources.is_empty() {
+            sqlx::query(
+                "UPDATE workflow_status SET was_forked_from = TRUE WHERE workflow_uuid = ANY($1)",
+            )
+            .bind(&sources)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(())

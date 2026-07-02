@@ -1562,7 +1562,11 @@ impl StateProvider for SqliteProvider {
             .bind(col_str(s, "parent_workflow_id"))
             .bind(col_i64(s, "delay_until_epoch_ms"))
             .bind(col_str(s, "serialization"))
-            .bind(col_str(s, "forked_from").is_some())
+            // `was_forked_from` marks a fork *source*, not the fork — the export
+            // schema omits the column, so it is reconstructed from the fork links
+            // after the batch is inserted (see below), never derived from this
+            // row's own `forked_from`.
+            .bind(false)
             .execute(&mut *tx)
             .await?;
 
@@ -1622,6 +1626,24 @@ impl StateProvider for SqliteProvider {
                 .execute(&mut *tx)
                 .await?;
             }
+        }
+        // Reconstruct `was_forked_from`: any workflow an imported fork points at
+        // (via `forked_from`) is a fork source, so mark it — mirroring what
+        // `fork_workflow` stamps and what the in-memory backend derives.
+        let sources: Vec<String> = workflows
+            .iter()
+            .filter_map(|wf| col_str(&wf.workflow_status, "forked_from"))
+            .collect();
+        if !sources.is_empty() {
+            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+                "UPDATE workflow_status SET was_forked_from = TRUE WHERE workflow_uuid IN (",
+            );
+            let mut sep = qb.separated(", ");
+            for id in &sources {
+                sep.push_bind(id.as_str());
+            }
+            qb.push(")");
+            qb.build().execute(&mut *tx).await?;
         }
         tx.commit().await?;
         Ok(())
