@@ -7,7 +7,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::future::{poll_fn, Future};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
@@ -147,6 +147,10 @@ pub struct DurableContext {
     // deterministic, the same code path yields the same seq on every replay,
     // which is how we match a step call to its stored checkpoint.
     seq: Arc<AtomicI32>,
+    // Set while a transaction body is running (shared across context clones, so a
+    // clone captured inside a body sees it). Guards against nesting a transaction
+    // inside another — which would deadlock on the outer's write lock.
+    in_transaction: Arc<AtomicBool>,
 }
 
 impl DurableContext {
@@ -157,6 +161,7 @@ impl DurableContext {
             runtime,
             auth,
             seq: Arc::new(AtomicI32::new(0)),
+            in_transaction: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -452,6 +457,25 @@ impl DurableContext {
             + Sync
             + 'static,
     {
+        // Reject a transaction nested inside another: the inner would open a
+        // separate connection and block forever on the write lock the outer
+        // already holds (a deadlock). A context clone captured in an outer body
+        // shares this flag, so a nested `ctx.transaction` is caught here rather
+        // than hanging. Checked before consuming a step slot.
+        if self.in_transaction.swap(true, Ordering::SeqCst) {
+            return Err(Error::app(
+                "cannot start a transaction inside another transaction",
+            ));
+        }
+        // Clear the flag on every exit path (including the `?` below).
+        struct ResetOnDrop<'a>(&'a AtomicBool);
+        impl Drop for ResetOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _reset = ResetOnDrop(&self.in_transaction);
+
         let seq = self.next_seq();
         let started = chrono::Utc::now().timestamp_millis();
         // Separate the call from the `async move`: `f(tx)` borrows `f` and yields

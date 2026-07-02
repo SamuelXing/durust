@@ -1812,6 +1812,58 @@ async fn sqlite_transaction_step_exactly_once() -> Result<()> {
     Ok(())
 }
 
+/// A transaction started inside another transaction's body is rejected with a
+/// clear error rather than deadlocking on the outer's write lock (the inner would
+/// otherwise open a second connection and block forever). The workflow fails fast.
+#[tokio::test]
+async fn sqlite_nested_transaction_is_rejected() -> Result<()> {
+    use durust::params;
+    use std::time::Duration;
+    let (url, path) = temp_db_url("txnnest");
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("nest", |ctx: DurableContext, _: ()| async move {
+        let inner_ctx = ctx.clone();
+        ctx.transaction::<(), _>("outer", move |tx| {
+            let inner_ctx = inner_ctx.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)",
+                    &params![],
+                )
+                .await?;
+                // Nesting a transaction via a captured context must be refused.
+                inner_ctx
+                    .transaction::<(), _>("inner", |tx2| {
+                        Box::pin(async move {
+                            tx2.execute("INSERT INTO t (id) VALUES (1)", &params![])
+                                .await?;
+                            Ok(())
+                        })
+                    })
+                    .await?;
+                Ok(())
+            })
+        })
+        .await?;
+        Ok::<_, Error>(())
+    });
+
+    // Must complete (fail) promptly — a deadlock would hang until the timeout.
+    let run = engine.start_typed::<_, ()>("nest", "wf-nest", ());
+    let res = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("nested transaction must be rejected, not deadlock");
+    let err = res.expect_err("nesting a transaction is an error");
+    assert!(
+        err.to_string()
+            .contains("transaction inside another transaction"),
+        "clear nesting error, got: {err}"
+    );
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 /// A transactional step whose body returns an error rolls back its writes: a
 /// later step reads the original value, proving the failed write did not commit.
 #[tokio::test]
