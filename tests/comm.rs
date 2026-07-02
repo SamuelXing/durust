@@ -221,3 +221,50 @@ async fn get_event_times_out_to_none() -> Result<()> {
     assert_eq!(v, None);
     Ok(())
 }
+
+/// An idempotent send delivers at most once per key: two sends sharing a key
+/// collapse to a single message (a retry never double-delivers), while a distinct
+/// key delivers independently.
+#[tokio::test]
+async fn send_with_idempotency_key_delivers_at_most_once() -> Result<()> {
+    let provider = Arc::new(InMemoryProvider::new());
+    let engine = DurableEngine::new(provider.clone()).await?;
+
+    // A destination workflow to receive the messages.
+    provider
+        .insert_workflow_status(WorkflowStatus::new(
+            "dest",
+            "sink",
+            Value::Null,
+            STATUS_PENDING,
+            "",
+            "0.1.0",
+        ))
+        .await?;
+
+    // Same key twice → the retry is dropped; a different key delivers.
+    engine
+        .send_with_idempotency_key("dest", "a".to_string(), "t", "k1")
+        .await?;
+    engine
+        .send_with_idempotency_key("dest", "a-again".to_string(), "t", "k1")
+        .await?;
+    engine
+        .send_with_idempotency_key("dest", "b".to_string(), "t", "k2")
+        .await?;
+
+    // The mailbox holds exactly two messages, in send order.
+    let m1 = provider
+        .consume_notification("dest", "t", 0, "probe")
+        .await?;
+    let m2 = provider
+        .consume_notification("dest", "t", 1, "probe")
+        .await?;
+    let m3 = provider
+        .consume_notification("dest", "t", 2, "probe")
+        .await?;
+    assert_eq!(m1, Some(Value::String("a".into())));
+    assert_eq!(m2, Some(Value::String("b".into())));
+    assert_eq!(m3, None, "the duplicate keyed send was not delivered");
+    Ok(())
+}

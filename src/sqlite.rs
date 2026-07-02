@@ -578,14 +578,23 @@ impl StateProvider for SqliteProvider {
         destination_id: &str,
         topic: &str,
         message: Value,
+        idempotency_key: Option<&str>,
     ) -> Result<()> {
-        // The FK on destination_uuid rejects sends to nonexistent workflows.
+        // A keyed send derives its primary key so a retry conflicts and is
+        // dropped (at-most-once); an unkeyed send gets a fresh id every time.
+        let message_uuid = match idempotency_key {
+            Some(k) => format!("{k}::{destination_id}"),
+            None => uuid::Uuid::new_v4().to_string(),
+        };
+        // The FK on destination_uuid rejects sends to nonexistent workflows; a
+        // duplicate keyed message_uuid is silently ignored.
         sqlx::query(
             "INSERT INTO notifications
                  (message_uuid, destination_uuid, topic, message, serialization, created_at_epoch_ms)
-             VALUES (?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT (message_uuid) DO NOTHING",
         )
-        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(message_uuid)
         .bind(destination_id)
         .bind(topic)
         .bind(self.serializer.encode(&message)?)

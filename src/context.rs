@@ -697,7 +697,7 @@ impl DurableContext {
             return Ok(());
         }
         self.provider
-            .insert_notification(destination_id, topic, serde_json::to_value(message)?)
+            .insert_notification(destination_id, topic, serde_json::to_value(message)?, None)
             .await?;
         self.provider
             .record_step_result(&self.workflow_id, seq, "DBOS.send", Value::Null, None, None)
