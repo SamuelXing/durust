@@ -93,6 +93,60 @@ async fn step_retries_exhausted_propagates_error() -> Result<()> {
     Ok(())
 }
 
+/// A retry predicate fails fast: an error it rejects stops retries immediately,
+/// even with attempts remaining, while an error it accepts still retries up to
+/// `max_retries`.
+#[tokio::test]
+async fn step_retry_predicate_stops_on_permanent_error() -> Result<()> {
+    static PERMANENT_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+    static TRANSIENT_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+
+    // "permanent" is a validation error the predicate refuses to retry.
+    engine.register("permanent", |ctx: DurableContext, _: ()| async move {
+        let opts = StepOptions::new("check")
+            .max_retries(5)
+            .base_interval(Duration::from_millis(1))
+            .retry_if(|e: &Error| !e.to_string().contains("permanent"));
+        ctx.step_with(opts, || async {
+            PERMANENT_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(Error::app("permanent: bad input"))
+        })
+        .await
+    });
+
+    // "transient" is retried under the same predicate until attempts run out.
+    engine.register("transient", |ctx: DurableContext, _: ()| async move {
+        let opts = StepOptions::new("call")
+            .max_retries(3)
+            .base_interval(Duration::from_millis(1))
+            .retry_if(|e: &Error| !e.to_string().contains("permanent"));
+        ctx.step_with(opts, || async {
+            TRANSIENT_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(Error::app("temporary glitch"))
+        })
+        .await
+    });
+
+    let permanent: Result<()> = engine.start_typed("permanent", "wf-perm", ()).await;
+    assert!(permanent.is_err());
+    assert_eq!(
+        PERMANENT_ATTEMPTS.load(Ordering::SeqCst),
+        1,
+        "a rejected error must not be retried, despite max_retries(5)"
+    );
+
+    let transient: Result<()> = engine.start_typed("transient", "wf-tran", ()).await;
+    assert!(transient.is_err());
+    assert_eq!(
+        TRANSIENT_ATTEMPTS.load(Ordering::SeqCst),
+        4,
+        "an accepted error retries up to max_retries: 1 initial + 3 retries"
+    );
+    Ok(())
+}
+
 /// launch()/shutdown() are callable and drain in-flight work.
 #[tokio::test]
 async fn launch_and_shutdown_drain() -> Result<()> {
