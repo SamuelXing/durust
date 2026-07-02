@@ -2,8 +2,8 @@
 //! (separate engine + provider instances over the same database file).
 
 use durust::{
-    DurableContext, DurableEngine, Error, ListFilter, Result, SqliteProvider, WorkflowOptions,
-    WorkflowQueue, STATUS_CANCELLED, STATUS_SUCCESS,
+    DurableContext, DurableEngine, Error, ListFilter, Result, ScheduledInput, SqliteProvider,
+    WorkflowOptions, WorkflowQueue, STATUS_CANCELLED, STATUS_SUCCESS,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -1213,7 +1213,7 @@ async fn sqlite_schedule_persists_across_restart() -> Result<()> {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         engine.register(
             "nightly_job",
-            |_ctx: DurableContext, _: String| async move { Ok::<_, Error>(()) },
+            |_ctx: DurableContext, _: ScheduledInput| async move { Ok::<_, Error>(()) },
         );
         engine
             .create_schedule(
@@ -1232,7 +1232,7 @@ async fn sqlite_schedule_persists_across_restart() -> Result<()> {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         engine.register(
             "nightly_job",
-            |_ctx: DurableContext, _: String| async move { Ok::<_, Error>(()) },
+            |_ctx: DurableContext, _: ScheduledInput| async move { Ok::<_, Error>(()) },
         );
         let got = engine.get_schedule("nightly").await?.expect("persisted");
         assert_eq!(got.workflow_name, "nightly_job");
@@ -1278,7 +1278,7 @@ async fn sqlite_backfill_persists_each_tick_once() -> Result<()> {
     let mut engine = DurableEngine::new(provider.clone()).await?;
     engine.register(
         "nightly_job",
-        |_ctx: DurableContext, _: String| async move { Ok::<_, Error>(()) },
+        |_ctx: DurableContext, _: ScheduledInput| async move { Ok::<_, Error>(()) },
     );
     engine
         .create_schedule(

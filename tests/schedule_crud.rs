@@ -4,24 +4,29 @@
 
 use durust::{
     DurableContext, DurableEngine, InMemoryProvider, Result, ScheduleFilter, ScheduleOptions,
-    ScheduleStatus,
+    ScheduleStatus, ScheduledInput,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 static CREATED_RUNS: AtomicUsize = AtomicUsize::new(0);
+/// The context each fired tick received, so the test can assert the schedule's
+/// configured context reaches the workflow — not just that get/list surface it.
+static SEEN_CONTEXT: Mutex<Option<String>> = Mutex::new(None);
 
 /// A schedule created at runtime is persisted, fires on its cron ticks, is
 /// surfaced by get/list, stamps `last_fired_at`, and stops firing once paused.
+/// The fired workflow also receives the configured context in its input.
 #[tokio::test]
 async fn create_schedule_fires_and_pauses() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
     engine.register(
         "created_tick",
-        |_ctx: DurableContext, _: String| async move {
+        |_ctx: DurableContext, tick: ScheduledInput| async move {
             CREATED_RUNS.fetch_add(1, Ordering::SeqCst);
+            *SEEN_CONTEXT.lock().unwrap() = tick.context_as::<String>().unwrap();
             Ok::<_, durust::Error>(())
         },
     );
@@ -78,6 +83,12 @@ async fn create_schedule_fires_and_pauses() -> Result<()> {
     engine.shutdown(Duration::from_secs(1)).await?;
 
     assert!(after_pause >= 1, "the created schedule should have fired");
+    // The configured context ("hello") was delivered to the fired workflow.
+    assert_eq!(
+        SEEN_CONTEXT.lock().unwrap().as_deref(),
+        Some("hello"),
+        "the schedule's context must reach the workflow's input"
+    );
 
     // Paused schedule is reflected and last_fired_at was stamped.
     let paused = engine.get_schedule("every-sec").await?.expect("exists");
@@ -103,12 +114,14 @@ async fn create_schedule_fires_and_pauses() -> Result<()> {
 #[tokio::test]
 async fn list_schedules_filters() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("wf_a", |_ctx: DurableContext, _: String| async move {
-        Ok::<_, durust::Error>(())
-    });
-    engine.register("wf_b", |_ctx: DurableContext, _: String| async move {
-        Ok::<_, durust::Error>(())
-    });
+    engine.register(
+        "wf_a",
+        |_ctx: DurableContext, _: ScheduledInput| async move { Ok::<_, durust::Error>(()) },
+    );
+    engine.register(
+        "wf_b",
+        |_ctx: DurableContext, _: ScheduledInput| async move { Ok::<_, durust::Error>(()) },
+    );
 
     engine
         .create_schedule("nightly-a", "wf_a", "0 0 0 * * *", ScheduleOptions::new())
@@ -148,9 +161,10 @@ async fn list_schedules_filters() -> Result<()> {
 #[tokio::test]
 async fn resume_reactivates_and_unknown_name_is_a_noop() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("wf", |_ctx: DurableContext, _at: String| async move {
-        Ok::<_, durust::Error>(())
-    });
+    engine.register(
+        "wf",
+        |_ctx: DurableContext, _at: ScheduledInput| async move { Ok::<_, durust::Error>(()) },
+    );
     engine
         .create_schedule("s", "wf", "0 0 12 * * *", ScheduleOptions::new())
         .await?;

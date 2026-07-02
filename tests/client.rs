@@ -4,7 +4,7 @@
 
 use durust::{
     Client, DurableContext, DurableEngine, Error, InMemoryProvider, ListFilter, Result,
-    WorkflowOptions, WorkflowQueue,
+    ScheduledInput, WorkflowOptions, WorkflowQueue,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -367,10 +367,13 @@ async fn client_created_schedule_fires_on_engine() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
 
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("tick_job", |_ctx: DurableContext, _at: String| async move {
-        FIRED.fetch_add(1, Ordering::SeqCst);
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "tick_job",
+        |_ctx: DurableContext, _at: ScheduledInput| async move {
+            FIRED.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, Error>(())
+        },
+    );
     engine.launch().await?;
 
     // The client declares the schedule; the engine's reconciler installs it.
@@ -557,10 +560,16 @@ async fn client_triggers_a_schedule_run_on_an_engine() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
 
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("tick_job", |_ctx: DurableContext, at: String| async move {
-        FIRED.fetch_add(1, Ordering::SeqCst);
-        Ok::<_, Error>(at)
-    });
+    engine.register(
+        "tick_job",
+        |_ctx: DurableContext, at: ScheduledInput| async move {
+            FIRED.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, Error>(
+                at.scheduled_time
+                    .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            )
+        },
+    );
     engine.launch().await?;
 
     // A cron far in the future so the reconciler never fires it on its own —

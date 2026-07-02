@@ -5,8 +5,8 @@
 
 use durust::{
     DurableContext, DurableEngine, Error, ErrorCode, ListFilter, PortableWorkflowError,
-    PostgresProvider, Result, Serializer, StateProvider, WorkflowOptions, WorkflowQueue,
-    WorkflowStatus, STATUS_PENDING,
+    PostgresProvider, Result, ScheduledInput, Serializer, StateProvider, WorkflowOptions,
+    WorkflowQueue, WorkflowStatus, STATUS_PENDING,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -944,7 +944,7 @@ async fn pg_schedule_crud() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
     engine.register(
         "nightly_job",
-        |_ctx: DurableContext, _: String| async move { Ok::<_, Error>(()) },
+        |_ctx: DurableContext, _: ScheduledInput| async move { Ok::<_, Error>(()) },
     );
 
     let name = format!("nightly-{}", uuid::Uuid::new_v4());
@@ -1012,7 +1012,7 @@ async fn pg_schedule_backfill_apply_trigger() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
     engine.register(
         "nightly_job",
-        |_ctx: DurableContext, _: String| async move { Ok::<_, Error>(()) },
+        |_ctx: DurableContext, _: ScheduledInput| async move { Ok::<_, Error>(()) },
     );
 
     let name = format!("bf-{}", uuid::Uuid::new_v4());

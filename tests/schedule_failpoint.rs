@@ -7,8 +7,8 @@
 //! the schedule fire loop and are no-ops unless armed here.
 
 use durust::{
-    DurableContext, DurableEngine, Error, ListFilter, Result, ScheduleOptions, SqliteProvider,
-    StateProvider, STATUS_PENDING, STATUS_SUCCESS,
+    DurableContext, DurableEngine, Error, ListFilter, Result, ScheduleOptions, ScheduledInput,
+    SqliteProvider, StateProvider, STATUS_PENDING, STATUS_SUCCESS,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -44,14 +44,17 @@ async fn tick_survives_crash_before_run() -> Result<()> {
     let (url, path) = temp_db_url("fp-before-run");
 
     let register = |engine: &mut DurableEngine| {
-        engine.register("job", |ctx: DurableContext, _at: String| async move {
-            ctx.step("work", || async {
-                WORK.fetch_add(1, Ordering::SeqCst);
+        engine.register(
+            "job",
+            |ctx: DurableContext, _at: ScheduledInput| async move {
+                ctx.step("work", || async {
+                    WORK.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, Error>(())
+                })
+                .await?;
                 Ok::<_, Error>(())
-            })
-            .await?;
-            Ok::<_, Error>(())
-        });
+            },
+        );
     };
 
     // Persist exactly one tick, then trip the failpoint to abort the fire loop
@@ -107,21 +110,24 @@ async fn tick_replays_after_crash_during_run() -> Result<()> {
     let (url, path) = temp_db_url("fp-during-run");
 
     let register = |engine: &mut DurableEngine| {
-        engine.register("job", |ctx: DurableContext, _at: String| async move {
-            ctx.step("s1", || async {
-                S1.fetch_add(1, Ordering::SeqCst);
+        engine.register(
+            "job",
+            |ctx: DurableContext, _at: ScheduledInput| async move {
+                ctx.step("s1", || async {
+                    S1.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, Error>(())
+                })
+                .await?;
+                // Crash between the two steps once s1 is checkpointed.
+                fail::fail_point!("scheduled_job_mid_run");
+                ctx.step("s2", || async {
+                    S2.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, Error>(())
+                })
+                .await?;
                 Ok::<_, Error>(())
-            })
-            .await?;
-            // Crash between the two steps once s1 is checkpointed.
-            fail::fail_point!("scheduled_job_mid_run");
-            ctx.step("s2", || async {
-                S2.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, Error>(())
-            })
-            .await?;
-            Ok::<_, Error>(())
-        });
+            },
+        );
     };
 
     // Each fired tick runs s1, then panics (leaving the row PENDING with s1
@@ -183,14 +189,17 @@ async fn tick_completes_when_crash_before_reschedule() -> Result<()> {
     let (url, path) = temp_db_url("fp-before-resched");
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("job", |ctx: DurableContext, _at: String| async move {
-        ctx.step("work", || async {
-            WORK.fetch_add(1, Ordering::SeqCst);
+    engine.register(
+        "job",
+        |ctx: DurableContext, _at: ScheduledInput| async move {
+            ctx.step("work", || async {
+                WORK.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>(())
+            })
+            .await?;
             Ok::<_, Error>(())
-        })
-        .await?;
-        Ok::<_, Error>(())
-    });
+        },
+    );
     engine
         .create_schedule("tick", "job", "* * * * * *", ScheduleOptions::new())
         .await?;

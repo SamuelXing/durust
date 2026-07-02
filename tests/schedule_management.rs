@@ -6,7 +6,7 @@
 use chrono::{TimeZone, Utc};
 use durust::{
     ApplySchedule, DurableContext, DurableEngine, Error, InMemoryProvider, Result, ScheduleFilter,
-    ScheduleOptions, StateProvider, WorkflowHandle,
+    ScheduleOptions, ScheduledInput, StateProvider, WorkflowHandle,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -18,9 +18,10 @@ use std::time::Duration;
 #[tokio::test]
 async fn apply_creates_replaces_and_validates() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("wf", |_ctx: DurableContext, _at: String| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "wf",
+        |_ctx: DurableContext, _at: ScheduledInput| async move { Ok::<_, Error>(()) },
+    );
 
     engine
         .apply_schedules(vec![
@@ -76,10 +77,13 @@ async fn apply_creates_replaces_and_validates() -> Result<()> {
 async fn backfill_fires_each_tick_once() -> Result<()> {
     static WORK: AtomicUsize = AtomicUsize::new(0);
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("wf", |_ctx: DurableContext, _at: String| async move {
-        WORK.fetch_add(1, Ordering::SeqCst);
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "wf",
+        |_ctx: DurableContext, _at: ScheduledInput| async move {
+            WORK.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, Error>(())
+        },
+    );
     // Daily at noon UTC.
     engine
         .create_schedule("daily", "wf", "0 0 12 * * *", ScheduleOptions::new())
@@ -126,10 +130,13 @@ async fn backfill_fires_each_tick_once() -> Result<()> {
 async fn trigger_runs_once_now() -> Result<()> {
     static WORK: AtomicUsize = AtomicUsize::new(0);
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("wf", |_ctx: DurableContext, _at: String| async move {
-        WORK.fetch_add(1, Ordering::SeqCst);
-        Ok::<_, Error>("done".to_string())
-    });
+    engine.register(
+        "wf",
+        |_ctx: DurableContext, _at: ScheduledInput| async move {
+            WORK.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, Error>("done".to_string())
+        },
+    );
     engine
         .create_schedule("s", "wf", "0 0 12 * * *", ScheduleOptions::new())
         .await?;
@@ -154,9 +161,10 @@ async fn trigger_runs_once_now() -> Result<()> {
 #[tokio::test]
 async fn timezone_shifts_the_fired_instant() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("wf", |_ctx: DurableContext, _at: String| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "wf",
+        |_ctx: DurableContext, _at: ScheduledInput| async move { Ok::<_, Error>(()) },
+    );
     engine
         .create_schedule(
             "tokyo",
@@ -201,10 +209,13 @@ async fn automatic_backfill_catches_up_missed_ticks_on_launch() -> Result<()> {
     static WORK: AtomicUsize = AtomicUsize::new(0);
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("beat", |_ctx: DurableContext, _at: String| async move {
-        WORK.fetch_add(1, Ordering::SeqCst);
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "beat",
+        |_ctx: DurableContext, _at: ScheduledInput| async move {
+            WORK.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, Error>(())
+        },
+    );
     // Fire every second, with automatic backfill enabled.
     engine
         .create_schedule(

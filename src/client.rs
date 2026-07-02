@@ -509,13 +509,14 @@ impl Client {
             .get_schedule(schedule_name)
             .await?
             .ok_or_else(|| Error::app(format!("schedule not found: {schedule_name}")))?;
-        let stamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let now = Utc::now();
+        let stamp = now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         let id = format!("sched-{schedule_name}-trigger-{stamp}");
         let queue = schedule.queue_name.as_deref().unwrap_or(INTERNAL_QUEUE);
         self.enqueue(
             queue,
             &schedule.workflow_name,
-            stamp,
+            schedule.tick_input(now),
             WorkflowOptions::with_id(id),
         )
         .await
@@ -543,12 +544,11 @@ impl Client {
         let queue = schedule.queue_name.as_deref().unwrap_or(INTERNAL_QUEUE);
         let mut ids = Vec::new();
         for instant in cron_ticks_between(&cron, schedule.cron_timezone.as_deref(), start, end) {
-            let stamp = instant.to_rfc3339();
-            let id = format!("sched-{schedule_name}-{stamp}");
+            let id = format!("sched-{schedule_name}-{}", instant.to_rfc3339());
             self.enqueue::<_, serde_json::Value>(
                 queue,
                 &schedule.workflow_name,
-                stamp,
+                schedule.tick_input(instant),
                 WorkflowOptions::with_id(id.clone()),
             )
             .await?;

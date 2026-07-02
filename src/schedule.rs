@@ -4,7 +4,43 @@
 //! deterministic id so a tick runs exactly once across executors.
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// The input a scheduled workflow receives on each cron tick: the tick's
+/// wall-clock instant plus any user value attached to the schedule via
+/// [`ScheduleOptions::context`].
+///
+/// Serialized as `{"scheduled_time": <RFC3339>, "context": <value>}` — the shape
+/// the other DBOS SDKs deliver too, so a scheduled run's persisted input is
+/// portable across them. A scheduled workflow declares this as its input type:
+///
+/// ```ignore
+/// #[durust::workflow(schedule = "0 0 * * * *")]
+/// async fn hourly(_ctx: DurableContext, tick: ScheduledInput) -> Result<()> {
+///     println!("fired for {}", tick.scheduled_time);
+///     Ok(())
+/// }
+/// ```
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScheduledInput {
+    /// The cron tick instant this run fires for.
+    pub scheduled_time: DateTime<Utc>,
+    /// The user value attached to the schedule (`None` if none was set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<Value>,
+}
+
+impl ScheduledInput {
+    /// Deserialize [`context`](Self::context) into a concrete type, returning
+    /// `Ok(None)` when no context was attached.
+    pub fn context_as<T: serde::de::DeserializeOwned>(&self) -> crate::Result<Option<T>> {
+        match &self.context {
+            Some(v) => Ok(Some(serde_json::from_value(v.clone())?)),
+            None => Ok(None),
+        }
+    }
+}
 
 /// Lifecycle state of a persisted schedule. Stored as the cross-SDK strings
 /// `ACTIVE` / `PAUSED`.
@@ -55,6 +91,18 @@ pub struct WorkflowSchedule {
     pub cron_timezone: Option<String>,
     /// Queue to route each tick to (`None` runs the tick directly).
     pub queue_name: Option<String>,
+}
+
+impl WorkflowSchedule {
+    /// The input delivered to the workflow for the tick at `instant`: the tick
+    /// time plus this schedule's attached context. The single place tick input
+    /// is shaped, so every firing path (live loop, backfill, trigger) agrees.
+    pub(crate) fn tick_input(&self, instant: DateTime<Utc>) -> ScheduledInput {
+        ScheduledInput {
+            scheduled_time: instant,
+            context: self.context.clone(),
+        }
+    }
 }
 
 /// Optional settings for [`DurableEngine::create_schedule`](crate::DurableEngine::create_schedule).

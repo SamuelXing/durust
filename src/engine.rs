@@ -569,7 +569,7 @@ impl DurableEngine {
             queue: schedule.queue_name.clone(),
             ..Default::default()
         };
-        self.run_workflow(&schedule.workflow_name, stamp, opts)
+        self.run_workflow(&schedule.workflow_name, schedule.tick_input(now), opts)
             .await
     }
 
@@ -1416,23 +1416,16 @@ impl Runtime {
         schedule: &WorkflowSchedule,
         instant: DateTime<Utc>,
     ) -> Result<(WorkflowStatus, bool, String)> {
-        let stamp = instant.to_rfc3339();
-        let wf_id = format!("sched-{}-{}", schedule.schedule_name, stamp);
+        let wf_id = format!("sched-{}-{}", schedule.schedule_name, instant.to_rfc3339());
         let opts = WorkflowOptions {
             workflow_id: Some(wf_id.clone()),
             queue: schedule.queue_name.clone(),
             ..Default::default()
         };
         let auth = AuthContext::default();
+        let input = serde_json::to_value(schedule.tick_input(instant))?;
         let (canonical, queued) = self
-            .insert_run(
-                &wf_id,
-                &schedule.workflow_name,
-                Value::String(stamp),
-                &opts,
-                None,
-                &auth,
-            )
+            .insert_run(&wf_id, &schedule.workflow_name, input, &opts, None, &auth)
             .await?;
         Ok((canonical, queued, wf_id))
     }

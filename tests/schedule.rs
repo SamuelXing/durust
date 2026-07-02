@@ -3,7 +3,7 @@
 
 use durust::{
     DurableContext, DurableEngine, InMemoryProvider, ListFilter, Result, ScheduleFilter,
-    StateProvider,
+    ScheduledInput, StateProvider,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -12,9 +12,9 @@ use std::time::Duration;
 static RUNS: AtomicUsize = AtomicUsize::new(0);
 
 /// Fires every second (6-field cron: sec min hour dom mon dow). Receives the
-/// scheduled tick time (RFC 3339) as input.
+/// scheduled tick time and (unset here) context as its [`ScheduledInput`].
 #[durust::workflow(schedule = "* * * * * *")]
-async fn cron_tick(_ctx: DurableContext, _scheduled_at: String) -> Result<()> {
+async fn cron_tick(_ctx: DurableContext, _tick: ScheduledInput) -> Result<()> {
     RUNS.fetch_add(1, Ordering::SeqCst);
     Ok(())
 }

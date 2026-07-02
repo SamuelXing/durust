@@ -99,9 +99,13 @@ Postgres claims use `FOR UPDATE SKIP LOCKED`; SQLite uses a transactional claim.
 
 ### Scheduled (cron) workflows
 ```rust
-// 6-field cron (sec min hour dom mon dow); receives the tick time as input.
+// 6-field cron (sec min hour dom mon dow). The tick input carries the fire
+// time and any context attached to the schedule.
 #[durust::workflow(schedule = "0 0 * * * *")] // top of every hour
-async fn hourly(ctx: DurableContext, scheduled_at: String) -> Result<()> { Ok(()) }
+async fn hourly(ctx: DurableContext, tick: ScheduledInput) -> Result<()> {
+    println!("fired for {}", tick.scheduled_time);
+    Ok(())
+}
 ```
 Each tick starts the workflow under a deterministic `sched-<name>-<time>` id, so
 it runs **once per tick even across multiple executors**.

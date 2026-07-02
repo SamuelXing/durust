@@ -75,7 +75,8 @@ pub use provider::{
 };
 pub use queue::{RateLimiter, WorkflowQueue};
 pub use schedule::{
-    ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus, WorkflowSchedule,
+    ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus, ScheduledInput,
+    WorkflowSchedule,
 };
 pub use serialize::{
     PortableWorkflowArgs, PortableWorkflowError, Serializer, SerializerCodec, PORTABLE_ERROR_NAME,
