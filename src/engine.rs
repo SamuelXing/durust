@@ -1235,7 +1235,7 @@ impl DurableEngine {
     pub async fn recover_pending_for(&self, executor_ids: &[String]) -> Result<Vec<String>> {
         let filter = ListFilter {
             status: vec![STATUS_PENDING.to_string()],
-            app_version: Some(self.app_version.clone()),
+            app_version: vec![self.app_version.clone()],
             executor_ids: executor_ids.to_vec(),
             ..Default::default()
         };

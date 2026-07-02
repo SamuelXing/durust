@@ -707,7 +707,7 @@ async fn sqlite_management() -> Result<()> {
     // list filters via QueryBuilder.
     let listed = engine
         .list_workflows(&ListFilter {
-            name: Some("pipeline".to_string()),
+            name: vec!["pipeline".to_string()],
             status: vec![STATUS_SUCCESS.to_string()],
             limit: Some(10),
             ..Default::default()
@@ -1295,7 +1295,7 @@ async fn sqlite_backfill_persists_each_tick_once() -> Result<()> {
     assert_eq!(ids.len(), 3, "one tick per day");
 
     let filter = ListFilter {
-        workflow_id_prefix: Some("sched-daily-".to_string()),
+        workflow_id_prefix: vec!["sched-daily-".to_string()],
         ..Default::default()
     };
 
@@ -1441,7 +1441,7 @@ async fn sqlite_client_backfills_a_schedule() -> Result<()> {
     assert_eq!(ids.len(), 3);
 
     let prefix = || ListFilter {
-        workflow_id_prefix: Some("sched-daily-".to_string()),
+        workflow_id_prefix: vec!["sched-daily-".to_string()],
         ..Default::default()
     };
     let rows = client.list_workflows(&prefix()).await?;

@@ -401,31 +401,53 @@ impl StateProvider for InMemoryProvider {
 
     async fn list_workflows(&self, filter: &ListFilter) -> Result<Vec<WorkflowStatus>> {
         let g = self.inner.lock().await;
+        // A workflow is `was_forked_from` when some other workflow was forked
+        // from it (SQL backends stamp a column; in memory we derive it from the
+        // set of ids anyone points at via `forked_from`).
+        let fork_sources: std::collections::HashSet<&str> = filter
+            .was_forked_from
+            .map(|_| {
+                g.workflows
+                    .values()
+                    .filter_map(|w| w.forked_from.as_deref())
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut rows: Vec<WorkflowStatus> = g
             .workflows
             .values()
             .filter(|w| {
                 (filter.workflow_ids.is_empty() || filter.workflow_ids.contains(&w.id))
-                    && filter
-                        .workflow_id_prefix
-                        .as_ref()
-                        .is_none_or(|p| w.id.starts_with(p))
-                    && filter.name.as_ref().is_none_or(|n| &w.name == n)
+                    && (filter.workflow_id_prefix.is_empty()
+                        || filter
+                            .workflow_id_prefix
+                            .iter()
+                            .any(|p| w.id.starts_with(p)))
+                    && (filter.name.is_empty() || filter.name.contains(&w.name))
                     && (filter.status.is_empty() || filter.status.contains(&w.status))
-                    && filter
-                        .queue_name
-                        .as_ref()
-                        .is_none_or(|q| w.queue_name.as_deref() == Some(q.as_str()))
-                    && filter
-                        .app_version
-                        .as_ref()
-                        .is_none_or(|v| &w.app_version == v)
+                    && (filter.queue_name.is_empty()
+                        || w.queue_name
+                            .as_deref()
+                            .is_some_and(|q| filter.queue_name.iter().any(|f| f == q)))
+                    && (filter.app_version.is_empty()
+                        || filter.app_version.contains(&w.app_version))
                     && (filter.executor_ids.is_empty()
                         || filter.executor_ids.contains(&w.executor_id))
+                    && (filter.authenticated_users.is_empty()
+                        || w.authenticated_user
+                            .as_deref()
+                            .is_some_and(|u| filter.authenticated_users.iter().any(|f| f == u)))
+                    && (filter.forked_from.is_empty()
+                        || w.forked_from
+                            .as_deref()
+                            .is_some_and(|f| filter.forked_from.iter().any(|x| x == f)))
+                    && (filter.parent_workflow_ids.is_empty()
+                        || w.parent_workflow_id
+                            .as_deref()
+                            .is_some_and(|p| filter.parent_workflow_ids.iter().any(|x| x == p)))
                     && filter
-                        .forked_from
-                        .as_ref()
-                        .is_none_or(|f| w.forked_from.as_deref() == Some(f.as_str()))
+                        .was_forked_from
+                        .is_none_or(|wf| fork_sources.contains(w.id.as_str()) == wf)
                     && filter
                         .start_time_ms
                         .is_none_or(|t| w.created_at.timestamp_millis() >= t)

@@ -491,14 +491,26 @@ impl WorkflowStatus {
 #[derive(Clone)]
 pub struct ListFilter {
     pub workflow_ids: Vec<String>,
-    pub workflow_id_prefix: Option<String>,
-    pub name: Option<String>,
+    /// Match any workflow whose id starts with one of these prefixes (OR).
+    pub workflow_id_prefix: Vec<String>,
+    /// Match any of these workflow names (OR).
+    pub name: Vec<String>,
     /// Match any of these statuses.
     pub status: Vec<String>,
-    pub queue_name: Option<String>,
-    pub app_version: Option<String>,
+    /// Match any of these queue names (OR).
+    pub queue_name: Vec<String>,
+    /// Match any of these application versions (OR).
+    pub app_version: Vec<String>,
     pub executor_ids: Vec<String>,
-    pub forked_from: Option<String>,
+    /// Match any of these authenticated users (OR).
+    pub authenticated_users: Vec<String>,
+    /// Match any workflow forked from one of these source ids (OR).
+    pub forked_from: Vec<String>,
+    /// Match any workflow whose parent is one of these ids (OR).
+    pub parent_workflow_ids: Vec<String>,
+    /// `Some(true)` keeps only workflows that were themselves created by a fork;
+    /// `Some(false)` only those that were not; `None` does not filter on it.
+    pub was_forked_from: Option<bool>,
     pub start_time_ms: Option<i64>,
     pub end_time_ms: Option<i64>,
     /// Lower/upper bound on `completed_at` (epoch ms).
@@ -530,13 +542,16 @@ impl Default for ListFilter {
     fn default() -> Self {
         Self {
             workflow_ids: Vec::new(),
-            workflow_id_prefix: None,
-            name: None,
+            workflow_id_prefix: Vec::new(),
+            name: Vec::new(),
             status: Vec::new(),
-            queue_name: None,
-            app_version: None,
+            queue_name: Vec::new(),
+            app_version: Vec::new(),
             executor_ids: Vec::new(),
-            forked_from: None,
+            authenticated_users: Vec::new(),
+            forked_from: Vec::new(),
+            parent_workflow_ids: Vec::new(),
+            was_forked_from: None,
             start_time_ms: None,
             end_time_ms: None,
             completed_after_ms: None,

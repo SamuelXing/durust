@@ -39,7 +39,7 @@ async fn cron_fires_once_per_tick_across_executors() -> Result<()> {
 
     let rows = provider
         .list_workflows(&ListFilter {
-            workflow_id_prefix: Some("sched-".to_string()),
+            workflow_id_prefix: vec!["sched-".to_string()],
             ..Default::default()
         })
         .await?;

@@ -338,10 +338,10 @@ impl ListWorkflowsRequest {
     fn to_filter(&self) -> ListFilter {
         let mut f = ListFilter {
             workflow_ids: self.workflow_uuids.clone().unwrap_or_default(),
-            workflow_id_prefix: self.workflow_id_prefix.clone(),
-            name: self.workflow_name.clone(),
-            app_version: self.application_version.clone(),
-            queue_name: self.queue_name.clone(),
+            workflow_id_prefix: self.workflow_id_prefix.clone().into_iter().collect(),
+            name: self.workflow_name.clone().into_iter().collect(),
+            app_version: self.application_version.clone().into_iter().collect(),
+            queue_name: self.queue_name.clone().into_iter().collect(),
             start_time_ms: self.start_time.map(|t| t.timestamp_millis()),
             end_time_ms: self.end_time.map(|t| t.timestamp_millis()),
             limit: self.limit,
