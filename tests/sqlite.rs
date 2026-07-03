@@ -2097,6 +2097,126 @@ async fn sqlite_export_import_round_trip() -> Result<()> {
     Ok(())
 }
 
+/// `was_forked_from` survives an export/import round trip with its correct
+/// semantics: it marks the fork *source*, not the fork. The exported payload now
+/// carries the flag (Python-style), so import restores it verbatim — a source
+/// re-imported *alone* keeps `was_forked_from=true`, and the fork stays `false`
+/// (the old bug set it from the row's own `forked_from`, which stamped the fork).
+#[tokio::test]
+async fn sqlite_was_forked_from_survives_import() -> Result<()> {
+    let (url, path) = temp_db_url("wff-import");
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("wff", |ctx: DurableContext, n: i64| async move {
+        ctx.step("s", || async { Ok::<_, Error>(n) }).await
+    });
+    engine.launch().await?;
+
+    // Source runs; a fork is taken from it (marks the source `was_forked_from`).
+    engine
+        .run_workflow::<_, i64>("wff", 1i64, WorkflowOptions::with_id("src"))
+        .await?
+        .get_result()
+        .await?;
+    // fork_workflow stamps the source and creates the fork row synchronously; the
+    // fork itself need not run for the import-reconstruction check.
+    engine
+        .fork_workflow::<i64>("src", 0, WorkflowOptions::with_id("fork"))
+        .await?;
+
+    // Export each alone (a fork is not a child, so they export separately) and
+    // delete both.
+    let src_export = engine.export_workflow("src", false).await?;
+    let fork_export = engine.export_workflow("fork", false).await?;
+    engine
+        .delete_workflows(&["src".to_string(), "fork".to_string()], false)
+        .await?;
+
+    // Import the source ALONE: carry-over restores `was_forked_from=true` from the
+    // payload even with no fork in the batch to reconstruct from (the earlier
+    // reconstruction-only path would have left it false here).
+    engine.import_workflow(&src_export).await?;
+    let sources = engine
+        .list_workflows(&ListFilter {
+            was_forked_from: Some(true),
+            workflow_ids: vec!["src".to_string()],
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(
+        sources.len(),
+        1,
+        "the source's was_forked_from carried over"
+    );
+    assert_eq!(sources[0].id, "src");
+
+    // The fork imports as not-a-source.
+    engine.import_workflow(&fork_export).await?;
+    let not_sources = engine
+        .list_workflows(&ListFilter {
+            was_forked_from: Some(false),
+            workflow_ids: vec!["fork".to_string()],
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(not_sources.len(), 1, "the fork is not a source");
+    assert_eq!(not_sources[0].id, "fork");
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// Fallback path: a payload that *omits* `was_forked_from` (a Go export, or a
+/// Rust one from before the field was added) still recovers the flag — import
+/// reconstructs it from the fork links when the source+fork pair is imported
+/// together.
+#[tokio::test]
+async fn sqlite_was_forked_from_reconstructed_when_payload_omits_it() -> Result<()> {
+    let (url, path) = temp_db_url("wff-fallback");
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("wff", |ctx: DurableContext, n: i64| async move {
+        ctx.step("s", || async { Ok::<_, Error>(n) }).await
+    });
+    engine.launch().await?;
+
+    engine
+        .run_workflow::<_, i64>("wff", 1i64, WorkflowOptions::with_id("src"))
+        .await?
+        .get_result()
+        .await?;
+    engine
+        .fork_workflow::<i64>("src", 0, WorkflowOptions::with_id("fork"))
+        .await?;
+
+    // Export the pair, then strip `was_forked_from` from every payload to mimic a
+    // Go/old export that never carried the column.
+    let mut exported = engine.export_workflow("src", false).await?;
+    exported.extend(engine.export_workflow("fork", false).await?);
+    for wf in &mut exported {
+        wf.workflow_status.remove("was_forked_from");
+    }
+    engine
+        .delete_workflows(&["src".to_string(), "fork".to_string()], false)
+        .await?;
+    engine.import_workflow(&exported).await?;
+
+    // Reconstruction marks the source (a fork in the batch points at it); the fork
+    // stays false.
+    let sources = engine
+        .list_workflows(&ListFilter {
+            was_forked_from: Some(true),
+            workflow_ids: vec!["src".to_string(), "fork".to_string()],
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(sources.len(), 1, "reconstruction marked the source");
+    assert_eq!(sources[0].id, "src");
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 /// Genuine mid-flight replay: recovering a `PENDING` workflow re-executes the
 /// workflow body but replays each already-checkpointed step from storage instead
 /// of re-running it.

@@ -1,8 +1,8 @@
 use crate::error::{Error, Result};
 use crate::provider::{
-    col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows, is_terminal,
-    nonexistent_or, step_outcome_from, workflow_agg_selects, ChangeWait, DequeueRequest,
-    ExportedWorkflow, ListFilter, NotificationInfo, StateProvider, StepAggregate,
+    col_bool, col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows,
+    is_terminal, nonexistent_or, step_outcome_from, workflow_agg_selects, ChangeWait,
+    DequeueRequest, ExportedWorkflow, ListFilter, NotificationInfo, StateProvider, StepAggregate,
     StepAggregateQuery, StepInfo, StepOutcome, VersionInfo, WorkflowAggregate,
     WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_STR_COLS, NOTIFICATIONS_CHANNEL,
     STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
@@ -1798,7 +1798,11 @@ impl StateProvider for PostgresProvider {
             .bind(col_str(s, "parent_workflow_id"))
             .bind(col_i64(s, "delay_until_epoch_ms"))
             .bind(col_str(s, "serialization"))
-            .bind(col_str(s, "forked_from").is_some())
+            // `was_forked_from` marks a fork *source*, not the fork. Carry over
+            // the exported value (Python-style portable format); the fallback
+            // reconstruction below covers payloads that omit it (Go exports, or
+            // older Rust ones). Never derived from this row's own `forked_from`.
+            .bind(col_bool(s, "was_forked_from").unwrap_or(false))
             .execute(&mut *tx)
             .await?;
 
@@ -1859,6 +1863,21 @@ impl StateProvider for PostgresProvider {
                 .await?;
             }
         }
+        // Reconstruct `was_forked_from`: any workflow an imported fork points at
+        // (via `forked_from`) is a fork source, so mark it — mirroring what
+        // `fork_workflow` stamps and what the in-memory backend derives.
+        let sources: Vec<String> = workflows
+            .iter()
+            .filter_map(|wf| col_str(&wf.workflow_status, "forked_from"))
+            .collect();
+        if !sources.is_empty() {
+            sqlx::query(
+                "UPDATE workflow_status SET was_forked_from = TRUE WHERE workflow_uuid = ANY($1)",
+            )
+            .bind(&sources)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -1885,6 +1904,15 @@ fn i32_col(row: &sqlx::postgres::PgRow, key: &str) -> Value {
     json!(row.try_get::<Option<i32>, _>(key).ok().flatten())
 }
 
+/// A `BOOLEAN` column of a Postgres row as a JSON value (`false` when SQL NULL).
+fn bool_col(row: &sqlx::postgres::PgRow, key: &str) -> Value {
+    json!(row
+        .try_get::<Option<bool>, _>(key)
+        .ok()
+        .flatten()
+        .unwrap_or(false))
+}
+
 fn export_status_map(row: &sqlx::postgres::PgRow) -> Map<String, Value> {
     let mut m = Map::new();
     for &c in EXPORT_STATUS_STR_COLS {
@@ -1903,6 +1931,12 @@ fn export_status_map(row: &sqlx::postgres::PgRow) -> Map<String, Value> {
         m.insert(c.to_string(), i64_col(row, c));
     }
     m.insert("priority".to_string(), i32_col(row, "priority"));
+    // `was_forked_from` (BOOLEAN) — included so the flag round-trips across SDKs
+    // the way Python's portable format does (Go omits it).
+    m.insert(
+        "was_forked_from".to_string(),
+        bool_col(row, "was_forked_from"),
+    );
     m
 }
 

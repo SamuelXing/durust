@@ -161,6 +161,24 @@ async fn fork_reuses_checkpoints() -> Result<()> {
 
     let row = provider.get_workflow_status("wf-fork").await?.unwrap();
     assert_eq!(row.forked_from.as_deref(), Some("wf-orig"));
+
+    // The in-memory backend has no `was_forked_from` column, so it derives the
+    // flag when exporting: the source's payload carries `was_forked_from=true`,
+    // the fork's `false` — keeping the portable payload shape consistent with the
+    // SQL backends (and Python).
+    let src_export = engine.export_workflow("wf-orig", false).await?;
+    assert_eq!(
+        src_export[0].workflow_status.get("was_forked_from"),
+        Some(&serde_json::json!(true)),
+        "exported source carries was_forked_from=true"
+    );
+    let fork_export = engine.export_workflow("wf-fork", false).await?;
+    assert_eq!(
+        fork_export[0].workflow_status.get("was_forked_from"),
+        Some(&serde_json::json!(false)),
+        "exported fork carries was_forked_from=false"
+    );
+
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }

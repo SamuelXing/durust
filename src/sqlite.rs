@@ -1,12 +1,13 @@
 use crate::error::{Error, Result};
 use crate::provider::{
-    col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows, is_terminal,
-    nonexistent_or, step_outcome_from, workflow_agg_selects, DequeueRequest, ExportedWorkflow,
-    ListFilter, NotificationInfo, StateProvider, StepAggregate, StepAggregateQuery, StepInfo,
-    StepOutcome, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
-    EXPORT_STATUS_INT_COLS, EXPORT_STATUS_STR_COLS, STATUS_CANCELLED, STATUS_DELAYED,
-    STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
-    STATUS_SUCCESS, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL,
+    col_bool, col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows,
+    is_terminal, nonexistent_or, step_outcome_from, workflow_agg_selects, DequeueRequest,
+    ExportedWorkflow, ListFilter, NotificationInfo, StateProvider, StepAggregate,
+    StepAggregateQuery, StepInfo, StepOutcome, VersionInfo, WorkflowAggregate,
+    WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_INT_COLS, EXPORT_STATUS_STR_COLS,
+    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
+    STREAM_CLOSED_SENTINEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
@@ -1562,7 +1563,11 @@ impl StateProvider for SqliteProvider {
             .bind(col_str(s, "parent_workflow_id"))
             .bind(col_i64(s, "delay_until_epoch_ms"))
             .bind(col_str(s, "serialization"))
-            .bind(col_str(s, "forked_from").is_some())
+            // `was_forked_from` marks a fork *source*, not the fork. Carry over
+            // the exported value (Python-style portable format); the fallback
+            // reconstruction below covers payloads that omit it (Go exports, or
+            // older Rust ones). Never derived from this row's own `forked_from`.
+            .bind(col_bool(s, "was_forked_from").unwrap_or(false))
             .execute(&mut *tx)
             .await?;
 
@@ -1623,6 +1628,24 @@ impl StateProvider for SqliteProvider {
                 .await?;
             }
         }
+        // Reconstruct `was_forked_from`: any workflow an imported fork points at
+        // (via `forked_from`) is a fork source, so mark it — mirroring what
+        // `fork_workflow` stamps and what the in-memory backend derives.
+        let sources: Vec<String> = workflows
+            .iter()
+            .filter_map(|wf| col_str(&wf.workflow_status, "forked_from"))
+            .collect();
+        if !sources.is_empty() {
+            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+                "UPDATE workflow_status SET was_forked_from = TRUE WHERE workflow_uuid IN (",
+            );
+            let mut sep = qb.separated(", ");
+            for id in &sources {
+                sep.push_bind(id.as_str());
+            }
+            qb.push(")");
+            qb.build().execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -1638,6 +1661,18 @@ fn i_col(row: &sqlx::sqlite::SqliteRow, key: &str) -> Value {
     json!(row.try_get::<Option<i64>, _>(key).ok().flatten())
 }
 
+/// A boolean column of a SQLite row (stored as 0/1) as a JSON bool (`false` when
+/// SQL NULL) — so the exported payload uses a real bool, like Postgres/Python.
+fn bool_col(row: &sqlx::sqlite::SqliteRow, key: &str) -> Value {
+    json!(
+        row.try_get::<Option<i64>, _>(key)
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+            != 0
+    )
+}
+
 fn export_status_map(row: &sqlx::sqlite::SqliteRow) -> Map<String, Value> {
     let mut m = Map::new();
     for &c in EXPORT_STATUS_STR_COLS {
@@ -1646,6 +1681,12 @@ fn export_status_map(row: &sqlx::sqlite::SqliteRow) -> Map<String, Value> {
     for &c in EXPORT_STATUS_INT_COLS {
         m.insert(c.to_string(), i_col(row, c));
     }
+    // `was_forked_from` (0/1) — emitted as a bool so the flag round-trips across
+    // SDKs the way Python's portable format does (Go omits it).
+    m.insert(
+        "was_forked_from".to_string(),
+        bool_col(row, "was_forked_from"),
+    );
     m
 }
 

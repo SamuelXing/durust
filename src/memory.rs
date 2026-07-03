@@ -1197,6 +1197,14 @@ impl StateProvider for InMemoryProvider {
             }
         }
 
+        // `was_forked_from` is derived (this backend has no column): a workflow
+        // is a fork source when some other workflow points at it via forked_from.
+        let fork_sources: std::collections::HashSet<&str> = g
+            .workflows
+            .values()
+            .filter_map(|w| w.forked_from.as_deref())
+            .collect();
+
         let mut exported = Vec::with_capacity(ids.len());
         for id in &ids {
             let Some(w) = g.workflows.get(id) else {
@@ -1238,8 +1246,13 @@ impl StateProvider for InMemoryProvider {
                 }
             }
 
+            let mut workflow_status = status_to_map(w);
+            workflow_status.insert(
+                "was_forked_from".into(),
+                json!(fork_sources.contains(w.id.as_str())),
+            );
             exported.push(ExportedWorkflow {
-                workflow_status: status_to_map(w),
+                workflow_status,
                 operation_outputs,
                 workflow_events,
                 // No events-history table in the in-memory backend.
