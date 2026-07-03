@@ -148,6 +148,28 @@ impl PostgresProvider {
         self.serializer = serializer;
         self
     }
+
+    /// Back off before the next attempt of the unbounded transaction-conflict
+    /// retry loop, unless the workflow has been cancelled — in which case return
+    /// [`Error::Cancelled`] so an operator can stop a transaction wedged on a
+    /// conflict (the loop is otherwise unbounded, matching Go/Python). The backoff
+    /// is exponential, capped at 1s. A failure to read the status (e.g. the
+    /// database is momentarily unreachable) is treated as not-cancelled so a
+    /// transient outage keeps being retried until it clears or the workflow is
+    /// actually cancelled.
+    async fn conflict_retry_wait(&self, workflow_id: &str, attempt: u32) -> Result<()> {
+        let status: std::result::Result<Option<String>, _> =
+            sqlx::query_scalar("SELECT status FROM workflow_status WHERE workflow_uuid = $1")
+                .bind(workflow_id)
+                .fetch_optional(&self.pool)
+                .await;
+        if matches!(status, Ok(Some(s)) if s == STATUS_CANCELLED) {
+            return Err(Error::Cancelled(workflow_id.to_string()));
+        }
+        let ms = (1u64 << attempt.min(10)).min(1000);
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        Ok(())
+    }
 }
 
 impl Drop for PostgresProvider {
@@ -574,7 +596,6 @@ impl StateProvider for PostgresProvider {
                 return so.into_value_result();
             }
         }
-        const MAX_CONFLICT_ATTEMPTS: u32 = 10;
         // OUTER loop: the user-facing retry policy for application errors. A body
         // error is retried up to `opts.max_retries` (gated by `retry_if`), the
         // whole body re-running on a fresh transaction. Conflicts are handled by
@@ -583,8 +604,10 @@ impl StateProvider for PostgresProvider {
         loop {
             let mut conflict_attempt: u32 = 0;
             // INNER loop: one committed success, or an application error surfaced
-            // to the outer loop. A serialization/deadlock conflict aborts the tx
-            // and retries on a fresh one without recording anything.
+            // to the outer loop. A serialization/deadlock conflict or transient DB
+            // error aborts the tx and retries on a fresh one — unbounded (until it
+            // clears or the workflow is cancelled), matching Go/Python. Nothing is
+            // recorded on a conflict.
             let body_err = 'conflict: loop {
                 let outcome = async {
                     let mut tx = self.pool.begin().await?;
@@ -629,12 +652,12 @@ impl StateProvider for PostgresProvider {
                             Ok(value)
                         }
                         // Any error rolls back the body's writes (dropping `tx` on a
-                        // conflict, an explicit rollback otherwise) so the step stays
-                        // atomic. Nothing is recorded here: a conflict retries on a
-                        // fresh tx, and an application error is left for the outer
-                        // user-retry loop, which records it only once the budget is
-                        // exhausted.
-                        Err(e) if e.is_tx_conflict() => Err(e),
+                        // conflict/transient error, an explicit rollback otherwise) so
+                        // the step stays atomic. Nothing is recorded here: a conflict
+                        // or transient DB error retries on a fresh tx, and an
+                        // application error is left for the outer user-retry loop,
+                        // which records it only once the budget is exhausted.
+                        Err(e) if e.is_tx_conflict() || e.is_retryable() => Err(e),
                         Err(e) => {
                             tx.rollback().await?;
                             Err(e)
@@ -645,12 +668,14 @@ impl StateProvider for PostgresProvider {
 
                 match outcome {
                     Ok(v) => return Ok(v),
-                    Err(e)
-                        if e.is_tx_conflict() && conflict_attempt + 1 < MAX_CONFLICT_ATTEMPTS =>
-                    {
-                        conflict_attempt += 1;
-                        let ms = (1u64 << conflict_attempt.min(6)).min(200);
-                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    // A transaction conflict or transient DB error: retry on a fresh
+                    // transaction, unbounded, backing off and bailing if the workflow
+                    // is cancelled. Matches Go/Python, which retry these until they
+                    // clear rather than surfacing a spurious failure under contention.
+                    Err(e) if e.is_tx_conflict() || e.is_retryable() => {
+                        self.conflict_retry_wait(workflow_id, conflict_attempt)
+                            .await?;
+                        conflict_attempt = conflict_attempt.saturating_add(1);
                     }
                     Err(e) => break 'conflict e,
                 }

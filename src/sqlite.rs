@@ -63,6 +63,28 @@ impl SqliteProvider {
         }
     }
 
+    /// Back off before the next attempt of the unbounded transaction-conflict
+    /// retry loop, unless the workflow has been cancelled — in which case return
+    /// [`Error::Cancelled`] so an operator can stop a transaction wedged on a
+    /// conflict (the loop is otherwise unbounded, matching Go/Python). The backoff
+    /// is exponential, capped at 1s. A failure to read the status (e.g. the
+    /// database is momentarily unreachable) is treated as not-cancelled so a
+    /// transient outage keeps being retried until it clears or the workflow is
+    /// actually cancelled.
+    async fn conflict_retry_wait(&self, workflow_id: &str, attempt: u32) -> Result<()> {
+        let status: std::result::Result<Option<String>, _> =
+            sqlx::query_scalar("SELECT status FROM workflow_status WHERE workflow_uuid = ?")
+                .bind(workflow_id)
+                .fetch_optional(&self.pool)
+                .await;
+        if matches!(status, Ok(Some(s)) if s == STATUS_CANCELLED) {
+            return Err(Error::Cancelled(workflow_id.to_string()));
+        }
+        let ms = (1u64 << attempt.min(10)).min(1000);
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        Ok(())
+    }
+
     /// Choose the format new values are encoded with (see [`crate::Serializer`]).
     pub fn with_serializer(mut self, serializer: Serializer) -> Self {
         self.serializer = serializer;
@@ -366,11 +388,11 @@ impl StateProvider for SqliteProvider {
                 return so.into_value_result();
             }
         }
-        const MAX_CONFLICT_ATTEMPTS: u32 = 10;
         // OUTER loop: the user-facing retry policy for application errors (see the
         // Postgres provider for the shared design). Conflicts (SQLITE_BUSY /
-        // SQLITE_LOCKED) are handled by the inner loop and don't count against
-        // this budget.
+        // SQLITE_LOCKED) and transient DB errors are handled by the inner loop —
+        // retried unbounded until they clear or the workflow is cancelled — and
+        // don't count against this budget.
         let mut user_attempt: u32 = 0;
         loop {
             let mut conflict_attempt: u32 = 0;
@@ -407,10 +429,11 @@ impl StateProvider for SqliteProvider {
                             Ok(value)
                         }
                         // Any error rolls back the body's writes so the step stays
-                        // atomic. Nothing is recorded here: a conflict retries on a
-                        // fresh tx, an application error is left for the outer
-                        // user-retry loop (recorded only once the budget is spent).
-                        Err(e) if e.is_tx_conflict() => Err(e),
+                        // atomic. Nothing is recorded here: a conflict or transient DB
+                        // error retries on a fresh tx, an application error is left for
+                        // the outer user-retry loop (recorded only once the budget is
+                        // spent).
+                        Err(e) if e.is_tx_conflict() || e.is_retryable() => Err(e),
                         Err(e) => {
                             tx.rollback().await?;
                             Err(e)
@@ -421,12 +444,14 @@ impl StateProvider for SqliteProvider {
 
                 match outcome {
                     Ok(v) => return Ok(v),
-                    Err(e)
-                        if e.is_tx_conflict() && conflict_attempt + 1 < MAX_CONFLICT_ATTEMPTS =>
-                    {
-                        conflict_attempt += 1;
-                        let ms = (1u64 << conflict_attempt.min(6)).min(200);
-                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    // A conflict (SQLITE_BUSY / SQLITE_LOCKED) or transient DB error:
+                    // retry on a fresh transaction, unbounded, backing off and bailing
+                    // if the workflow is cancelled. Matches Go/Python, which retry
+                    // these until they clear rather than failing under contention.
+                    Err(e) if e.is_tx_conflict() || e.is_retryable() => {
+                        self.conflict_retry_wait(workflow_id, conflict_attempt)
+                            .await?;
+                        conflict_attempt = conflict_attempt.saturating_add(1);
                     }
                     Err(e) => break 'conflict e,
                 }
