@@ -2107,6 +2107,107 @@ async fn sqlite_transaction_retry_predicate_fails_fast() -> Result<()> {
     Ok(())
 }
 
+/// A transaction body that fails with a *retryable* DB error (here a closed pool,
+/// standing in for a transient connection blip) is retried on a fresh transaction
+/// until it clears — matching Go/Python, which retry the transient set, not just
+/// serialization/deadlock conflicts. Before this, durust retried only
+/// `is_tx_conflict` errors, so a connection-class error fell straight through to
+/// the (default: no-op) user-retry policy and failed immediately.
+#[tokio::test]
+async fn sqlite_transaction_retries_transient_db_error() -> Result<()> {
+    use durust::{params, TransactionOptions};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+    RUNS.store(0, Ordering::SeqCst);
+    let (url, path) = temp_db_url("txn-transient");
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("flaky", |ctx: DurableContext, _: ()| async move {
+        let n: i64 = ctx
+            .transaction_with(TransactionOptions::new("t"), |tx| {
+                Box::pin(async move {
+                    tx.execute("SELECT 1", &params![]).await?;
+                    // Fail with a retryable (connection-class) error three times,
+                    // then succeed. The old conflict loop would not retry this at all.
+                    if RUNS.fetch_add(1, Ordering::SeqCst) < 3 {
+                        Err(durust::Error::Db(sqlx::Error::PoolClosed))
+                    } else {
+                        Ok(7_i64)
+                    }
+                })
+            })
+            .await?;
+        Ok::<_, Error>(n)
+    });
+    let out: i64 = engine.start_typed("flaky", "wf-transient", ()).await?;
+    assert_eq!(out, 7, "the transaction eventually commits");
+    assert_eq!(
+        RUNS.load(Ordering::SeqCst),
+        4,
+        "the body re-ran past the retryable error (3 failures + 1 success)"
+    );
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// The transaction conflict/transient retry is now *unbounded* (matching Go/Python,
+/// which retry until the conflict clears rather than capping). A body that always
+/// fails with a retryable error would spin forever; cancelling the workflow must
+/// make the loop observe the cancellation and stop with a `Cancelled` error rather
+/// than hang. This exercises both the unboundedness (it retries well past the old
+/// 10-cap) and the cancellation-awareness.
+#[tokio::test]
+async fn sqlite_transaction_conflict_retry_is_unbounded_but_cancellable() -> Result<()> {
+    use durust::{params, TransactionOptions};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SPINS: AtomicUsize = AtomicUsize::new(0);
+    SPINS.store(0, Ordering::SeqCst);
+    let (url, path) = temp_db_url("txn-spin-cancel");
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("spinner", |ctx: DurableContext, _: ()| async move {
+        ctx.transaction_with(TransactionOptions::new("t"), |tx| {
+            Box::pin(async move {
+                tx.execute("SELECT 1", &params![]).await?;
+                SPINS.fetch_add(1, Ordering::SeqCst);
+                Err::<i64, _>(durust::Error::Db(sqlx::Error::PoolClosed))
+            })
+        })
+        .await?;
+        Ok::<_, Error>(())
+    });
+    engine.launch().await?;
+    let engine = Arc::new(engine);
+
+    // Run it in the background; the conflict loop spins on the retryable error.
+    let bg = engine.clone();
+    let run = tokio::spawn(async move { bg.start_typed::<_, ()>("spinner", "wf-spin", ()).await });
+
+    // Once it has spun past the old 10-attempt cap, cancel it. The loop must stop.
+    for _ in 0..400 {
+        if SPINS.load(Ordering::SeqCst) > 10 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        SPINS.load(Ordering::SeqCst) > 10,
+        "the conflict loop retried past the old 10-attempt cap (unbounded)"
+    );
+    engine.cancel_workflow("wf-spin").await?;
+
+    let res = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("cancelled transaction must stop promptly, not spin forever")
+        .expect("workflow task joins");
+    assert!(
+        res.is_err(),
+        "a cancelled spinning transaction surfaces an error, not success"
+    );
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 /// Replaying a transaction step that recorded a *failure* must return that
 /// failure **immediately**, even when the step is configured with `max_retries`:
 /// a durable outcome is terminal, not a fresh error to re-run against the retry
