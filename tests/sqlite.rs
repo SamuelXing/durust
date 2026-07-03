@@ -2107,6 +2107,86 @@ async fn sqlite_transaction_retry_predicate_fails_fast() -> Result<()> {
     Ok(())
 }
 
+/// Replaying a transaction step that recorded a *failure* must return that
+/// failure **immediately**, even when the step is configured with `max_retries`:
+/// a durable outcome is terminal, not a fresh error to re-run against the retry
+/// policy. Exercises the provider's `run_transaction_step` directly (an engine
+/// `start` on an already-completed workflow short-circuits above this path, so it
+/// wouldn't reach step replay at all). A large `base_interval` makes a regression
+/// — spinning the user-retry loop over the recorded failure — sleep for tens of
+/// seconds; the replay is asserted near-instant, with the body never re-run.
+#[tokio::test]
+async fn sqlite_recorded_transaction_failure_replays_immediately() -> Result<()> {
+    use durust::{params, StateProvider, TxBody};
+    static REC_RUNS: AtomicUsize = AtomicUsize::new(0);
+    static REPLAY_BODY_RUNS: AtomicUsize = AtomicUsize::new(0);
+    let (url, path) = temp_db_url("txn-replay");
+
+    // Keep a handle on the provider so we can call it directly after the engine
+    // has created the workflow row and the recorded failure.
+    let provider = Arc::new(SqliteProvider::connect(&url).await?);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("rec", |ctx: DurableContext, _: ()| async move {
+        let r: Result<i64> = ctx
+            .transaction_with(
+                TransactionOptions::new("boom").base_interval(Duration::from_millis(1)),
+                |tx| {
+                    Box::pin(async move {
+                        tx.execute("SELECT 1", &params![]).await?;
+                        REC_RUNS.fetch_add(1, Ordering::SeqCst);
+                        Err(Error::app("always"))
+                    })
+                },
+            )
+            .await;
+        Ok::<_, Error>(if r.is_err() { "caught" } else { "ok" }.to_string())
+    });
+    let id = "wf-txn-replay";
+    let out: String = engine.start_typed("rec", id, ()).await?;
+    assert_eq!(out, "caught");
+    assert_eq!(
+        REC_RUNS.load(Ordering::SeqCst),
+        1,
+        "the body ran once on record"
+    );
+
+    // Find the transaction step's function_id, then replay it directly with a
+    // *retrying* policy (max_retries(3), 30s backoff). The recorded failure must
+    // short-circuit ahead of the retry loop: near-instant, body not re-run. A
+    // regression would sleep ~15s (three backoffs capped at max_interval) first.
+    let steps = engine.get_workflow_steps(id).await?;
+    let step = steps.iter().find(|s| s.name == "boom").expect("recorded");
+    let seq = step.step_id;
+
+    let opts = TransactionOptions::new("boom")
+        .max_retries(3)
+        .base_interval(Duration::from_secs(30));
+    let body: TxBody = Box::new(|_tx| {
+        Box::pin(async move {
+            REPLAY_BODY_RUNS.fetch_add(1, Ordering::SeqCst);
+            Err(Error::app("always"))
+        })
+    });
+    let started = std::time::Instant::now();
+    // started_at_ms is only used by the checkpoint insert, which the replay path
+    // never reaches — any value works.
+    let res = provider.run_transaction_step(id, seq, 0, &opts, body).await;
+    let elapsed = started.elapsed();
+    assert!(res.is_err(), "replay returns the recorded failure");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "recorded failure replayed in {elapsed:?}; the retry loop must be skipped"
+    );
+    assert_eq!(
+        REPLAY_BODY_RUNS.load(Ordering::SeqCst),
+        0,
+        "the body is not re-run on replay of a recorded failure"
+    );
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 /// export_workflow captures a workflow's full durable state (status, steps,
 /// events, streams); import_workflow restores it byte-for-byte after deletion.
 #[tokio::test]
