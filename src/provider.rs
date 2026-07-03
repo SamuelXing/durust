@@ -966,6 +966,12 @@ pub(crate) fn col_i64(m: &Map<String, Value>, key: &str) -> Option<i64> {
     m.get(key).and_then(Value::as_i64)
 }
 
+/// A column's value pulled from an exported row as a `bool` (`None` for JSON null
+/// or a missing/non-bool key). Shared by the SQL providers' import.
+pub(crate) fn col_bool(m: &Map<String, Value>, key: &str) -> Option<bool> {
+    m.get(key).and_then(Value::as_bool)
+}
+
 /// Parameters for one dequeue iteration, computed by the engine's dispatcher
 /// from a [`crate::WorkflowQueue`]'s configuration. Plain scalars so the storage
 /// layer stays decoupled from the queue type.

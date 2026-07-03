@@ -2345,9 +2345,8 @@ async fn pg_list_filters_multi_value() -> Result<()> {
 }
 
 /// `was_forked_from` survives an export/import round trip on Postgres with its
-/// correct semantics (marks the fork *source*, not the fork). The export schema
-/// omits the column, so import reconstructs it from the fork links via the
-/// `= ANY($1)` mark-sources pass.
+/// correct semantics (marks the fork *source*, not the fork). The exported payload
+/// carries the flag (Python-style), so a source re-imported alone keeps it.
 #[tokio::test]
 async fn pg_was_forked_from_survives_import() -> Result<()> {
     let Some(url) = database_url() else {
@@ -2368,33 +2367,41 @@ async fn pg_was_forked_from_survives_import() -> Result<()> {
         .await?
         .get_result()
         .await?;
-    // fork_workflow stamps the source and creates the fork row synchronously; the
-    // fork itself need not run for the import-reconstruction check.
+    // fork_workflow stamps the source and creates the fork row synchronously.
     engine
         .fork_workflow::<i64>(&src, 0, WorkflowOptions::with_id(&fork))
         .await?;
 
-    let mut exported = engine.export_workflow(&src, false).await?;
-    exported.extend(engine.export_workflow(&fork, false).await?);
+    // Export each alone, delete both.
+    let src_export = engine.export_workflow(&src, false).await?;
+    let fork_export = engine.export_workflow(&fork, false).await?;
     engine
         .delete_workflows(&[src.clone(), fork.clone()], false)
         .await?;
-    engine.import_workflow(&exported).await?;
 
+    // Import the source ALONE: carry-over restores was_forked_from=true from the
+    // payload even with no fork in the batch to reconstruct from.
+    engine.import_workflow(&src_export).await?;
     let sources = engine
         .list_workflows(&ListFilter {
             was_forked_from: Some(true),
-            workflow_ids: vec![src.clone(), fork.clone()],
+            workflow_ids: vec![src.clone()],
             ..Default::default()
         })
         .await?;
-    assert_eq!(sources.len(), 1, "only the source is was_forked_from");
+    assert_eq!(
+        sources.len(),
+        1,
+        "the source's was_forked_from carried over"
+    );
     assert_eq!(sources[0].id, src);
 
+    // The fork imports as not-a-source.
+    engine.import_workflow(&fork_export).await?;
     let not_sources = engine
         .list_workflows(&ListFilter {
             was_forked_from: Some(false),
-            workflow_ids: vec![src.clone(), fork.clone()],
+            workflow_ids: vec![fork.clone()],
             ..Default::default()
         })
         .await?;
