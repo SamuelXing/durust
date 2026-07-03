@@ -547,6 +547,33 @@ impl StateProvider for PostgresProvider {
         body: TxBody<'_>,
     ) -> Result<Value> {
         let name = opts.name.as_str();
+        // Replay: a previously recorded outcome — a committed success or a durable
+        // failure written by an earlier exhausted run — is returned immediately,
+        // without running the body or re-evaluating the retry policy. This must
+        // sit *ahead* of the retry loops: a recorded failure is terminal, not a
+        // fresh error to be retried (otherwise a replay would spin the user-retry
+        // loop, sleeping through its whole backoff, before returning it). The
+        // `ON CONFLICT DO NOTHING` inserts below guard the write side; there is a
+        // single writer per (workflow_id, seq).
+        if let Some(r) = sqlx::query(
+            "SELECT output, error, serialization FROM operation_outputs
+             WHERE workflow_uuid = $1 AND function_id = $2",
+        )
+        .bind(workflow_id)
+        .bind(seq)
+        .fetch_optional(&self.pool)
+        .await?
+        {
+            let fmt: Option<String> = r.get("serialization");
+            if let Some(so) = step_outcome_from(
+                &self.serializer,
+                fmt.as_deref(),
+                r.get::<Option<String>, _>("output").as_deref(),
+                r.get::<Option<String>, _>("error").as_deref(),
+            )? {
+                return so.into_value_result();
+            }
+        }
         const MAX_CONFLICT_ATTEMPTS: u32 = 10;
         // OUTER loop: the user-facing retry policy for application errors. A body
         // error is retried up to `opts.max_retries` (gated by `retry_if`), the
@@ -572,29 +599,8 @@ impl StateProvider for PostgresProvider {
                         }
                         sqlx::query(&stmt).execute(&mut *tx).await?;
                     }
-                    // Replay: if this step already committed, return its recorded
-                    // outcome (output as Ok, a recorded failure as Err) without
-                    // running the body.
-                    if let Some(r) = sqlx::query(
-                        "SELECT output, error, serialization FROM operation_outputs
-                         WHERE workflow_uuid = $1 AND function_id = $2",
-                    )
-                    .bind(workflow_id)
-                    .bind(seq)
-                    .fetch_optional(&mut *tx)
-                    .await?
-                    {
-                        let fmt: Option<String> = r.get("serialization");
-                        if let Some(so) = step_outcome_from(
-                            &self.serializer,
-                            fmt.as_deref(),
-                            r.get::<Option<String>, _>("output").as_deref(),
-                            r.get::<Option<String>, _>("error").as_deref(),
-                        )? {
-                            return so.into_value_result();
-                        }
-                    }
-                    // Run the user's body against this transaction.
+                    // Run the user's body against this transaction. (Replay is
+                    // handled up front, before the retry loops.)
                     let body_result = {
                         let mut h = Tx::postgres(&mut tx);
                         body(&mut h).await
