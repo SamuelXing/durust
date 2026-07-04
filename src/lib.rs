@@ -55,7 +55,7 @@ pub use admin::AdminServer;
 pub use client::Client;
 pub use conductor::{AlertHandler, Conductor, ConductorConfig};
 pub use context::{AuthContext, DurableContext, RetryPredicate, StepOptions};
-pub use debounce::Debouncer;
+pub use debounce::{Debouncer, DebouncerClient};
 pub use engine::{
     erase, DeduplicationPolicy, DurableEngine, RegisteredWorkflow, WorkflowFn, WorkflowOptions,
     WorkflowRegistration,

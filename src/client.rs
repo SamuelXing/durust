@@ -63,6 +63,14 @@ impl Client {
         &self.provider
     }
 
+    /// Debounce a target workflow from out of process — coalesce rapid repeated
+    /// triggers (grouped by key) into a single delayed run with the latest input.
+    /// A launched engine elsewhere (which auto-registers the internal debouncer
+    /// and has the target registered) executes the coalesced run.
+    pub fn debouncer(&self, target_workflow: &str) -> crate::debounce::DebouncerClient<'_> {
+        crate::debounce::DebouncerClient::new(self, target_workflow)
+    }
+
     /// Enqueue `workflow_name` on `queue_name` for an executor to claim and run.
     /// The workflow need not be registered in this process. Returns a polling
     /// [`WorkflowHandle`] over the result.

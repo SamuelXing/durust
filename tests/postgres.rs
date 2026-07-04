@@ -1172,6 +1172,53 @@ async fn pg_client_enqueues_work_an_engine_runs() -> Result<()> {
     Ok(())
 }
 
+/// An out-of-process `Client` debounces over a real Postgres database: three
+/// rapid `Client.debouncer(...).debounce` calls (sharing the DB with a launched
+/// engine that runs the collector and target) coalesce to a single run with the
+/// latest input, all handles pointing at the same run.
+#[tokio::test]
+async fn pg_client_debounces() -> Result<()> {
+    use durust::{Client, WorkflowHandle};
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_client_debounces: DATABASE_URL unset");
+        return Ok(());
+    };
+    let wf = format!("notify-{}", uuid::Uuid::new_v4());
+    let key = format!("k-{}", uuid::Uuid::new_v4());
+
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register(&wf, |_ctx: DurableContext, msg: String| async move {
+        Ok::<_, Error>(msg)
+    });
+    engine.launch().await?;
+
+    let client = Client::new(provider.clone());
+    let delay = Duration::from_millis(300);
+    let h1: WorkflowHandle<String> = client
+        .debouncer(&wf)
+        .debounce(&key, delay, "a".to_string())
+        .await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let h2: WorkflowHandle<String> = client
+        .debouncer(&wf)
+        .debounce(&key, delay, "b".to_string())
+        .await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut h3: WorkflowHandle<String> = client
+        .debouncer(&wf)
+        .debounce(&key, delay, "c".to_string())
+        .await?;
+
+    assert_eq!(h1.id(), h2.id());
+    assert_eq!(h2.id(), h3.id());
+    let out = h3.get_result().await?;
+    assert_eq!(out, "c", "the debounced run used the latest input");
+
+    engine.shutdown(Duration::from_secs(2)).await?;
+    Ok(())
+}
+
 /// Client management over Postgres: reschedule a DELAYED workflow so the engine
 /// runs it, and cancel + delete another. Names are uuid-scoped for isolation.
 #[tokio::test]

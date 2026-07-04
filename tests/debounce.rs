@@ -2,7 +2,8 @@
 //! a single delayed run with the latest input.
 
 use durust::{
-    DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowHandle, WorkflowOptions,
+    Client, DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowHandle,
+    WorkflowOptions,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -41,6 +42,50 @@ async fn debounce_coalesces_to_latest_input() -> Result<()> {
     assert_eq!(h2.id(), h3.id());
 
     // That single run executes with the latest input.
+    let out = h3.get_result().await?;
+    assert_eq!(out, "c", "the debounced run used the latest input");
+    assert_eq!(RUNS.load(Ordering::SeqCst), 1, "exactly one run");
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// An out-of-process `Client` debounces the same way an engine does: it only
+/// enqueues the collector and pushes inputs, while a launched engine runs the
+/// coalesced target. Three rapid `Client` calls collapse to one run with the
+/// latest input, all handles pointing at the same run.
+#[tokio::test]
+async fn debounce_from_client_coalesces_to_latest_input() -> Result<()> {
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+    // Engine and client share one provider; the engine runs the collector/target.
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("notify", |_ctx: DurableContext, msg: String| async move {
+        RUNS.fetch_add(1, Ordering::SeqCst);
+        Ok::<_, Error>(msg)
+    });
+    engine.launch().await?;
+
+    let client = Client::new(provider.clone());
+    let delay = Duration::from_millis(250);
+    let h1: WorkflowHandle<String> = client
+        .debouncer("notify")
+        .debounce("k", delay, "a".to_string())
+        .await?;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let h2: WorkflowHandle<String> = client
+        .debouncer("notify")
+        .debounce("k", delay, "b".to_string())
+        .await?;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let mut h3: WorkflowHandle<String> = client
+        .debouncer("notify")
+        .debounce("k", delay, "c".to_string())
+        .await?;
+
+    assert_eq!(h1.id(), h2.id());
+    assert_eq!(h2.id(), h3.id());
+
     let out = h3.get_result().await?;
     assert_eq!(out, "c", "the debounced run used the latest input");
     assert_eq!(RUNS.load(Ordering::SeqCst), 1, "exactly one run");
