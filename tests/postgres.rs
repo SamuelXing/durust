@@ -381,7 +381,7 @@ async fn pg_patch() -> Result<()> {
             serde_json::Value::Null,
             STATUS_PENDING,
             "",
-            "0.1.0",
+            engine.app_version(),
         ))
         .await?;
     provider2

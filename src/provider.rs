@@ -1044,7 +1044,16 @@ pub trait StateProvider: Send + Sync {
     /// existing row is returned unchanged (so a re-submitted id is a no-op, not a
     /// duplicate). This is the single creation path for both direct runs and
     /// enqueues.
-    async fn insert_workflow_status(&self, status: WorkflowStatus) -> Result<WorkflowStatus>;
+    ///
+    /// The returned flag is `true` iff **this call** created the row — the
+    /// atomic arbiter for "who runs it" when several executors race the same
+    /// deterministic id (e.g. a scheduled tick). Executor ids cannot serve as
+    /// that arbiter: they are not unique across processes (`"local"` is the
+    /// default for every process not told otherwise).
+    async fn insert_workflow_status(
+        &self,
+        status: WorkflowStatus,
+    ) -> Result<(WorkflowStatus, bool)>;
 
     /// The id of the workflow currently holding the deduplication slot
     /// `(queue_name, dedup_id)`, if any. Backs

@@ -18,6 +18,9 @@ inventory = "0.3"
 uuid = { version = "1", features = ["v4"] }
 cron = "0.12"
 base64 = "0.21"
+# Default application version: sha-256 of the running executable, so distinct
+# builds get distinct versions and version-gated dispatch/recovery works.
+sha2 = "0.10"
 # gzip framing for the conductor's portable workflow export/import payloads.
 flate2 = "1"
 # Admin HTTP control surface (opt-in via `AdminServer::start`). Default features

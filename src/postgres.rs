@@ -364,9 +364,9 @@ impl StateProvider for PostgresProvider {
         let _ = tokio::time::timeout(within, sub.notify.notified()).await;
     }
 
-    async fn insert_workflow_status(&self, s: WorkflowStatus) -> Result<WorkflowStatus> {
+    async fn insert_workflow_status(&self, s: WorkflowStatus) -> Result<(WorkflowStatus, bool)> {
         // Idempotent create: an existing id is left untouched.
-        sqlx::query(
+        let created = sqlx::query(
             "INSERT INTO workflow_status
                  (workflow_uuid, name, inputs, status, executor_id, application_version,
                   queue_name, queue_partition_key, priority, deduplication_id, parent_workflow_id,
@@ -399,7 +399,10 @@ impl StateProvider for PostgresProvider {
         .bind(s.updated_at.timestamp_millis())
         .execute(&self.pool)
         .await
-        .map_err(|e| dedup_or(e, &s))?;
+        .map_err(|e| dedup_or(e, &s))?
+        // `ON CONFLICT DO NOTHING`: 1 row iff this call created it.
+        .rows_affected()
+            == 1;
 
         let row = sqlx::query(&format!(
             "SELECT {SELECT_COLS} FROM workflow_status WHERE workflow_uuid = $1"
@@ -407,7 +410,7 @@ impl StateProvider for PostgresProvider {
         .bind(&s.id)
         .fetch_one(&self.pool)
         .await?;
-        Ok(row_to_status(&self.serializer, &row))
+        Ok((row_to_status(&self.serializer, &row), created))
     }
 
     async fn get_deduplicated_workflow(
