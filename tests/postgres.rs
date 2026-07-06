@@ -1185,15 +1185,22 @@ async fn pg_client_debounces() -> Result<()> {
     };
     let wf = format!("notify-{}", uuid::Uuid::new_v4());
     let key = format!("k-{}", uuid::Uuid::new_v4());
+    // Pin a unique app version on both the engine and the client. The debouncer
+    // rides the shared internal queue, and dequeue gates on application version
+    // (`= mine OR ''`): a client-enqueued collector stamped '' can be claimed by
+    // ANY concurrently-launched test engine, which has `_dbos_debouncer` but not
+    // this test's uuid-scoped target — the collector errors and the test hangs.
+    // Version-pinning scopes the collector to this test's engine alone.
+    let ver = format!("v-{}", uuid::Uuid::new_v4());
 
     let provider = Arc::new(PostgresProvider::connect(&url).await?);
-    let mut engine = DurableEngine::new(provider.clone()).await?;
+    let mut engine = DurableEngine::new_with_version(provider.clone(), &ver).await?;
     engine.register(&wf, |_ctx: DurableContext, msg: String| async move {
         Ok::<_, Error>(msg)
     });
     engine.launch().await?;
 
-    let client = Client::new(provider.clone());
+    let client = Client::new(provider.clone()).with_app_version(&ver);
     let delay = Duration::from_millis(300);
     let h1: WorkflowHandle<String> = client
         .debouncer(&wf)
