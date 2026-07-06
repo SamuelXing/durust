@@ -550,10 +550,28 @@ impl StateProvider for SqliteProvider {
             return Ok(Vec::new());
         }
 
+        // A row's version must match this executor's exactly; unversioned rows
+        // ('' or NULL, e.g. client-enqueued) are claimable only by the fleet
+        // running the LATEST registered application version — otherwise a
+        // stale-version executor could claim work whose handlers it no longer
+        // has. No registered versions ⇒ treat this executor as latest.
+        let is_latest = sqlx::query_scalar::<_, String>(
+            "SELECT version_name FROM application_versions
+             ORDER BY version_timestamp DESC LIMIT 1",
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_none_or(|latest| latest == req.app_version);
+        let version_clause = if is_latest {
+            "(application_version = ? OR application_version = '' \
+              OR application_version IS NULL)"
+        } else {
+            "application_version = ?"
+        };
         let sql = format!(
             "SELECT workflow_uuid FROM workflow_status
              WHERE queue_name = ? AND status = ?
-               AND (application_version = ? OR application_version = ''){part_clause}
+               AND {version_clause}{part_clause}
              ORDER BY priority ASC, created_at ASC
              LIMIT ?"
         );

@@ -1130,6 +1130,16 @@ async fn pg_application_versions() -> Result<()> {
         !a.set_latest_application_version(&format!("nope-{}", uuid::Uuid::new_v4()))
             .await?
     );
+
+    // Restore this binary's real version as latest: unversioned-row dequeue
+    // gating is latest-only, so leaving a uuid version promoted would starve
+    // every other test's client-enqueued ('') claims on the shared database.
+    let real = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert!(
+        real.set_latest_application_version(real.app_version())
+            .await?
+    );
     Ok(())
 }
 
@@ -1223,6 +1233,101 @@ async fn pg_client_debounces() -> Result<()> {
     assert_eq!(out, "c", "the debounced run used the latest input");
 
     engine.shutdown(Duration::from_secs(2)).await?;
+
+    // The pinned engine registered `ver` at launch, making it the latest
+    // application version. Unversioned-row dequeue gating is latest-only, so
+    // restore this binary's real version as latest or other tests' ('')
+    // client-enqueued claims on the shared database would starve.
+    let real = DurableEngine::new(provider.clone()).await?;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert!(
+        real.set_latest_application_version(real.app_version())
+            .await?
+    );
+    Ok(())
+}
+
+/// Dequeue version gating over live Postgres: an executor claims only rows of
+/// its exact version; unversioned ('') rows are claimable only by the executor
+/// running the latest registered application version. Uses a uuid-scoped queue
+/// and the database's ambient latest (this binary's version) — no global state
+/// is mutated.
+#[tokio::test]
+async fn pg_dequeue_gates_by_version() -> Result<()> {
+    use durust::DequeueRequest;
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_dequeue_gates_by_version: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let queue = format!("q-{tag}");
+    let (v_foo, v_bar) = (format!("vf-{tag}"), format!("vb-{tag}"));
+
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    provider.init().await?;
+    // This binary's version is (or is about to be) the latest — the same engine
+    // registration every other test performs.
+    let engine = DurableEngine::new(provider.clone()).await?;
+    engine.launch().await?;
+    engine
+        .set_latest_application_version(engine.app_version())
+        .await?;
+
+    let mk = |id: String, ver: &str| {
+        let mut s = WorkflowStatus::new(
+            id,
+            "wf",
+            serde_json::Value::Null,
+            durust::STATUS_ENQUEUED,
+            "",
+            ver,
+        );
+        s.queue_name = Some(queue.clone());
+        s
+    };
+    let req = |ver: &str| DequeueRequest {
+        queue_name: queue.clone(),
+        executor_id: "exec".into(),
+        app_version: ver.into(),
+        partition_key: None,
+        max_tasks: 10,
+        global_concurrency: None,
+        rate_limit_max: None,
+        rate_limit_period_ms: None,
+    };
+    let id_foo = format!("wf-foo-{tag}");
+    let id_bare = format!("wf-bare-{tag}");
+    provider
+        .insert_workflow_status(mk(id_foo.clone(), &v_foo))
+        .await?;
+    provider
+        .insert_workflow_status(mk(id_bare.clone(), ""))
+        .await?;
+
+    // A non-latest, non-matching executor claims nothing.
+    assert!(
+        provider.dequeue_workflows(&req(&v_bar)).await?.is_empty(),
+        "wrong version + not latest claims neither row"
+    );
+    // Exact version match claims its own row only (v_foo is not latest).
+    let got: Vec<String> = provider
+        .dequeue_workflows(&req(&v_foo))
+        .await?
+        .into_iter()
+        .map(|w| w.id)
+        .collect();
+    assert_eq!(got, vec![id_foo.clone()]);
+    // The latest-version executor claims the unversioned row.
+    let got: Vec<String> = provider
+        .dequeue_workflows(&req(engine.app_version()))
+        .await?
+        .into_iter()
+        .map(|w| w.id)
+        .collect();
+    assert_eq!(got, vec![id_bare.clone()]);
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    engine.delete_workflows(&[id_foo, id_bare], false).await?;
     Ok(())
 }
 

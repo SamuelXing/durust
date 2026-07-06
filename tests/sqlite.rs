@@ -2562,3 +2562,152 @@ async fn sqlite_recovery_replays_checkpointed_step_without_rerunning() -> Result
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// Dequeue version gating: a claimed row's version must match the executor's
+/// exactly, and an unversioned ('') row is claimable only by the executor
+/// running the LATEST registered application version (no registered versions =
+/// this executor counts as latest).
+#[tokio::test]
+async fn sqlite_dequeue_gates_by_version_and_latest() -> Result<()> {
+    use durust::{DequeueRequest, StateProvider, WorkflowStatus};
+    let (url, path) = temp_db_url("vgate");
+    let provider = SqliteProvider::connect(&url).await?;
+    provider.init().await?;
+
+    let mk = |id: &str, ver: &str| {
+        let mut s = WorkflowStatus::new(
+            id,
+            "wf",
+            serde_json::Value::Null,
+            durust::STATUS_ENQUEUED,
+            "",
+            ver,
+        );
+        s.queue_name = Some("q".into());
+        s
+    };
+    let req = |ver: &str| DequeueRequest {
+        queue_name: "q".into(),
+        executor_id: "exec".into(),
+        app_version: ver.into(),
+        partition_key: None,
+        max_tasks: 10,
+        global_concurrency: None,
+        rate_limit_max: None,
+        rate_limit_period_ms: None,
+    };
+    let claim_ids = |claimed: Vec<WorkflowStatus>| {
+        let mut ids: Vec<String> = claimed.into_iter().map(|w| w.id).collect();
+        ids.sort();
+        ids
+    };
+
+    // No versions registered: the executor counts as latest — it claims its own
+    // version's row and the unversioned one, but never another version's.
+    provider.insert_workflow_status(mk("r-own", "v1")).await?;
+    provider.insert_workflow_status(mk("r-bare", "")).await?;
+    provider.insert_workflow_status(mk("r-other", "v9")).await?;
+    assert_eq!(
+        claim_ids(provider.dequeue_workflows(&req("v1")).await?),
+        vec!["r-bare".to_string(), "r-own".to_string()],
+        "with no registered versions the executor is latest"
+    );
+
+    // Register v1 then v2 (later ⇒ latest). A v1 executor is no longer latest:
+    // strict matches only. A v2 executor claims unversioned rows too.
+    provider.create_application_version("v1").await?;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    provider.create_application_version("v2").await?;
+    provider.insert_workflow_status(mk("r-own2", "v1")).await?;
+    provider.insert_workflow_status(mk("r-bare2", "")).await?;
+    assert_eq!(
+        claim_ids(provider.dequeue_workflows(&req("v1")).await?),
+        vec!["r-own2".to_string()],
+        "a non-latest executor claims only exact version matches"
+    );
+    assert_eq!(
+        claim_ids(provider.dequeue_workflows(&req("v2")).await?),
+        vec!["r-bare2".to_string()],
+        "the latest executor also claims unversioned rows"
+    );
+
+    // The mismatched-version row was never claimable by anyone here.
+    let other = provider.get_workflow_status("r-other").await?.expect("row");
+    assert_eq!(other.status, durust::STATUS_ENQUEUED);
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// An engine that claims a queued workflow it has no handler for RELEASES the
+/// claim (row back to ENQUEUED) instead of stranding it PENDING under an
+/// executor that can never run it — so an executor that has the handler can
+/// pick it up.
+#[tokio::test]
+async fn sqlite_unhandled_claim_is_released_not_stranded() -> Result<()> {
+    use durust::{StateProvider, WorkflowStatus};
+    let (url, path) = temp_db_url("release");
+    let provider = Arc::new(SqliteProvider::connect(&url).await?);
+
+    // Engine X dispatches the queue but does NOT register "ghost".
+    let mut x = DurableEngine::new(provider.clone()).await?;
+    x.register_queue(WorkflowQueue::new("q").base_polling_interval(Duration::from_millis(10)));
+    x.launch().await?;
+
+    // Enqueue "ghost" by hand (an engine refuses to enqueue what it doesn't
+    // know), stamped with X's version so X will claim it.
+    let mut s = WorkflowStatus::new(
+        "wf-ghost",
+        "ghost",
+        serde_json::Value::Null,
+        durust::STATUS_ENQUEUED,
+        "",
+        x.app_version(),
+    );
+    s.queue_name = Some("q".into());
+    provider.insert_workflow_status(s).await?;
+
+    // Let X claim (and release) it. With the stranding bug, X's first claim
+    // pins the row PENDING forever; with the release it returns to ENQUEUED
+    // within a poll cycle. Poll while X keeps running — do NOT shut X down
+    // first: `shutdown` aborts dispatchers and can legitimately cut a claim
+    // mid-flight (documented; recovery handles it), which would race this
+    // assertion.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let row = provider
+            .get_workflow_status("wf-ghost")
+            .await?
+            .expect("row");
+        if row.status == durust::STATUS_ENQUEUED {
+            break; // released (or between claims) — never observed once stranded
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "row stayed {} — an unhandled claim was stranded, not released",
+            row.status
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // An engine that has the handler completes it — impossible if X had
+    // stranded the claim (the row would never be claimable again).
+    let mut y = DurableEngine::new(provider.clone()).await?;
+    y.register(
+        "ghost",
+        |_ctx: DurableContext, _: serde_json::Value| async { Ok::<_, Error>(7_i64) },
+    );
+    y.register_queue(WorkflowQueue::new("q").base_polling_interval(Duration::from_millis(10)));
+    y.launch().await?;
+    let mut h = y.retrieve_workflow::<i64>("wf-ghost").await?;
+    let out = tokio::time::timeout(Duration::from_secs(20), h.get_result())
+        .await
+        .expect("the released workflow must be claimable by an engine with the handler")?;
+    assert_eq!(out, 7);
+
+    x.shutdown(Duration::from_secs(1)).await?;
+    y.shutdown(Duration::from_secs(1)).await?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}

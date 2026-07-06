@@ -1589,11 +1589,19 @@ async fn queue_dispatch_loop(
                 Ok(claimed) => {
                     for wf in claimed {
                         let Some(handler) = rt.workflows.get(&wf.name).cloned() else {
+                            // Release the claim instead of stranding the row
+                            // PENDING under an executor that can never run it,
+                            // so an executor that does have the handler can
+                            // claim it on its next poll. (Go logs and abandons
+                            // the row here — a deliberate improvement.)
                             tracing::error!(
                                 workflow = %wf.name,
                                 id = %wf.id,
-                                "dequeued workflow has no registered handler"
+                                "dequeued workflow has no registered handler; releasing the claim"
                             );
+                            let _ = provider
+                                .set_workflow_status(&wf.id, STATUS_ENQUEUED, None, None)
+                                .await;
                             continue;
                         };
                         inflight.fetch_add(1, Ordering::Relaxed);

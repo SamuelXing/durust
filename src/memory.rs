@@ -254,6 +254,17 @@ impl StateProvider for InMemoryProvider {
             return Ok(Vec::new());
         }
 
+        // A row's version must match this executor's exactly; unversioned rows
+        // ('', e.g. client-enqueued) are claimable only by the fleet running the
+        // LATEST registered application version — otherwise a stale-version
+        // executor could claim work whose handlers it no longer has. No
+        // registered versions ⇒ treat this executor as latest.
+        let is_latest = g
+            .versions
+            .values()
+            .max_by_key(|v| v.version_timestamp)
+            .is_none_or(|latest| latest.version_name == req.app_version);
+
         // Candidates ordered by (priority, created_at), version-gated.
         let mut ids: Vec<(i32, i64, String)> = g
             .workflows
@@ -262,7 +273,7 @@ impl StateProvider for InMemoryProvider {
                 w.queue_name.as_deref() == Some(req.queue_name.as_str())
                     && in_partition(w)
                     && w.status == STATUS_ENQUEUED
-                    && (w.app_version.is_empty() || w.app_version == req.app_version)
+                    && (w.app_version == req.app_version || (w.app_version.is_empty() && is_latest))
             })
             .map(|w| (w.priority, w.created_at.timestamp_millis(), w.id.clone()))
             .collect();
