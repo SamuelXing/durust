@@ -434,6 +434,14 @@ pub struct WorkflowStatus {
     pub assumed_role: Option<String>,
     /// Full set of roles available to the authenticated user.
     pub authenticated_roles: Vec<String>,
+    /// Class / namespace name (e.g. a Python class whose method is the workflow).
+    /// Passive metadata in Rust — persisted and round-tripped for cross-SDK
+    /// compatibility, not itself used to route dispatch.
+    pub class_name: Option<String>,
+    /// Config / instance name: selects among multiple handlers registered under
+    /// the *same* workflow name (one per configured instance), and is durably
+    /// recorded so recovery re-dispatches to the same instance.
+    pub config_name: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -477,6 +485,8 @@ impl WorkflowStatus {
             authenticated_user: None,
             assumed_role: None,
             authenticated_roles: Vec::new(),
+            class_name: None,
+            config_name: None,
             created_at: now,
             updated_at: now,
         }

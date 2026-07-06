@@ -1344,6 +1344,67 @@ async fn pg_dequeue_gates_by_version() -> Result<()> {
     Ok(())
 }
 
+/// Config-name routing over live Postgres: a dispatcher reads the persisted
+/// `config_name` from the claimed row and routes to the matching instance;
+/// `class_name`/`config_name` round-trip on the row.
+#[tokio::test]
+async fn pg_config_name_routes_on_queue_dispatch() -> Result<()> {
+    use durust::WorkflowQueue;
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_config_name_routes_on_queue_dispatch: DATABASE_URL unset");
+        return Ok(());
+    };
+    let wf = format!("greet-{}", uuid::Uuid::new_v4());
+    let queue = format!("q-{}", uuid::Uuid::new_v4());
+    let id_fr = format!("wf-fr-{}", uuid::Uuid::new_v4());
+    let id_en = format!("wf-en-{}", uuid::Uuid::new_v4());
+
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register_configured(&wf, "en", |_ctx: DurableContext, who: String| async move {
+        Ok::<_, Error>(format!("Hello, {who}"))
+    });
+    engine.register_configured(&wf, "fr", |_ctx: DurableContext, who: String| async move {
+        Ok::<_, Error>(format!("Bonjour, {who}"))
+    });
+    engine.register_queue(
+        WorkflowQueue::new(&queue).base_polling_interval(Duration::from_millis(10)),
+    );
+    engine.launch().await?;
+
+    let mut fr = engine
+        .enqueue::<_, String>(
+            &queue,
+            &wf,
+            "Sam".to_string(),
+            WorkflowOptions::with_id(&id_fr)
+                .config_name("fr")
+                .class_name("Greeter"),
+        )
+        .await?;
+    let mut en = engine
+        .enqueue::<_, String>(
+            &queue,
+            &wf,
+            "Sam".to_string(),
+            WorkflowOptions::with_id(&id_en).config_name("en"),
+        )
+        .await?;
+    assert_eq!(fr.get_result().await?, "Bonjour, Sam");
+    assert_eq!(en.get_result().await?, "Hello, Sam");
+
+    let status = engine
+        .retrieve_workflow::<String>(&id_fr)
+        .await?
+        .get_status()
+        .await?;
+    assert_eq!(status.config_name.as_deref(), Some("fr"));
+    assert_eq!(status.class_name.as_deref(), Some("Greeter"));
+
+    engine.shutdown(Duration::from_secs(2)).await?;
+    Ok(())
+}
+
 /// Client management over Postgres: reschedule a DELAYED workflow so the engine
 /// runs it, and cancel + delete another. Names are uuid-scoped for isolation.
 #[tokio::test]

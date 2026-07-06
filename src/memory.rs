@@ -1378,8 +1378,8 @@ fn status_to_map(w: &WorkflowStatus) -> Map<String, Value> {
     m.insert("updated_at".into(), json!(w.updated_at.timestamp_millis()));
     m.insert("application_version".into(), json!(w.app_version));
     m.insert("application_id".into(), Value::Null);
-    m.insert("class_name".into(), Value::Null);
-    m.insert("config_name".into(), Value::Null);
+    m.insert("class_name".into(), json!(w.class_name));
+    m.insert("config_name".into(), json!(w.config_name));
     m.insert("recovery_attempts".into(), json!(w.recovery_attempts));
     m.insert("queue_name".into(), json!(w.queue_name));
     m.insert("workflow_timeout_ms".into(), json!(w.timeout_ms));
@@ -1432,6 +1432,8 @@ fn map_to_status(s: &Map<String, Value>) -> WorkflowStatus {
         authenticated_user: col_str(s, "authenticated_user"),
         assumed_role: col_str(s, "assumed_role"),
         authenticated_roles: decode_roles(col_str(s, "authenticated_roles").as_deref()),
+        class_name: col_str(s, "class_name"),
+        config_name: col_str(s, "config_name"),
         created_at: ms_to_dt(col_i64(s, "created_at")),
         updated_at: ms_to_dt(col_i64(s, "updated_at")),
     }
