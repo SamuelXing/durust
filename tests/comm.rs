@@ -99,7 +99,7 @@ async fn recv_replay_does_not_double_consume() -> Result<()> {
             Value::Null,
             STATUS_PENDING,
             "",
-            "0.1.0",
+            engine.app_version(),
         ))
         .await?;
     engine.send("wf-replay", "m1".to_string(), "t").await?;
@@ -238,7 +238,7 @@ async fn send_with_idempotency_key_delivers_at_most_once() -> Result<()> {
             Value::Null,
             STATUS_PENDING,
             "",
-            "0.1.0",
+            engine.app_version(),
         ))
         .await?;
 

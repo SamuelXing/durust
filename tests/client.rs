@@ -428,7 +428,7 @@ async fn client_resumes_a_cancelled_workflow() -> Result<()> {
             serde_json::Value::Null,
             STATUS_PENDING,
             "",
-            "0.1.0",
+            engine.app_version(),
         ))
         .await?;
     provider

@@ -102,6 +102,91 @@ pub struct RegisteredWorkflow {
     pub cron_schedule: Option<String>,
 }
 
+/// Engine-level identity settings, resolved at construction.
+///
+/// Each field follows the same precedence, matching the platform convention
+/// shared by every DBOS SDK:
+///
+/// 1. the environment variable, when set and non-empty
+///    (`DBOS__APPVERSION` / `DBOS__VMID` — set by the hosting platform);
+/// 2. the explicit value configured here;
+/// 3. the default — a sha-256 of the running executable for the application
+///    version (distinct builds get distinct versions, so version-gated queue
+///    dispatch and recovery never mix incompatible code), and `"local"` for
+///    the executor id (stable across restarts of a local process, so its
+///    crashed runs are attributable to it).
+#[derive(Clone, Debug, Default)]
+pub struct EngineConfig {
+    /// Application version stamped on runs and used to gate dequeue/recovery.
+    pub app_version: Option<String>,
+    /// This process's executor id, recorded as the owner of claimed runs.
+    pub executor_id: Option<String>,
+}
+
+impl EngineConfig {
+    /// Set the application version (still overridden by `DBOS__APPVERSION`).
+    pub fn app_version(mut self, version: impl Into<String>) -> Self {
+        self.app_version = Some(version.into());
+        self
+    }
+
+    /// Set the executor id (still overridden by `DBOS__VMID`).
+    pub fn executor_id(mut self, id: impl Into<String>) -> Self {
+        self.executor_id = Some(id.into());
+        self
+    }
+
+    pub(crate) fn resolve_app_version(&self) -> String {
+        if let Ok(v) = std::env::var("DBOS__APPVERSION") {
+            if !v.is_empty() {
+                return v;
+            }
+        }
+        if let Some(v) = &self.app_version {
+            return v.clone();
+        }
+        binary_version().to_string()
+    }
+
+    pub(crate) fn resolve_executor_id(&self) -> String {
+        if let Ok(v) = std::env::var("DBOS__VMID") {
+            if !v.is_empty() {
+                return v;
+            }
+        }
+        if let Some(v) = &self.executor_id {
+            return v.clone();
+        }
+        "local".to_string()
+    }
+}
+
+/// The default application version: a hex sha-256 of the running executable,
+/// computed once per process. Distinct builds hash differently, so two
+/// deployments sharing a system database never claim each other's queued or
+/// recovering work. Falls back to `""` (matches-any in dequeue gating) if the
+/// executable cannot be read, with a warning.
+fn binary_version() -> &'static str {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        let hash = || -> std::io::Result<String> {
+            use sha2::{Digest, Sha256};
+            let exe = std::env::current_exe()?.canonicalize()?;
+            let mut file = std::fs::File::open(exe)?;
+            let mut hasher = Sha256::new();
+            std::io::copy(&mut file, &mut hasher)?;
+            Ok(format!("{:x}", hasher.finalize()))
+        };
+        match hash() {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to hash the executable for the default application version");
+                String::new()
+            }
+        }
+    })
+}
+
 /// Per-workflow start options.
 ///
 /// `timeout` fixes a deadline when the workflow starts (at claim time for
@@ -255,16 +340,39 @@ impl DurableEngine {
     ///
     /// Every workflow annotated with `#[durust::workflow]` anywhere in the binary
     /// is auto-registered here (via `inventory`).
+    ///
+    /// The application version and executor id resolve as
+    /// [`EngineConfig`] documents: `DBOS__APPVERSION` / `DBOS__VMID` environment
+    /// overrides, then a sha-256 of the running executable / `"local"`.
     pub async fn new(provider: Arc<dyn StateProvider>) -> Result<Self> {
-        Self::new_with_version(provider, "0.1.0").await
+        Self::with_config(provider, EngineConfig::default()).await
     }
 
     /// Like [`new`](Self::new) but pins the application version used to stamp and
     /// version-gate workflows (recovery only re-runs rows of a matching version).
+    /// A non-empty `DBOS__APPVERSION` environment variable still wins.
     pub async fn new_with_version(
         provider: Arc<dyn StateProvider>,
         app_version: impl Into<String>,
     ) -> Result<Self> {
+        Self::with_config(
+            provider,
+            EngineConfig {
+                app_version: Some(app_version.into()),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Build an engine with explicit [`EngineConfig`] settings; anything left
+    /// `None` resolves from the environment, then to the documented default.
+    pub async fn with_config(
+        provider: Arc<dyn StateProvider>,
+        config: EngineConfig,
+    ) -> Result<Self> {
+        let app_version = config.resolve_app_version();
+        let executor_id = config.resolve_executor_id();
         provider.init().await?;
         let mut workflows = HashMap::new();
         let mut scheduled = Vec::new();
@@ -288,8 +396,8 @@ impl DurableEngine {
             queues,
             listen_filter: None,
             scheduled,
-            executor_id: uuid::Uuid::new_v4().to_string(),
-            app_version: app_version.into(),
+            executor_id,
+            app_version,
             max_recovery_attempts: 100,
             shutting_down: Arc::new(AtomicBool::new(false)),
             deactivated: Arc::new(AtomicBool::new(false)),
@@ -800,7 +908,7 @@ impl DurableEngine {
         // On a dedup collision under `ReturnExisting`, hand back the workflow
         // already holding the slot; retry if it was freed between insert and
         // lookup (the slot's owner just completed).
-        let (canonical, queued) = loop {
+        let (canonical, queued, _created) = loop {
             match rt
                 .insert_run(&id, name, input_json.clone(), &opts, None, &auth)
                 .await
@@ -1312,9 +1420,10 @@ impl Runtime {
     }
 
     /// Build a new run's status row from `opts` and persist it idempotently,
-    /// returning the canonical row and whether it was routed to a queue. Shared
-    /// by top-level runs and child workflows; `parent_id`/`auth` are stamped on
-    /// the row.
+    /// returning the canonical row, whether it was routed to a queue, and whether
+    /// **this call** created the row (the arbiter when executors race a
+    /// deterministic id). Shared by top-level runs and child workflows;
+    /// `parent_id`/`auth` are stamped on the row.
     async fn insert_run(
         &self,
         id: &str,
@@ -1323,7 +1432,7 @@ impl Runtime {
         opts: &WorkflowOptions,
         parent_id: Option<&str>,
         auth: &AuthContext,
-    ) -> Result<(WorkflowStatus, bool)> {
+    ) -> Result<(WorkflowStatus, bool, bool)> {
         let queued = opts.queue.is_some();
         if let Some(q) = &opts.queue {
             if !self.queues.contains_key(q) {
@@ -1373,8 +1482,8 @@ impl Runtime {
             row.deadline_ms = row.timeout_ms.map(|t| created_ms + t);
         }
 
-        let canonical = self.provider.insert_workflow_status(row).await?;
-        Ok((canonical, queued))
+        let (canonical, created) = self.provider.insert_workflow_status(row).await?;
+        Ok((canonical, queued, created))
     }
 
     /// Spawn a run on a task this caller owns (for a local [`WorkflowHandle`]).
@@ -1414,13 +1523,14 @@ impl Runtime {
 
     /// Persist one scheduled tick at `instant` under the deterministic
     /// `sched-{name}-{time}` id (idempotent, so the tick is created at most once
-    /// across executors). Returns the canonical row, whether it is queued, and
-    /// the id. Pairs with [`launch_scheduled_tick`](Self::launch_scheduled_tick).
+    /// across executors). Returns the canonical row, whether it is queued,
+    /// whether this call created it, and the id. Pairs with
+    /// [`launch_scheduled_tick`](Self::launch_scheduled_tick).
     async fn persist_scheduled_tick(
         &self,
         schedule: &WorkflowSchedule,
         instant: DateTime<Utc>,
-    ) -> Result<(WorkflowStatus, bool, String)> {
+    ) -> Result<(WorkflowStatus, bool, bool, String)> {
         let wf_id = format!("sched-{}-{}", schedule.schedule_name, instant.to_rfc3339());
         let opts = WorkflowOptions {
             workflow_id: Some(wf_id.clone()),
@@ -1429,23 +1539,27 @@ impl Runtime {
         };
         let auth = AuthContext::default();
         let input = serde_json::to_value(schedule.tick_input(instant))?;
-        let (canonical, queued) = self
+        let (canonical, queued, created) = self
             .insert_run(&wf_id, &schedule.workflow_name, input, &opts, None, &auth)
             .await?;
-        Ok((canonical, queued, wf_id))
+        Ok((canonical, queued, created, wf_id))
     }
 
-    /// Run a freshly-persisted tick now if it is a direct (unqueued) run this
-    /// executor owns and has not finished. A queued tick is left for a dispatcher
-    /// to claim.
+    /// Run a freshly-persisted tick now if this executor's insert created it
+    /// (won the cross-executor race) and it is a direct (unqueued) run that has
+    /// not finished. A queued tick is left for a dispatcher to claim. The
+    /// arbiter is the idempotent insert itself, NOT executor-id equality —
+    /// executor ids are not unique across processes (every local process
+    /// defaults to `"local"`), so id equality would double-fire the tick.
     fn launch_scheduled_tick(
         self: &Arc<Self>,
         schedule: &WorkflowSchedule,
         canonical: WorkflowStatus,
         queued: bool,
+        created: bool,
         id: &str,
     ) {
-        if queued || canonical.executor_id != self.executor_id || is_terminal(&canonical.status) {
+        if queued || !created || is_terminal(&canonical.status) {
             return;
         }
         if let Some(handler) = self.workflows.get(&schedule.workflow_name).cloned() {
@@ -1476,7 +1590,7 @@ impl Runtime {
             .get(name)
             .cloned()
             .ok_or_else(|| Error::UnknownWorkflow(name.to_string()))?;
-        let (canonical, queued) = self
+        let (canonical, queued, _created) = self
             .insert_run(child_id, name, input_json, &opts, Some(parent_id), &auth)
             .await?;
         if !queued && !is_terminal(&canonical.status) {
@@ -1785,8 +1899,8 @@ async fn backfill_ticks(
     let cron = parse_cron(&schedule.schedule)?;
     let mut ids = Vec::new();
     for instant in cron_ticks_between(&cron, schedule.cron_timezone.as_deref(), start, end) {
-        let (canonical, queued, id) = rt.persist_scheduled_tick(schedule, instant).await?;
-        rt.launch_scheduled_tick(schedule, canonical, queued, &id);
+        let (canonical, queued, created, id) = rt.persist_scheduled_tick(schedule, instant).await?;
+        rt.launch_scheduled_tick(schedule, canonical, queued, created, &id);
         ids.push(id);
     }
     Ok(ids)
@@ -1928,7 +2042,7 @@ async fn schedule_fire_loop(
         }
 
         match rt.persist_scheduled_tick(&schedule, next).await {
-            Ok((canonical, queued, id)) => {
+            Ok((canonical, queued, created, id)) => {
                 // Test hook: simulate an abrupt failure of the scheduling
                 // process right after the tick is persisted but before it runs
                 // (and before `last_fired_at` is stamped). Recovery must then
@@ -1936,7 +2050,7 @@ async fn schedule_fire_loop(
                 // armed via the `fail` registry. See `tests/schedule_failpoint.rs`.
                 fail::fail_point!("schedule_tick_after_persist", |_| {});
 
-                rt.launch_scheduled_tick(&schedule, canonical, queued, &id);
+                rt.launch_scheduled_tick(&schedule, canonical, queued, created, &id);
             }
             Err(e) => {
                 tracing::warn!(
@@ -1983,5 +2097,74 @@ async fn sleep_until_or_stop(
             return true;
         }
         tokio::time::sleep((deadline - now).min(Duration::from_millis(100))).await;
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    /// Env-mutating tests share the process environment; serialize them.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard restoring an env var on drop, so a panicking assert can't
+    /// leak state into the other tests.
+    struct EnvVar(&'static str, Option<String>);
+    impl EnvVar {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prior = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            EnvVar(key, prior)
+        }
+    }
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
+    #[test]
+    fn defaults_are_binary_hash_and_local() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let cfg = EngineConfig::default();
+        let ver = cfg.resolve_app_version();
+        assert_eq!(ver.len(), 64, "sha-256 hex of the executable: {ver}");
+        assert!(ver.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(cfg.resolve_executor_id(), "local");
+    }
+
+    #[test]
+    fn explicit_config_wins_over_defaults() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let cfg = EngineConfig::default()
+            .app_version("9.9.9")
+            .executor_id("exec-7");
+        assert_eq!(cfg.resolve_app_version(), "9.9.9");
+        assert_eq!(cfg.resolve_executor_id(), "exec-7");
+    }
+
+    #[test]
+    fn env_overrides_explicit_config() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _v = EnvVar::set("DBOS__APPVERSION", "env-ver");
+        let _e = EnvVar::set("DBOS__VMID", "env-vm");
+        let cfg = EngineConfig::default()
+            .app_version("9.9.9")
+            .executor_id("exec-7");
+        assert_eq!(cfg.resolve_app_version(), "env-ver");
+        assert_eq!(cfg.resolve_executor_id(), "env-vm");
+    }
+
+    #[test]
+    fn empty_env_is_ignored() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _v = EnvVar::set("DBOS__APPVERSION", "");
+        let _e = EnvVar::set("DBOS__VMID", "");
+        let cfg = EngineConfig::default().app_version("9.9.9");
+        assert_eq!(cfg.resolve_app_version(), "9.9.9");
+        assert_eq!(cfg.resolve_executor_id(), "local");
     }
 }

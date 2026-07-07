@@ -748,7 +748,7 @@ async fn sqlite_management() -> Result<()> {
             serde_json::Value::Null,
             STATUS_PENDING,
             "",
-            "0.1.0",
+            engine.app_version(),
         ))
         .await?;
     engine.cancel_workflow("wf-3").await?;
@@ -784,8 +784,9 @@ async fn sqlite_bulk_ops() -> Result<()> {
     engine.launch().await?;
     let provider = SqliteProvider::connect(&url).await?;
 
-    let seed = |id: &str, status: &str, parent: Option<&str>| {
-        let mut s = WorkflowStatus::new(id, "noop", serde_json::Value::Null, status, "", "0.1.0");
+    let ver = engine.app_version().to_string();
+    let seed = move |id: &str, status: &str, parent: Option<&str>| {
+        let mut s = WorkflowStatus::new(id, "noop", serde_json::Value::Null, status, "", &ver);
         s.parent_workflow_id = parent.map(|p| p.to_string());
         s
     };

@@ -77,7 +77,10 @@ impl StateProvider for InMemoryProvider {
         Ok(())
     }
 
-    async fn insert_workflow_status(&self, status: WorkflowStatus) -> Result<WorkflowStatus> {
+    async fn insert_workflow_status(
+        &self,
+        status: WorkflowStatus,
+    ) -> Result<(WorkflowStatus, bool)> {
         let mut g = self.inner.lock().await;
         // Queue-scoped deduplication (the SQL backends enforce this with a
         // unique index on (queue_name, deduplication_id)).
@@ -91,12 +94,10 @@ impl StateProvider for InMemoryProvider {
                 return Err(Error::queue_deduplicated(queue, dedup));
             }
         }
-        let row = g
-            .workflows
-            .entry(status.id.clone())
-            .or_insert(status)
-            .clone();
-        Ok(row)
+        let entry = g.workflows.entry(status.id.clone());
+        let created = matches!(entry, std::collections::hash_map::Entry::Vacant(_));
+        let row = entry.or_insert(status).clone();
+        Ok((row, created))
     }
 
     async fn get_deduplicated_workflow(

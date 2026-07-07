@@ -112,7 +112,7 @@ async fn cancel_then_resume() -> Result<()> {
             serde_json::Value::Null,
             STATUS_PENDING,
             "",
-            "0.1.0",
+            engine.app_version(),
         ))
         .await?;
     provider
@@ -351,7 +351,7 @@ async fn recover_caps_attempts() -> Result<()> {
             serde_json::Value::Null,
             STATUS_PENDING,
             "",
-            "0.1.0",
+            engine.app_version(),
         ))
         .await?;
 
@@ -419,7 +419,7 @@ async fn bulk_cancel_and_resume() -> Result<()> {
                 serde_json::Value::Null,
                 STATUS_PENDING,
                 "",
-                "0.1.0",
+                engine.app_version(),
             ))
             .await?;
     }
@@ -468,7 +468,7 @@ async fn bulk_delete_with_children() -> Result<()> {
             serde_json::Value::Null,
             STATUS_SUCCESS,
             "",
-            "0.1.0",
+            engine.app_version(),
         );
         s.parent_workflow_id = parent.map(|p| p.to_string());
         s
