@@ -101,10 +101,27 @@ impl Drop for Subscription {
     }
 }
 
+/// The schema every DBOS SDK keeps its system tables in by default. Sharing it
+/// means a Rust engine pointed at a Go/Python system database reads the same
+/// tables they write.
+const DEFAULT_SCHEMA: &str = "dbos";
+
+/// A schema name safe to interpolate into `CREATE SCHEMA` and `search_path`
+/// without quoting games: `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_plain_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Postgres-backed [`StateProvider`], built on sqlx and the canonical DBOS
 /// schema (`workflow_status` / `operation_outputs`).
 pub struct PostgresProvider {
     pool: PgPool,
+    /// System-tables schema this provider owns; created (if missing) and
+    /// migrated on `init`. Empty for [`from_pool`](Self::from_pool), where the
+    /// caller's pool controls the search path.
+    schema: String,
     /// Format used when *encoding* stored values. Decoding always follows each
     /// row's recorded format, so this only sets what new rows are written as.
     serializer: Serializer,
@@ -121,25 +138,67 @@ pub struct PostgresProvider {
 impl PostgresProvider {
     /// Connect to Postgres using a standard connection URL, e.g.
     /// `postgres://user:pass@localhost:5432/durust`.
+    ///
+    /// System tables live in the `dbos` schema — the same one every DBOS SDK
+    /// defaults to, so a database shared with Go/Python workers just works. Use
+    /// [`connect_with_schema`](Self::connect_with_schema) to isolate a tenant
+    /// under a different schema.
     pub async fn connect(database_url: &str) -> Result<Self> {
+        Self::connect_with_schema(database_url, DEFAULT_SCHEMA).await
+    }
+
+    /// Like [`connect`](Self::connect) but with an explicit system-tables
+    /// `schema` — e.g. one schema per tenant sharing a database. The schema is
+    /// created if missing and migrated independently on `init` (each schema has
+    /// its own migration history). The name must be a plain identifier
+    /// (`[A-Za-z_][A-Za-z0-9_]*`).
+    ///
+    /// Implementation: every pooled connection starts with `search_path` set to
+    /// the schema, so all queries — including a transactional step's user SQL —
+    /// resolve inside it. One caveat: `LISTEN`/`NOTIFY` channel names are shared
+    /// database-wide, so tenants in one database may wake each other spuriously;
+    /// wakeups are only hints (the state is always re-read), so this affects
+    /// latency noise, not correctness.
+    pub async fn connect_with_schema(database_url: &str, schema: &str) -> Result<Self> {
+        if !is_plain_identifier(schema) {
+            return Err(Error::app(format!(
+                "invalid schema name {schema:?}: use letters, digits, and underscores, \
+                 not starting with a digit"
+            )));
+        }
+        use std::str::FromStr as _;
+        let opts = sqlx::postgres::PgConnectOptions::from_str(database_url)?
+            .options([("search_path", schema)]);
         // One of these is held by the LISTEN/NOTIFY listener for its lifetime
         // (see `notify_hub`), leaving the rest for workflow/app queries.
         let pool = PgPoolOptions::new()
             .max_connections(8)
-            .connect(database_url)
+            .connect_with(opts)
             .await?;
-        Ok(Self::from_pool(pool))
+        let mut provider = Self::from_pool(pool);
+        provider.schema = schema.to_string();
+        Ok(provider)
     }
 
-    /// Build a provider from an existing pool (useful if your app already owns one).
+    /// Build a provider from an existing pool (useful if your app already owns
+    /// one). The pool's own configuration controls the search path, so system
+    /// tables live wherever it resolves unqualified names (no schema is created
+    /// on `init`).
     pub fn from_pool(pool: PgPool) -> Self {
         Self {
             pool,
+            schema: String::new(),
             serializer: Serializer::default(),
             notify_hub: Arc::new(NotifyHub::default()),
             listener_token: CancellationToken::new(),
             listener_started: AtomicBool::new(false),
         }
+    }
+
+    /// The underlying connection pool (e.g. for application queries that should
+    /// share the provider's connections and search path).
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     /// Choose the format new values are encoded with. Use [`Serializer::Portable`]
@@ -325,9 +384,33 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::postgres::PgRow) -> Workfl
 #[async_trait]
 impl StateProvider for PostgresProvider {
     async fn init(&self) -> Result<()> {
+        // Make sure the system-tables schema exists before migrating into it
+        // (the pool's search_path already points there, so the unqualified DDL
+        // in the migrations lands in it). `from_pool` leaves `schema` empty and
+        // skips this — the caller's pool decides where names resolve.
+        if !self.schema.is_empty() {
+            if let Err(e) = sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", self.schema))
+                .execute(&self.pool)
+                .await
+            {
+                // `IF NOT EXISTS` is not race-safe: two concurrent creators can
+                // both pass the existence check, and the loser fails on the
+                // catalog's unique constraint (23505) or `duplicate_schema`
+                // (42P06). Either way the schema exists now — proceed.
+                let benign = matches!(
+                    &e,
+                    sqlx::Error::Database(db)
+                        if matches!(db.code().as_deref(), Some("23505") | Some("42P06"))
+                );
+                if !benign {
+                    return Err(e.into());
+                }
+            }
+        }
         // Embedded migrations (baked in at compile time from ./migrations/postgres).
-        // sqlx tracks applied versions in `_sqlx_migrations` and applies only what
-        // is pending, so this is safe on every startup and upgrades existing DBs.
+        // sqlx tracks applied versions in `_sqlx_migrations` (inside the schema,
+        // so each schema migrates independently) and applies only what is
+        // pending, so this is safe on every startup and upgrades existing DBs.
         sqlx::migrate!("./migrations/postgres")
             .run(&self.pool)
             .await?;

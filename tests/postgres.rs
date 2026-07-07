@@ -1185,15 +1185,22 @@ async fn pg_client_debounces() -> Result<()> {
     };
     let wf = format!("notify-{}", uuid::Uuid::new_v4());
     let key = format!("k-{}", uuid::Uuid::new_v4());
+    // Pin a unique app version on both the engine and the client. The debouncer
+    // rides the shared internal queue, and dequeue gates on application version
+    // (`= mine OR ''`): a client-enqueued collector stamped '' can be claimed by
+    // ANY concurrently-launched test engine, which has `_dbos_debouncer` but not
+    // this test's uuid-scoped target — the collector errors and the test hangs.
+    // Version-pinning scopes the collector to this test's engine alone.
+    let ver = format!("v-{}", uuid::Uuid::new_v4());
 
     let provider = Arc::new(PostgresProvider::connect(&url).await?);
-    let mut engine = DurableEngine::new(provider.clone()).await?;
+    let mut engine = DurableEngine::new_with_version(provider.clone(), &ver).await?;
     engine.register(&wf, |_ctx: DurableContext, msg: String| async move {
         Ok::<_, Error>(msg)
     });
     engine.launch().await?;
 
-    let client = Client::new(provider.clone());
+    let client = Client::new(provider.clone()).with_app_version(&ver);
     let delay = Duration::from_millis(300);
     let h1: WorkflowHandle<String> = client
         .debouncer(&wf)
@@ -1310,7 +1317,11 @@ async fn pg_client_manages_schedules() -> Result<()> {
         return Ok(());
     };
     let name = format!("nightly-{}", uuid::Uuid::new_v4());
-    let client = Client::new(Arc::new(PostgresProvider::connect(&url).await?));
+    // A Client requires an initialized database (it never migrates); on a fresh
+    // schema that's the application's (here: the test's) job.
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    provider.init().await?;
+    let client = Client::new(provider);
 
     client
         .create_schedule(
@@ -1372,8 +1383,9 @@ async fn pg_client_backfills_and_triggers_a_schedule() -> Result<()> {
     };
     let tag = uuid::Uuid::new_v4();
     let name = format!("bf-{tag}");
-    let client = Client::new(Arc::new(PostgresProvider::connect(&url).await?))
-        .with_app_version(format!("v-{tag}"));
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    provider.init().await?;
+    let client = Client::new(provider).with_app_version(format!("v-{tag}"));
 
     client
         .create_schedule(&name, "report", "0 0 12 * * *", ScheduleOptions::new())
@@ -1436,13 +1448,13 @@ async fn pg_portable_input_envelope() -> Result<()> {
     // Read the raw columns: input is the args envelope, output is a bare value.
     let pool = sqlx::PgPool::connect(&url).await?;
     let raw_inputs: String =
-        sqlx::query_scalar("SELECT inputs FROM workflow_status WHERE workflow_uuid = $1")
+        sqlx::query_scalar("SELECT inputs FROM dbos.workflow_status WHERE workflow_uuid = $1")
             .bind(&id)
             .fetch_one(&pool)
             .await?;
     assert_eq!(raw_inputs, r#"{"positionalArgs":["ada"],"namedArgs":{}}"#);
     let raw_output: String =
-        sqlx::query_scalar("SELECT output FROM workflow_status WHERE workflow_uuid = $1")
+        sqlx::query_scalar("SELECT output FROM dbos.workflow_status WHERE workflow_uuid = $1")
             .bind(&id)
             .fetch_one(&pool)
             .await?;
@@ -2123,6 +2135,74 @@ async fn pg_transaction_body_user_retry() -> Result<()> {
         1,
         "a rejected error is not retried despite max_retries(5)"
     );
+    Ok(())
+}
+
+/// A custom system-tables schema isolates tenants sharing one database: each
+/// `connect_with_schema` provider creates and migrates its own schema, a
+/// workflow run in one is invisible to the other, and an invalid schema name is
+/// rejected up front.
+#[tokio::test]
+async fn pg_custom_schema_isolates_tenants() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_custom_schema_isolates_tenants: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let (schema_a, schema_b) = (format!("t_a_{tag}"), format!("t_b_{tag}"));
+    let id = format!("wf-schema-{tag}");
+
+    let provider_a = Arc::new(PostgresProvider::connect_with_schema(&url, &schema_a).await?);
+    let provider_b = Arc::new(PostgresProvider::connect_with_schema(&url, &schema_b).await?);
+
+    let mut engine_a = DurableEngine::new(provider_a.clone()).await?;
+    engine_a.register("hello", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n * 2)
+    });
+    let out: i64 = engine_a
+        .run_workflow::<_, i64>("hello", 21_i64, WorkflowOptions::with_id(&id))
+        .await?
+        .get_result()
+        .await?;
+    assert_eq!(out, 42);
+
+    // Tenant A sees its run; tenant B — same database, different schema — does not.
+    assert!(provider_a.get_workflow_status(&id).await?.is_some());
+    let engine_b = DurableEngine::new(provider_b.clone()).await?; // migrates schema_b
+    assert!(
+        provider_b.get_workflow_status(&id).await?.is_none(),
+        "a run in schema {schema_a} must be invisible from schema {schema_b}"
+    );
+
+    // Both schemas hold their own copy of the system tables.
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.tables
+         WHERE table_schema IN ($1, $2) AND table_name = 'workflow_status'",
+    )
+    .bind(&schema_a)
+    .bind(&schema_b)
+    .fetch_one(provider_a.pool())
+    .await
+    .map_err(Error::from)?;
+    assert_eq!(count, 2, "each tenant schema has its own workflow_status");
+
+    // A schema name that isn't a plain identifier is rejected before any SQL.
+    assert!(
+        PostgresProvider::connect_with_schema(&url, "bad-name; drop table x")
+            .await
+            .is_err(),
+        "non-identifier schema names are rejected"
+    );
+
+    engine_a.shutdown(Duration::from_secs(1)).await?;
+    engine_b.shutdown(Duration::from_secs(1)).await?;
+    // Clean up the tenant schemas so repeated runs don't accumulate.
+    for schema in [&schema_a, &schema_b] {
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(provider_a.pool())
+            .await
+            .map_err(Error::from)?;
+    }
     Ok(())
 }
 
