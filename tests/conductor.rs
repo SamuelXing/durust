@@ -163,7 +163,13 @@ async fn conductor_handles_workflow_management() -> Result<()> {
         let fork = exchange(
             &mut ws,
             json!({"type":"fork_workflow","request_id":"f",
-                   "body":{"workflow_id":"wf-1","start_step":0,"new_workflow_id":"forked-1"}}),
+                   "body":{"workflow_id":"wf-1","start_step":0,"new_workflow_id":"forked-1",
+                           "queue_name":"cond-fork-q","queue_partition_key":"p-1"}}),
+        )
+        .await;
+        let fork_row = exchange(
+            &mut ws,
+            json!({"type":"get_workflow","request_id":"fg","workflow_id":"forked-1"}),
         )
         .await;
         let cancel = exchange(
@@ -176,7 +182,7 @@ async fn conductor_handles_workflow_management() -> Result<()> {
             json!({"type":"delete","request_id":"d","workflow_ids":["forked-1"]}),
         )
         .await;
-        (list, get, steps, fork, cancel, delete)
+        (list, get, steps, fork, fork_row, cancel, delete)
     });
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
@@ -204,7 +210,7 @@ async fn conductor_handles_workflow_management() -> Result<()> {
         },
     )?;
 
-    let (list, get, steps, fork, cancel, delete) = server.await.unwrap();
+    let (list, get, steps, fork, fork_row, cancel, delete) = server.await.unwrap();
 
     // list_workflows -> output array carrying the conductor wire shape.
     assert_eq!(list["type"], "list_workflows");
@@ -223,8 +229,13 @@ async fn conductor_handles_workflow_management() -> Result<()> {
     let step_list = steps["output"].as_array().unwrap();
     assert!(step_list.iter().any(|s| s["function_name"] == "s1"));
 
-    // fork -> the new id we asked for.
+    // fork -> the new id we asked for, enqueued on the requested queue (no
+    // dispatcher listens on it, so the fork sits ENQUEUED with the partition
+    // key persisted — proving queue routing reached the row).
     assert_eq!(fork["new_workflow_id"], "forked-1");
+    assert_eq!(fork_row["output"]["WorkflowUUID"], "forked-1");
+    assert_eq!(fork_row["output"]["Status"], "ENQUEUED");
+    assert_eq!(fork_row["output"]["QueueName"], "cond-fork-q");
 
     // cancel / delete -> success.
     assert_eq!(cancel["success"], true);

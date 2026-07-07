@@ -4,7 +4,7 @@
 use durust::{
     DurableContext, DurableEngine, Error, InMemoryProvider, ListFilter, Result, StateProvider,
     StepAggregateQuery, WorkflowAggregate, WorkflowAggregateQuery, WorkflowOptions, WorkflowStatus,
-    STATUS_CANCELLED, STATUS_PENDING, STATUS_SUCCESS,
+    STATUS_CANCELLED, STATUS_ENQUEUED, STATUS_PENDING, STATUS_SUCCESS,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -882,4 +882,58 @@ async fn status_of(provider: &Arc<InMemoryProvider>, id: &str) -> String {
         .unwrap()
         .unwrap()
         .status
+}
+
+/// A fork lands on the queue named in `WorkflowOptions::queue` (default: the
+/// internal queue) and inherits the original's application version unless
+/// overridden; a partition key without a queue is rejected up front.
+#[tokio::test]
+async fn fork_routes_to_named_queue_and_inherits_version() -> Result<()> {
+    use durust::WorkflowQueue;
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("double", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n * 2)
+    });
+    engine.register_queue(
+        WorkflowQueue::new("fork-q").base_polling_interval(Duration::from_millis(10)),
+    );
+    engine.launch().await?;
+
+    let orig: i64 = engine.start_typed("double", "wf-orig-q", 21_i64).await?;
+    assert_eq!(orig, 42);
+
+    // Fork onto the named queue: its dispatcher runs the fork, the row records
+    // the queue, and the version is the original's.
+    let mut opts = WorkflowOptions::with_id("wf-fork-q");
+    opts.queue = Some("fork-q".to_string());
+    let mut forked = engine.fork_workflow::<i64>("wf-orig-q", 0, opts).await?;
+    assert_eq!(forked.get_result().await?, 42);
+    let row = provider.get_workflow_status("wf-fork-q").await?.unwrap();
+    assert_eq!(row.queue_name.as_deref(), Some("fork-q"));
+    let orig_row = provider.get_workflow_status("wf-orig-q").await?.unwrap();
+    assert_eq!(row.app_version, orig_row.app_version);
+
+    // An explicit version override wins — and version-gated dispatch leaves the
+    // foreign-version fork ENQUEUED (only a matching executor may claim it).
+    let forked_v = engine
+        .fork_workflow::<i64>(
+            "wf-orig-q",
+            0,
+            WorkflowOptions::with_id("wf-fork-v").app_version("v-next"),
+        )
+        .await?;
+    let row_v = provider.get_workflow_status(forked_v.id()).await?.unwrap();
+    assert_eq!(row_v.app_version, "v-next");
+    assert_eq!(row_v.status, STATUS_ENQUEUED);
+
+    // A partition key without a queue name is rejected.
+    let bad = WorkflowOptions::default().partition_key("p1");
+    assert!(engine
+        .fork_workflow::<i64>("wf-orig-q", 0, bad)
+        .await
+        .is_err());
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
 }

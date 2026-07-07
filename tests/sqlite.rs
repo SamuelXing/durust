@@ -2764,3 +2764,65 @@ async fn sqlite_unhandled_claim_is_released_not_stranded() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// A fork row is created `ENQUEUED` on the requested queue with the partition
+/// key persisted, copies `class_name`/`config_name`, and inherits the
+/// original's application version unless the caller overrides it.
+#[tokio::test]
+async fn sqlite_fork_lands_on_queue_and_copies_columns() -> Result<()> {
+    use durust::{ForkParams, StateProvider, WorkflowStatus, STATUS_ENQUEUED};
+    let (url, path) = temp_db_url("fork-cols");
+    let provider = SqliteProvider::connect(&url).await?;
+    provider.init().await?;
+
+    let mut orig = WorkflowStatus::new(
+        "orig",
+        "job",
+        serde_json::json!(7),
+        STATUS_SUCCESS,
+        "",
+        "v1",
+    );
+    orig.class_name = Some("Jobs".to_string());
+    orig.config_name = Some("tenant-a".to_string());
+    provider.insert_workflow_status(orig).await?;
+
+    provider
+        .fork_workflow(&ForkParams {
+            original_id: "orig".to_string(),
+            new_id: "fork-inherit".to_string(),
+            start_step: 0,
+            app_version: None,
+            queue_name: "part-q".to_string(),
+            partition_key: Some("p-7".to_string()),
+        })
+        .await?;
+    let row = provider.get_workflow_status("fork-inherit").await?.unwrap();
+    assert_eq!(row.status, STATUS_ENQUEUED);
+    assert_eq!(row.queue_name.as_deref(), Some("part-q"));
+    assert_eq!(row.queue_partition_key.as_deref(), Some("p-7"));
+    assert_eq!(
+        row.app_version, "v1",
+        "an unset version inherits the original's"
+    );
+    assert_eq!(row.class_name.as_deref(), Some("Jobs"));
+    assert_eq!(row.config_name.as_deref(), Some("tenant-a"));
+    assert_eq!(row.forked_from.as_deref(), Some("orig"));
+
+    provider
+        .fork_workflow(&ForkParams {
+            original_id: "orig".to_string(),
+            new_id: "fork-v2".to_string(),
+            start_step: 0,
+            app_version: Some("v2".to_string()),
+            queue_name: "another-q".to_string(),
+            partition_key: None,
+        })
+        .await?;
+    let row2 = provider.get_workflow_status("fork-v2").await?.unwrap();
+    assert_eq!(row2.app_version, "v2", "an explicit version override wins");
+    assert!(row2.queue_partition_key.is_none());
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
