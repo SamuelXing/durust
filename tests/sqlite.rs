@@ -441,6 +441,58 @@ async fn sqlite_queue_dispatch_and_dedup() -> Result<()> {
     Ok(())
 }
 
+/// Config-name routing over SQLite: a dispatcher claiming a queued workflow must
+/// read the persisted `config_name` back from the row and route to the matching
+/// instance handler; `class_name`/`config_name` round-trip on the stored row.
+#[tokio::test]
+async fn sqlite_config_name_routes_on_queue_dispatch() -> Result<()> {
+    let (url, path) = temp_db_url("cfg");
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register_configured(
+        "greet",
+        "en",
+        |_ctx: DurableContext, who: String| async move { Ok::<_, Error>(format!("Hello, {who}")) },
+    );
+    engine.register_configured("greet", "fr", |_ctx: DurableContext, who: String| async move {
+        Ok::<_, Error>(format!("Bonjour, {who}"))
+    });
+    engine.register_queue(WorkflowQueue::new("q").base_polling_interval(Duration::from_millis(10)));
+    engine.launch().await?;
+
+    let mut fr = engine
+        .enqueue::<_, String>(
+            "q",
+            "greet",
+            "Sam".to_string(),
+            WorkflowOptions::with_id("wf-fr")
+                .config_name("fr")
+                .class_name("Greeter"),
+        )
+        .await?;
+    let mut en = engine
+        .enqueue::<_, String>(
+            "q",
+            "greet",
+            "Sam".to_string(),
+            WorkflowOptions::with_id("wf-en").config_name("en"),
+        )
+        .await?;
+    assert_eq!(fr.get_result().await?, "Bonjour, Sam");
+    assert_eq!(en.get_result().await?, "Hello, Sam");
+
+    let status = engine
+        .retrieve_workflow::<String>("wf-fr")
+        .await?
+        .get_status()
+        .await?;
+    assert_eq!(status.config_name.as_deref(), Some("fr"));
+    assert_eq!(status.class_name.as_deref(), Some("Greeter"));
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 /// Messaging on the SQL backend: send/recv FIFO via the atomic consume,
 /// set_event/get_event, and the FK rejecting sends to missing workflows.
 #[tokio::test]

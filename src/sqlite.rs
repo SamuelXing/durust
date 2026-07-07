@@ -24,7 +24,7 @@ const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, e
      application_version, queue_name, queue_partition_key, priority, deduplication_id, recovery_attempts, \
      parent_workflow_id, workflow_timeout_ms, workflow_deadline_epoch_ms, \
      started_at_epoch_ms, rate_limited, delay_until_epoch_ms, completed_at, forked_from, \
-     authenticated_user, assumed_role, authenticated_roles, \
+     authenticated_user, assumed_role, authenticated_roles, class_name, config_name, \
      serialization, created_at, updated_at";
 
 /// SQLite-backed [`StateProvider`].
@@ -139,6 +139,8 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::sqlite::SqliteRow) -> Work
                 .flatten()
                 .as_deref(),
         ),
+        class_name: row.try_get("class_name").ok().flatten(),
+        config_name: row.try_get("config_name").ok().flatten(),
         created_at: ms_to_dt(row.get("created_at")),
         updated_at: ms_to_dt(row.get("updated_at")),
     }
@@ -163,9 +165,9 @@ impl StateProvider for SqliteProvider {
                  (workflow_uuid, name, inputs, status, executor_id, application_version,
                   queue_name, queue_partition_key, priority, deduplication_id, parent_workflow_id,
                   workflow_timeout_ms, workflow_deadline_epoch_ms, delay_until_epoch_ms,
-                  authenticated_user, assumed_role, authenticated_roles,
+                  authenticated_user, assumed_role, authenticated_roles, class_name, config_name,
                   serialization, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (workflow_uuid) DO NOTHING",
         )
         .bind(&s.id)
@@ -185,6 +187,8 @@ impl StateProvider for SqliteProvider {
         .bind(&s.authenticated_user)
         .bind(&s.assumed_role)
         .bind(encode_roles(&s.authenticated_roles))
+        .bind(&s.class_name)
+        .bind(&s.config_name)
         .bind(self.serializer.name())
         .bind(s.created_at.timestamp_millis())
         .bind(s.updated_at.timestamp_millis())

@@ -49,6 +49,17 @@ pub type WorkflowFn = Arc<
         + Sync,
 >;
 
+/// The registry key for a workflow: plain `name`, or an instance-qualified
+/// `name/config` when a non-empty config name is present. Keeps un-configured
+/// registrations keyed exactly by name (backward compatible) while letting
+/// several configured instances share one workflow name.
+pub(crate) fn registry_key(name: &str, config_name: Option<&str>) -> String {
+    match config_name {
+        Some(c) if !c.is_empty() => format!("{name}/{c}"),
+        _ => name.to_string(),
+    }
+}
+
 /// Erase a typed `async fn(DurableContext, Input) -> Result<Output>` into the
 /// JSON-in / JSON-out [`WorkflowFn`] the engine stores.
 ///
@@ -238,6 +249,14 @@ pub struct WorkflowOptions {
     pub assumed_role: Option<String>,
     /// Roles available to the authenticated user.
     pub authenticated_roles: Vec<String>,
+    /// Config / instance name: routes this run to the handler registered for that
+    /// instance under the same workflow name (see
+    /// [`DurableEngine::register_configured`]), and is recorded so recovery
+    /// re-dispatches to the same instance.
+    pub config_name: Option<String>,
+    /// Class / namespace name recorded on the row (cross-SDK metadata). Not used
+    /// for routing on its own.
+    pub class_name: Option<String>,
 }
 
 impl WorkflowOptions {
@@ -277,6 +296,19 @@ impl WorkflowOptions {
     /// [`DeduplicationPolicy`]).
     pub fn dedup_policy(mut self, policy: DeduplicationPolicy) -> Self {
         self.dedup_policy = policy;
+        self
+    }
+
+    /// Route this run to the handler registered for a configured instance under
+    /// the same workflow name (see [`DurableEngine::register_configured`]).
+    pub fn config_name(mut self, name: impl Into<String>) -> Self {
+        self.config_name = Some(name.into());
+        self
+    }
+
+    /// Set the class / namespace name recorded on the row (cross-SDK metadata).
+    pub fn class_name(mut self, name: impl Into<String>) -> Self {
+        self.class_name = Some(name.into());
         self
     }
 
@@ -462,6 +494,26 @@ impl DurableEngine {
         Fut: Future<Output = Result<O>> + Send + 'static,
     {
         self.workflows.insert(name.to_string(), erase(f));
+    }
+
+    /// Register a workflow handler for a **configured instance** under `name`.
+    ///
+    /// Several instances can share one workflow `name`, each distinguished by its
+    /// `config_name`. A run started or enqueued with a matching
+    /// [`WorkflowOptions::config_name`] is dispatched to that instance's handler,
+    /// and because the config name is persisted on the row, recovery re-dispatches
+    /// to the same one. Register every instance (with the same config name) on
+    /// each process start, before [`launch`](Self::launch). The instance's state
+    /// is simply captured by the handler closure.
+    pub fn register_configured<I, O, F, Fut>(&mut self, name: &str, config_name: &str, f: F)
+    where
+        I: DeserializeOwned + Send + 'static,
+        O: Serialize + Send + 'static,
+        F: Fn(DurableContext, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<O>> + Send + 'static,
+    {
+        self.workflows
+            .insert(registry_key(name, Some(config_name)), erase(f));
     }
 
     /// Register a durable queue. Must be called before [`launch`](Self::launch);
@@ -895,7 +947,7 @@ impl DurableEngine {
         }
         let handler = rt
             .workflows
-            .get(name)
+            .get(&registry_key(name, opts.config_name.as_deref()))
             .cloned()
             .ok_or_else(|| Error::UnknownWorkflow(name.to_string()))?;
 
@@ -1374,7 +1426,11 @@ impl DurableEngine {
                 continue;
             }
 
-            if let Some(handler) = rt.workflows.get(&record.name).cloned() {
+            if let Some(handler) = rt
+                .workflows
+                .get(&registry_key(&record.name, record.config_name.as_deref()))
+                .cloned()
+            {
                 // Best-effort: a workflow that fails again is marked ERROR by
                 // `run_to_completion`; we keep going with the rest.
                 let _ = run_to_completion(
@@ -1468,6 +1524,8 @@ impl Runtime {
         row.authenticated_user = auth.authenticated_user.clone();
         row.assumed_role = auth.assumed_role.clone();
         row.authenticated_roles = auth.authenticated_roles.clone();
+        row.class_name = opts.class_name.clone();
+        row.config_name = opts.config_name.clone();
         row.timeout_ms = opts.timeout.map(|d| d.as_millis() as i64);
         row.delay_until_ms = opts.delay.map(|d| now_ms + d.as_millis() as i64);
         if !queued {
@@ -1587,7 +1645,7 @@ impl Runtime {
     ) -> Result<()> {
         let handler = self
             .workflows
-            .get(name)
+            .get(&registry_key(name, opts.config_name.as_deref()))
             .cloned()
             .ok_or_else(|| Error::UnknownWorkflow(name.to_string()))?;
         let (canonical, queued, _created) = self
@@ -1702,7 +1760,11 @@ async fn queue_dispatch_loop(
             match provider.dequeue_workflows(&req).await {
                 Ok(claimed) => {
                     for wf in claimed {
-                        let Some(handler) = rt.workflows.get(&wf.name).cloned() else {
+                        let Some(handler) = rt
+                            .workflows
+                            .get(&registry_key(&wf.name, wf.config_name.as_deref()))
+                            .cloned()
+                        else {
                             // Release the claim instead of stranding the row
                             // PENDING under an executor that can never run it,
                             // so an executor that does have the handler can

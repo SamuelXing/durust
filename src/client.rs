@@ -134,6 +134,8 @@ impl Client {
         row.authenticated_user = opts.authenticated_user.clone();
         row.assumed_role = opts.assumed_role.clone();
         row.authenticated_roles = opts.authenticated_roles.clone();
+        row.class_name = opts.class_name.clone();
+        row.config_name = opts.config_name.clone();
         row.timeout_ms = opts.timeout.map(|d| d.as_millis() as i64);
         row.delay_until_ms = opts.delay.map(|d| now_ms + d.as_millis() as i64);
 
