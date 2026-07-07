@@ -2,8 +2,8 @@ use crate::error::{Error, Result};
 use crate::provider::{
     col_bool, col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows,
     is_terminal, nonexistent_or, step_outcome_from, workflow_agg_selects, ChangeWait,
-    DequeueRequest, ExportedWorkflow, ListFilter, NotificationInfo, StateProvider, StepAggregate,
-    StepAggregateQuery, StepInfo, StepOutcome, VersionInfo, WorkflowAggregate,
+    DequeueRequest, ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, StateProvider,
+    StepAggregate, StepAggregateQuery, StepInfo, StepOutcome, VersionInfo, WorkflowAggregate,
     WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_STR_COLS, NOTIFICATIONS_CHANNEL,
     STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
     STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
@@ -1376,13 +1376,10 @@ impl StateProvider for PostgresProvider {
         Ok(res.rows_affected() > 0)
     }
 
-    async fn fork_workflow(
-        &self,
-        original_id: &str,
-        new_id: &str,
-        start_step: i32,
-        app_version: &str,
-    ) -> Result<()> {
+    async fn fork_workflow(&self, params: &ForkParams) -> Result<()> {
+        let original_id = params.original_id.as_str();
+        let new_id = params.new_id.as_str();
+        let start_step = params.start_step;
         let mut tx = self.pool.begin().await?;
         let now = Utc::now().timestamp_millis();
 
@@ -1390,15 +1387,21 @@ impl StateProvider for PostgresProvider {
             "INSERT INTO workflow_status
                  (workflow_uuid, status, name, inputs, serialization, executor_id,
                   application_version, forked_from, recovery_attempts,
-                  authenticated_user, assumed_role, authenticated_roles, created_at, updated_at)
-             SELECT $1, $2, name, inputs, serialization, '', $3, $4, 0,
-                    authenticated_user, assumed_role, authenticated_roles, $5, $5
+                  authenticated_user, assumed_role, authenticated_roles,
+                  class_name, config_name, queue_name, queue_partition_key,
+                  created_at, updated_at)
+             SELECT $1, $2, name, inputs, serialization, '',
+                    COALESCE($3, application_version), $4, 0,
+                    authenticated_user, assumed_role, authenticated_roles,
+                    class_name, config_name, $5, $6, $7, $7
              FROM workflow_status WHERE workflow_uuid = $4",
         )
         .bind(new_id)
-        .bind(STATUS_PENDING)
-        .bind(app_version)
+        .bind(STATUS_ENQUEUED)
+        .bind(params.app_version.as_deref())
         .bind(original_id)
+        .bind(&params.queue_name)
+        .bind(params.partition_key.as_deref())
         .bind(now)
         .execute(&mut *tx)
         .await?;

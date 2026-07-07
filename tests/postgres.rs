@@ -2804,3 +2804,65 @@ async fn pg_was_forked_from_survives_import() -> Result<()> {
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
+
+/// A fork routes to the queue named in the fork options and completes there,
+/// inheriting the original's application version. A `Client` fork (which has
+/// no engine version at hand) also inherits the original's — rather than
+/// stamping '' — so the fleet that could run the original can run the fork.
+#[tokio::test]
+async fn pg_fork_routes_to_named_queue() -> Result<()> {
+    use durust::{Client, WorkflowHandle, WorkflowQueue};
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_fork_routes_to_named_queue: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let wf = format!("fork-wf-{tag}");
+    let queue = format!("fork-q-{tag}");
+
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register(&wf, |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n * 2)
+    });
+    engine.register_queue(
+        WorkflowQueue::new(&queue).base_polling_interval(Duration::from_millis(50)),
+    );
+    engine.launch().await?;
+
+    let orig_id = format!("fork-orig-{tag}");
+    let orig: i64 = engine.start_typed(&wf, &orig_id, 21_i64).await?;
+    assert_eq!(orig, 42);
+
+    // Engine fork onto the named queue: its dispatcher completes it, and the
+    // row records the queue and the inherited version.
+    let fork_id = format!("fork-new-{tag}");
+    let mut opts = WorkflowOptions::with_id(&fork_id);
+    opts.queue = Some(queue.clone());
+    let mut forked = engine.fork_workflow::<i64>(&orig_id, 0, opts).await?;
+    assert_eq!(forked.get_result().await?, 42);
+    let row = provider.get_workflow_status(&fork_id).await?.unwrap();
+    assert_eq!(row.queue_name.as_deref(), Some(queue.as_str()));
+    assert_eq!(row.app_version, engine.app_version());
+
+    // Client fork (internal queue): the inherited version matches this engine,
+    // so its dispatcher claims and completes the fork.
+    let client_fork_id = format!("fork-client-{tag}");
+    let client = Client::new(provider.clone());
+    let mut cf: WorkflowHandle<i64> = client
+        .fork_workflow(&orig_id, 0, WorkflowOptions::with_id(&client_fork_id))
+        .await?;
+    assert_eq!(cf.get_result().await?, 42);
+    let crow = provider
+        .get_workflow_status(&client_fork_id)
+        .await?
+        .unwrap();
+    assert_eq!(
+        crow.app_version,
+        engine.app_version(),
+        "a client fork inherits the original's version instead of stamping ''"
+    );
+
+    engine.shutdown(Duration::from_secs(2)).await?;
+    Ok(())
+}

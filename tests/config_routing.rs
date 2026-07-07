@@ -132,3 +132,49 @@ async fn plain_registration_unaffected_by_config_routing() -> Result<()> {
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
+
+/// A fork of a configured run copies `config_name`/`class_name`, so the
+/// claiming dispatcher routes the fork to the same instance instead of failing
+/// with `UnknownWorkflow`.
+#[tokio::test]
+async fn fork_of_configured_run_routes_to_same_instance() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register_configured(
+        "greet",
+        "en",
+        |_ctx: DurableContext, who: String| async move { Ok::<_, Error>(format!("Hello, {who}")) },
+    );
+    engine.register_configured("greet", "fr", |_ctx: DurableContext, who: String| async move {
+        Ok::<_, Error>(format!("Bonjour, {who}"))
+    });
+    engine.launch().await?;
+
+    let fr: String = engine
+        .run_workflow::<_, String>(
+            "greet",
+            "Sam".to_string(),
+            WorkflowOptions::with_id("wf-fr")
+                .config_name("fr")
+                .class_name("Greeter"),
+        )
+        .await?
+        .get_result()
+        .await?;
+    assert_eq!(fr, "Bonjour, Sam");
+
+    let mut forked = engine
+        .fork_workflow::<String>("wf-fr", 0, WorkflowOptions::with_id("wf-fr-fork"))
+        .await?;
+    assert_eq!(forked.get_result().await?, "Bonjour, Sam");
+
+    let status = engine
+        .retrieve_workflow::<String>("wf-fr-fork")
+        .await?
+        .get_status()
+        .await?;
+    assert_eq!(status.config_name.as_deref(), Some("fr"));
+    assert_eq!(status.class_name.as_deref(), Some("Greeter"));
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}

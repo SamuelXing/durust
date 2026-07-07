@@ -13,7 +13,7 @@ use crate::engine::{
 use crate::error::{Error, ErrorCode, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{
-    ListFilter, StateProvider, StepInfo, VersionInfo, WorkflowStatus, STATUS_DELAYED,
+    ForkParams, ListFilter, StateProvider, StepInfo, VersionInfo, WorkflowStatus, STATUS_DELAYED,
     STATUS_ENQUEUED,
 };
 use crate::schedule::{
@@ -296,22 +296,36 @@ impl Client {
     }
 
     /// Fork a workflow from `start_step`: a new workflow reuses the original's
-    /// checkpoints for steps `< start_step` and re-executes from there. Queued
-    /// onto the internal queue for a dispatcher to run; returns a polling handle.
-    /// The new id comes from `opts.workflow_id` or is generated.
+    /// checkpoints for steps `< start_step` and re-executes from there. Enqueued
+    /// onto `opts.queue` (the internal queue when unset) with
+    /// `opts.partition_key` for a dispatcher on a live engine to run; returns a
+    /// polling handle. The new id comes from `opts.workflow_id` or is generated.
+    /// `opts.app_version` overrides the version stamped on the fork; unset, the
+    /// fork inherits the original's, staying runnable by the executors that
+    /// could run the original.
     pub async fn fork_workflow<O>(
         &self,
         original_id: &str,
         start_step: i32,
         opts: WorkflowOptions,
     ) -> Result<WorkflowHandle<O>> {
+        if opts.partition_key.is_some() && opts.queue.is_none() {
+            return Err(Error::app("a queue partition key requires a queue name"));
+        }
         let new_id = opts
             .workflow_id
+            .filter(|s| !s.is_empty())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         self.provider
-            .fork_workflow(original_id, &new_id, start_step, "")
+            .fork_workflow(&ForkParams {
+                original_id: original_id.to_string(),
+                new_id: new_id.clone(),
+                start_step,
+                app_version: opts.app_version.filter(|v| !v.is_empty()),
+                queue_name: opts.queue.unwrap_or_else(|| INTERNAL_QUEUE.to_string()),
+                partition_key: opts.partition_key,
+            })
             .await?;
-        self.requeue_for_rerun(&new_id).await?;
         Ok(WorkflowHandle::polling(new_id, self.provider.clone()))
     }
 

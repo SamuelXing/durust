@@ -2,10 +2,10 @@ use crate::context::{AuthContext, DurableContext};
 use crate::error::{Error, ErrorCode, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{
-    is_terminal, DequeueRequest, ListFilter, StateProvider, StepAggregate, StepAggregateQuery,
-    StepInfo, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
-    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_PENDING,
-    STATUS_SUCCESS,
+    is_terminal, DequeueRequest, ForkParams, ListFilter, StateProvider, StepAggregate,
+    StepAggregateQuery, StepInfo, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery,
+    WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    STATUS_PENDING, STATUS_SUCCESS,
 };
 use crate::queue::WorkflowQueue;
 use crate::schedule::{
@@ -1289,7 +1289,7 @@ impl DurableEngine {
 
     /// Put an existing row onto the internal queue so a dispatcher re-runs it.
     /// Re-execution always uses the internal queue (not the workflow's original
-    /// user queue): it is always dispatched, so a resumed/forked workflow makes
+    /// user queue): it is always dispatched, so a resumed workflow makes
     /// progress regardless of which user queues a process listens to.
     async fn requeue_for_rerun(&self, id: &str) -> Result<()> {
         self.provider.enqueue_existing(id, INTERNAL_QUEUE).await
@@ -1352,27 +1352,39 @@ impl DurableEngine {
     /// Fork a workflow from `start_step`. Creates a new workflow that reuses the
     /// original's checkpoints for steps `< start_step` and re-executes from
     /// there. The new id comes from `opts.workflow_id` or is generated; the fork
-    /// is queued onto the internal queue for a dispatcher to run, and the
-    /// returned handle tracks it by polling.
+    /// is enqueued onto `opts.queue` (the internal queue when unset, so it is
+    /// always dispatched) with `opts.partition_key`, and the returned handle
+    /// tracks it by polling. `opts.app_version` overrides the version stamped on
+    /// the fork (e.g. forking onto a new deploy); unset, the fork inherits the
+    /// original's, staying runnable by the executors that could run the original.
     pub async fn fork_workflow<O>(
         &self,
         original_id: &str,
         start_step: i32,
         opts: WorkflowOptions,
     ) -> Result<WorkflowHandle<O>> {
+        if opts.partition_key.is_some() && opts.queue.is_none() {
+            return Err(crate::error::Error::app(
+                "a queue partition key requires a queue name",
+            ));
+        }
         let new_id = opts
             .workflow_id
             // An explicit empty id means "assign one for me": fall through to a
             // fresh id so an empty id is never persisted.
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        // Honor an explicit application-version override (e.g. forking onto a new
-        // deploy); default to this engine's version.
-        let app_version = opts.app_version.as_deref().unwrap_or(&self.app_version);
         self.provider
-            .fork_workflow(original_id, &new_id, start_step, app_version)
+            .fork_workflow(&ForkParams {
+                original_id: original_id.to_string(),
+                new_id: new_id.clone(),
+                start_step,
+                // An explicit empty version also means "inherit".
+                app_version: opts.app_version.filter(|v| !v.is_empty()),
+                queue_name: opts.queue.unwrap_or_else(|| INTERNAL_QUEUE.to_string()),
+                partition_key: opts.partition_key,
+            })
             .await?;
-        self.requeue_for_rerun(&new_id).await?;
         Ok(WorkflowHandle::polling(new_id, self.provider.clone()))
     }
 

@@ -982,6 +982,26 @@ pub(crate) fn col_bool(m: &Map<String, Value>, key: &str) -> Option<bool> {
     m.get(key).and_then(Value::as_bool)
 }
 
+/// Parameters for [`StateProvider::fork_workflow`]. The fork is created
+/// directly `ENQUEUED` on `queue_name`, in the same transaction that copies the
+/// original's checkpoints, so a fork is never observable half-made.
+#[derive(Clone, Debug)]
+pub struct ForkParams {
+    /// The workflow being forked.
+    pub original_id: String,
+    /// Id of the fork.
+    pub new_id: String,
+    /// First step to re-execute; checkpoints below it are copied over.
+    pub start_step: i32,
+    /// Version to stamp on the fork; `None` inherits the original's (so the
+    /// fork stays runnable by the executors that could run the original).
+    pub app_version: Option<String>,
+    /// Queue the fork is enqueued on.
+    pub queue_name: String,
+    /// Partition key when `queue_name` is a partitioned queue.
+    pub partition_key: Option<String>,
+}
+
 /// Parameters for one dequeue iteration, computed by the engine's dispatcher
 /// from a [`crate::WorkflowQueue`]'s configuration. Plain scalars so the storage
 /// layer stays decoupled from the queue type.
@@ -1231,7 +1251,7 @@ pub trait StateProvider: Send + Sync {
 
     /// Route an existing row to a queue: set it `ENQUEUED` on `queue`, clearing
     /// the owning executor and start time so a dispatcher claims it fresh. Used
-    /// to re-execute a resumed/forked workflow on a running engine without
+    /// to re-execute a resumed workflow on a running engine without
     /// re-running it locally. A no-op if the id is gone.
     async fn enqueue_existing(&self, id: &str, queue: &str) -> Result<()>;
 
@@ -1260,18 +1280,13 @@ pub trait StateProvider: Send + Sync {
     /// Returns whether a row was updated.
     async fn set_workflow_delay(&self, id: &str, delay_until_ms: i64) -> Result<bool>;
 
-    /// Create `new_id` as a fork of `original_id`: a fresh `PENDING` workflow
-    /// with the same name/input, `forked_from = original_id`, and the original's
-    /// step checkpoints with `seq < start_step` copied in so execution resumes
-    /// from that step. Marks the original `was_forked_from`. Errors if the
-    /// original does not exist.
-    async fn fork_workflow(
-        &self,
-        original_id: &str,
-        new_id: &str,
-        start_step: i32,
-        app_version: &str,
-    ) -> Result<()>;
+    /// Create `params.new_id` as a fork of `params.original_id`: a fresh
+    /// `ENQUEUED` workflow on `params.queue_name` with the same
+    /// name/input/auth/class/config, `forked_from = original_id`, and the
+    /// original's step checkpoints with `seq < start_step` copied in so
+    /// execution resumes from that step. Marks the original `was_forked_from`.
+    /// Errors if the original does not exist.
+    async fn fork_workflow(&self, params: &ForkParams) -> Result<()>;
 
     /// Atomically increment a workflow's `recovery_attempts` and return the new
     /// value. If it exceeds `max`, the workflow is parked in

@@ -1,8 +1,8 @@
 use crate::error::{Error, Result};
 use crate::provider::{
     col_i64, col_str, decode_roles, encode_roles, is_terminal, DequeueRequest, ExportedWorkflow,
-    ListFilter, NotificationInfo, StateProvider, StepAggregate, StepAggregateQuery, StepInfo,
-    StepOutcome, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
+    ForkParams, ListFilter, NotificationInfo, StateProvider, StepAggregate, StepAggregateQuery,
+    StepInfo, StepOutcome, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
     STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
     STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STREAM_CLOSED_SENTINEL,
 };
@@ -852,13 +852,10 @@ impl StateProvider for InMemoryProvider {
         Ok(false)
     }
 
-    async fn fork_workflow(
-        &self,
-        original_id: &str,
-        new_id: &str,
-        start_step: i32,
-        app_version: &str,
-    ) -> Result<()> {
+    async fn fork_workflow(&self, params: &ForkParams) -> Result<()> {
+        let original_id = params.original_id.as_str();
+        let new_id = params.new_id.as_str();
+        let start_step = params.start_step;
         let mut g = self.inner.lock().await;
         let original = g.workflows.get(original_id).cloned().ok_or_else(|| {
             Error::app(format!("cannot fork nonexistent workflow `{original_id}`"))
@@ -868,14 +865,21 @@ impl StateProvider for InMemoryProvider {
             new_id,
             &original.name,
             original.input.clone(),
-            STATUS_PENDING,
+            STATUS_ENQUEUED,
             "",
-            app_version,
+            params
+                .app_version
+                .as_deref()
+                .unwrap_or(&original.app_version),
         );
         forked.forked_from = Some(original_id.to_string());
         forked.authenticated_user = original.authenticated_user.clone();
         forked.assumed_role = original.assumed_role.clone();
         forked.authenticated_roles = original.authenticated_roles.clone();
+        forked.class_name = original.class_name.clone();
+        forked.config_name = original.config_name.clone();
+        forked.queue_name = Some(params.queue_name.clone());
+        forked.queue_partition_key = params.partition_key.clone();
         g.workflows.insert(new_id.to_string(), forked);
 
         // (`was_forked_from` is tracked only by the SQL backends, for
