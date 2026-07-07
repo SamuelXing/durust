@@ -1282,7 +1282,7 @@ pub trait StateProvider: Send + Sync {
 
     /// Create `params.new_id` as a fork of `params.original_id`: a fresh
     /// `ENQUEUED` workflow on `params.queue_name` with the same
-    /// name/input/auth/class/config, `forked_from = original_id`, and the
+    /// name/input/auth/class/config/app-id, `forked_from = original_id`, and the
     /// original's step checkpoints with `seq < start_step` copied in so
     /// execution resumes from that step. Marks the original `was_forked_from`.
     /// Errors if the original does not exist.

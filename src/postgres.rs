@@ -1386,12 +1386,12 @@ impl StateProvider for PostgresProvider {
         let inserted = sqlx::query(
             "INSERT INTO workflow_status
                  (workflow_uuid, status, name, inputs, serialization, executor_id,
-                  application_version, forked_from, recovery_attempts,
+                  application_version, application_id, forked_from, recovery_attempts,
                   authenticated_user, assumed_role, authenticated_roles,
                   class_name, config_name, queue_name, queue_partition_key,
                   created_at, updated_at)
              SELECT $1, $2, name, inputs, serialization, '',
-                    COALESCE($3, application_version), $4, 0,
+                    COALESCE($3, application_version), application_id, $4, 0,
                     authenticated_user, assumed_role, authenticated_roles,
                     class_name, config_name, $5, $6, $7, $7
              FROM workflow_status WHERE workflow_uuid = $4",

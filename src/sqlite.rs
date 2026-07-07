@@ -1061,12 +1061,12 @@ impl StateProvider for SqliteProvider {
         let inserted = sqlx::query(
             "INSERT INTO workflow_status
                  (workflow_uuid, status, name, inputs, serialization, executor_id,
-                  application_version, forked_from, recovery_attempts,
+                  application_version, application_id, forked_from, recovery_attempts,
                   authenticated_user, assumed_role, authenticated_roles,
                   class_name, config_name, queue_name, queue_partition_key,
                   created_at, updated_at)
              SELECT ?, ?, name, inputs, serialization, '',
-                    COALESCE(?, application_version), ?, 0,
+                    COALESCE(?, application_version), application_id, ?, 0,
                     authenticated_user, assumed_role, authenticated_roles,
                     class_name, config_name, ?, ?, ?, ?
              FROM workflow_status WHERE workflow_uuid = ?",
