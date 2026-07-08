@@ -937,3 +937,89 @@ async fn fork_routes_to_named_queue_and_inherits_version() -> Result<()> {
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
+
+/// A workflow whose steps changed between executions is non-deterministic:
+/// replaying a checkpoint recorded under a different step name fails with
+/// `UnexpectedStep` instead of silently returning the wrong step's result.
+#[tokio::test]
+async fn renamed_step_on_replay_fails_as_unexpected_step() -> Result<()> {
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("evolved", |ctx: DurableContext, _: ()| async move {
+        // The (changed) code runs a step named differently from the recorded one.
+        let v = ctx
+            .step("renamed", || async { Ok::<_, Error>(1_i64) })
+            .await?;
+        Ok::<_, Error>(v)
+    });
+    engine.launch().await?;
+
+    // Seed a PENDING run whose step 0 was checkpointed under the OLD name.
+    provider
+        .insert_workflow_status(WorkflowStatus::new(
+            "wf-evolved",
+            "evolved",
+            serde_json::Value::Null,
+            STATUS_PENDING,
+            "",
+            engine.app_version(),
+        ))
+        .await?;
+    provider
+        .record_step_result("wf-evolved", 0, "first", serde_json::json!(1), None, None)
+        .await?;
+
+    let mut h = engine.resume_workflow::<i64>("wf-evolved").await?;
+    let err = h.get_result().await.expect_err("replay must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("non-deterministic") && msg.contains("renamed") && msg.contains("first"),
+        "expected an UnexpectedStep failure, got: {msg}"
+    );
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// A parent that starts a *different* child workflow than the one recorded at
+/// this step position fails with `UnexpectedStep` instead of silently
+/// re-attaching to the wrong child.
+#[tokio::test]
+async fn changed_child_on_replay_fails_as_unexpected_step() -> Result<()> {
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("parent", |ctx: DurableContext, _: ()| async move {
+        let h = ctx
+            .start_workflow::<_, i64>("child-b", (), WorkflowOptions::default())
+            .await?;
+        Ok::<_, Error>(h.id().to_string())
+    });
+    engine.register("child-b", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(0_i64)
+    });
+    engine.launch().await?;
+
+    // Seed a PENDING parent whose step 0 recorded a child under a DIFFERENT name.
+    provider
+        .insert_workflow_status(WorkflowStatus::new(
+            "wf-parent",
+            "parent",
+            serde_json::Value::Null,
+            STATUS_PENDING,
+            "",
+            engine.app_version(),
+        ))
+        .await?;
+    provider
+        .record_child_workflow("wf-parent", 0, "child-a", "recorded-child-id")
+        .await?;
+
+    let mut h = engine.resume_workflow::<String>("wf-parent").await?;
+    let err = h.get_result().await.expect_err("replay must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("non-deterministic") && msg.contains("child-b") && msg.contains("child-a"),
+        "expected an UnexpectedStep failure, got: {msg}"
+    );
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}

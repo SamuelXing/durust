@@ -1,10 +1,11 @@
 use crate::error::{Error, Result};
 use crate::provider::{
     col_i64, col_str, decode_roles, encode_roles, is_terminal, DequeueRequest, ExportedWorkflow,
-    ForkParams, ListFilter, NotificationInfo, StateProvider, StepAggregate, StepAggregateQuery,
-    StepInfo, StepOutcome, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
-    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
-    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STREAM_CLOSED_SENTINEL,
+    ForkParams, ListFilter, NotificationInfo, RecordedStep, StateProvider, StepAggregate,
+    StepAggregateQuery, StepInfo, StepOutcome, VersionInfo, WorkflowAggregate,
+    WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
+    STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
+    STREAM_CLOSED_SENTINEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::tx::TxBody;
@@ -154,11 +155,14 @@ impl StateProvider for InMemoryProvider {
         Ok(())
     }
 
-    async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<StepOutcome>> {
+    async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<RecordedStep>> {
         let g = self.inner.lock().await;
         Ok(g.steps
             .get(&(workflow_id.to_string(), seq))
-            .map(step_row_outcome))
+            .map(|r| RecordedStep {
+                name: r.name.clone(),
+                outcome: step_row_outcome(r),
+            }))
     }
 
     async fn record_step_result(
@@ -932,11 +936,15 @@ impl StateProvider for InMemoryProvider {
         Ok(())
     }
 
-    async fn check_child_workflow(&self, parent_id: &str, seq: i32) -> Result<Option<String>> {
+    async fn check_child_workflow(
+        &self,
+        parent_id: &str,
+        seq: i32,
+    ) -> Result<Option<(String, String)>> {
         let g = self.inner.lock().await;
         Ok(g.steps
             .get(&(parent_id.to_string(), seq))
-            .and_then(|r| r.child_workflow_id.clone()))
+            .and_then(|r| r.child_workflow_id.clone().map(|id| (id, r.name.clone()))))
     }
 
     async fn get_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepInfo>> {

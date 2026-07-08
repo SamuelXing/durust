@@ -2826,3 +2826,57 @@ async fn sqlite_fork_lands_on_queue_and_copies_columns() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// Replaying a recorded transaction step under a different name fails with a
+/// typed `UnexpectedStep` — the workflow is non-deterministic, and the stored
+/// outcome would be the wrong step's result. The body is never run.
+#[tokio::test]
+async fn sqlite_renamed_transaction_fails_as_unexpected_step() -> Result<()> {
+    use durust::{params, ErrorCode, StateProvider, TxBody};
+    static BODY_RUNS: AtomicUsize = AtomicUsize::new(0);
+    let (url, path) = temp_db_url("txn-rename");
+
+    let provider = Arc::new(SqliteProvider::connect(&url).await?);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("tx-wf", |ctx: DurableContext, _: ()| async move {
+        ctx.transaction_with(TransactionOptions::new("tx-a"), |tx| {
+            Box::pin(async move {
+                tx.execute("SELECT 1", &params![]).await?;
+                Ok(7_i64)
+            })
+        })
+        .await
+    });
+    let id = "wf-txn-rename";
+    let out: i64 = engine.start_typed("tx-wf", id, ()).await?;
+    assert_eq!(out, 7);
+
+    // Re-drive the recorded step under a DIFFERENT transaction name.
+    let steps = engine.get_workflow_steps(id).await?;
+    let seq = steps
+        .iter()
+        .find(|s| s.name == "tx-a")
+        .expect("recorded")
+        .step_id;
+    let body: TxBody = Box::new(|_tx| {
+        Box::pin(async move {
+            BODY_RUNS.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!(0))
+        })
+    });
+    let err = provider
+        .run_transaction_step(id, seq, 0, &TransactionOptions::new("tx-b"), body)
+        .await
+        .expect_err("a renamed transaction must not replay the old outcome");
+    assert_eq!(err.code(), ErrorCode::UnexpectedStep);
+    assert!(
+        matches!(err, Error::UnexpectedStep { ref expected, ref recorded, .. }
+            if expected == "tx-b" && recorded == "tx-a"),
+        "got: {err}"
+    );
+    assert_eq!(BODY_RUNS.load(Ordering::SeqCst), 0, "the body must not run");
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}

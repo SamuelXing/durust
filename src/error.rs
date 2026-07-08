@@ -27,6 +27,9 @@ pub enum ErrorCode {
     WorkflowCancelled,
     /// A blocking operation or workflow deadline elapsed.
     Timeout,
+    /// A replay found a different step recorded at this position — the
+    /// workflow function is non-deterministic.
+    UnexpectedStep,
     /// An error raised by user code.
     Application,
 }
@@ -79,6 +82,24 @@ pub enum Error {
     #[error("operation timed out")]
     Timeout,
 
+    /// A replay found a different operation recorded at this step position:
+    /// the workflow is now executing `expected` where `recorded` ran on the
+    /// original execution. The workflow function is non-deterministic — its
+    /// steps were reordered, renamed, added, or removed between executions —
+    /// so replaying the stored checkpoint would return the wrong step's result.
+    #[error(
+        "workflow `{workflow_id}` step {step_id} is `{expected}` but `{recorded}` \
+         is recorded there — the workflow function is non-deterministic"
+    )]
+    UnexpectedStep {
+        workflow_id: String,
+        step_id: i32,
+        /// The operation the workflow is executing now.
+        expected: String,
+        /// The operation recorded at this position by the original execution.
+        recorded: String,
+    },
+
     /// An error raised by user code inside a step or workflow.
     #[error("{0}")]
     App(String),
@@ -124,6 +145,22 @@ impl Error {
         }
     }
 
+    /// Construct an [`Error::UnexpectedStep`] for a replay that found
+    /// `recorded` where the workflow is now executing `expected`.
+    pub fn unexpected_step(
+        workflow_id: impl Into<String>,
+        step_id: i32,
+        expected: impl Into<String>,
+        recorded: impl Into<String>,
+    ) -> Self {
+        Error::UnexpectedStep {
+            workflow_id: workflow_id.into(),
+            step_id,
+            expected: expected.into(),
+            recorded: recorded.into(),
+        }
+    }
+
     /// The stable [`ErrorCode`] for this error, for programmatic handling.
     pub fn code(&self) -> ErrorCode {
         match self {
@@ -136,6 +173,7 @@ impl Error {
             Error::QueueDeduplicated { .. } => ErrorCode::QueueDeduplicated,
             Error::Cancelled(_) => ErrorCode::WorkflowCancelled,
             Error::Timeout => ErrorCode::Timeout,
+            Error::UnexpectedStep { .. } => ErrorCode::UnexpectedStep,
             Error::App(_) | Error::Portable(_) => ErrorCode::Application,
         }
     }
@@ -219,6 +257,10 @@ mod tests {
         assert_eq!(
             Error::UnknownWorkflow("n".into()).code(),
             ErrorCode::WorkflowNotRegistered
+        );
+        assert_eq!(
+            Error::unexpected_step("wf", 3, "new", "old").code(),
+            ErrorCode::UnexpectedStep
         );
     }
 

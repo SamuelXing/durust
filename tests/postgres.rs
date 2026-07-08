@@ -2866,3 +2866,51 @@ async fn pg_fork_routes_to_named_queue() -> Result<()> {
     engine.shutdown(Duration::from_secs(2)).await?;
     Ok(())
 }
+
+/// A replay that finds a different step recorded at the current position fails
+/// the workflow with an `UnexpectedStep` (non-deterministic workflow) error
+/// instead of silently returning the wrong step's checkpoint.
+#[tokio::test]
+async fn pg_renamed_step_fails_as_unexpected_step() -> Result<()> {
+    use durust::{StateProvider, WorkflowStatus, STATUS_PENDING};
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_renamed_step_fails_as_unexpected_step: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let wf = format!("evolved-{tag}");
+    let id = format!("wf-evolved-{tag}");
+
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register(&wf, |ctx: DurableContext, _: ()| async move {
+        ctx.step("renamed", || async { Ok::<_, Error>(1_i64) })
+            .await
+    });
+    engine.launch().await?;
+
+    // Seed a PENDING run whose step 0 was checkpointed under the OLD name.
+    provider
+        .insert_workflow_status(WorkflowStatus::new(
+            &id,
+            &wf,
+            serde_json::Value::Null,
+            STATUS_PENDING,
+            "",
+            engine.app_version(),
+        ))
+        .await?;
+    provider
+        .record_step_result(&id, 0, "first", serde_json::json!(1), None, None)
+        .await?;
+
+    let mut h = engine.resume_workflow::<i64>(&id).await?;
+    let err = h.get_result().await.expect_err("replay must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("non-deterministic") && msg.contains("renamed") && msg.contains("first"),
+        "expected an UnexpectedStep failure, got: {msg}"
+    );
+    engine.shutdown(Duration::from_secs(2)).await?;
+    Ok(())
+}

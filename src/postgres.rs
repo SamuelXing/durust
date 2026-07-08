@@ -2,10 +2,10 @@ use crate::error::{Error, Result};
 use crate::provider::{
     col_bool, col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows,
     is_terminal, nonexistent_or, step_outcome_from, workflow_agg_selects, ChangeWait,
-    DequeueRequest, ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, StateProvider,
-    StepAggregate, StepAggregateQuery, StepInfo, StepOutcome, VersionInfo, WorkflowAggregate,
-    WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_STR_COLS, NOTIFICATIONS_CHANNEL,
-    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    DequeueRequest, ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, RecordedStep,
+    StateProvider, StepAggregate, StepAggregateQuery, StepInfo, StepOutcome, VersionInfo,
+    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_STR_COLS,
+    NOTIFICATIONS_CHANNEL, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
     STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
     STREAM_CLOSED_SENTINEL, WORKFLOW_EVENTS_CHANNEL,
 };
@@ -579,9 +579,9 @@ impl StateProvider for PostgresProvider {
         Ok(())
     }
 
-    async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<StepOutcome>> {
+    async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<RecordedStep>> {
         let row = sqlx::query(
-            "SELECT output, error, serialization FROM operation_outputs
+            "SELECT function_name, output, error, serialization FROM operation_outputs
              WHERE workflow_uuid = $1 AND function_id = $2",
         )
         .bind(workflow_id)
@@ -589,12 +589,16 @@ impl StateProvider for PostgresProvider {
         .fetch_optional(&self.pool)
         .await?;
         match row {
-            Some(r) => step_outcome_from(
+            Some(r) => Ok(step_outcome_from(
                 &self.serializer,
                 r.get::<Option<String>, _>("serialization").as_deref(),
                 r.get::<Option<String>, _>("output").as_deref(),
                 r.get::<Option<String>, _>("error").as_deref(),
-            ),
+            )?
+            .map(|outcome| RecordedStep {
+                name: r.get::<String, _>("function_name"),
+                outcome,
+            })),
             None => Ok(None),
         }
     }
@@ -668,7 +672,7 @@ impl StateProvider for PostgresProvider {
         // `ON CONFLICT DO NOTHING` inserts below guard the write side; there is a
         // single writer per (workflow_id, seq).
         if let Some(r) = sqlx::query(
-            "SELECT output, error, serialization FROM operation_outputs
+            "SELECT function_name, output, error, serialization FROM operation_outputs
              WHERE workflow_uuid = $1 AND function_id = $2",
         )
         .bind(workflow_id)
@@ -683,6 +687,18 @@ impl StateProvider for PostgresProvider {
                 r.get::<Option<String>, _>("output").as_deref(),
                 r.get::<Option<String>, _>("error").as_deref(),
             )? {
+                // A different operation recorded at this position means the
+                // workflow is non-deterministic — replaying the stored outcome
+                // would return the wrong step's result.
+                let recorded: String = r.get("function_name");
+                if recorded != name {
+                    return Err(crate::error::Error::unexpected_step(
+                        workflow_id,
+                        seq,
+                        name,
+                        recorded,
+                    ));
+                }
                 return so.into_value_result();
             }
         }
@@ -1483,16 +1499,23 @@ impl StateProvider for PostgresProvider {
         Ok(())
     }
 
-    async fn check_child_workflow(&self, parent_id: &str, seq: i32) -> Result<Option<String>> {
-        let child: Option<Option<String>> = sqlx::query_scalar(
-            "SELECT child_workflow_id FROM operation_outputs
+    async fn check_child_workflow(
+        &self,
+        parent_id: &str,
+        seq: i32,
+    ) -> Result<Option<(String, String)>> {
+        let row = sqlx::query(
+            "SELECT child_workflow_id, function_name FROM operation_outputs
              WHERE workflow_uuid = $1 AND function_id = $2",
         )
         .bind(parent_id)
         .bind(seq)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(child.flatten())
+        Ok(row.and_then(|r| {
+            r.get::<Option<String>, _>("child_workflow_id")
+                .map(|id| (id, r.get::<String, _>("function_name")))
+        }))
     }
 
     async fn get_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepInfo>> {

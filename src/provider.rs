@@ -855,6 +855,18 @@ impl StepOutcome {
     }
 }
 
+/// A previously checkpointed step as read back on replay: the recorded
+/// function name plus its outcome. The name lets the replayer detect a
+/// non-deterministic workflow — a different operation recorded at this step
+/// position than the one now executing (see [`Error::UnexpectedStep`]).
+#[derive(Clone, Debug)]
+pub struct RecordedStep {
+    /// The operation name recorded by the original execution.
+    pub name: String,
+    /// The recorded outcome (output or failure).
+    pub outcome: StepOutcome,
+}
+
 /// Build a [`StepOutcome`] from an `operation_outputs` row's `output`/`error`
 /// columns and recorded serialization format. A non-null `error` is a failure
 /// (decoded with [`crate::serialize::decode_error`]); otherwise the `output` is
@@ -1108,9 +1120,11 @@ pub trait StateProvider: Send + Sync {
         error: Option<&str>,
     ) -> Result<()>;
 
-    /// Return a previously checkpointed step's outcome (output or recorded
-    /// failure), or `None` if the step has not run.
-    async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<StepOutcome>>;
+    /// Return a previously checkpointed step — its recorded name plus outcome
+    /// (output or recorded failure) — or `None` if the step has not run. The
+    /// name lets the replayer detect a non-deterministic workflow (a different
+    /// operation recorded at this position than the one now executing).
+    async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<RecordedStep>>;
 
     /// Idempotently record a step's outcome keyed by `(workflow_id, seq)`: its
     /// success `value`, or — when `error` is set — its already-encoded failure
@@ -1306,9 +1320,16 @@ pub trait StateProvider: Send + Sync {
         child_id: &str,
     ) -> Result<()>;
 
-    /// Return the child workflow id `parent_id` started at step `seq`, if one was
-    /// recorded by [`record_child_workflow`](Self::record_child_workflow).
-    async fn check_child_workflow(&self, parent_id: &str, seq: i32) -> Result<Option<String>>;
+    /// Return `(child_id, recorded_name)` for the child workflow `parent_id`
+    /// started at step `seq`, if one was recorded by
+    /// [`record_child_workflow`](Self::record_child_workflow). The recorded
+    /// name lets the replayer detect a non-deterministic parent (a different
+    /// child recorded at this position than the one now being started).
+    async fn check_child_workflow(
+        &self,
+        parent_id: &str,
+        seq: i32,
+    ) -> Result<Option<(String, String)>>;
 
     /// List a workflow's recorded operations (its `operation_outputs` rows) as
     /// [`StepInfo`], ordered by `step_id`. Outputs are decoded per each row's

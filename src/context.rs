@@ -289,12 +289,22 @@ impl DurableContext {
     {
         let seq = self.next_seq();
 
-        // Replay: re-attach to the child already started at this step.
-        if let Some(child_id) = self
+        // Replay: re-attach to the child already started at this step. A
+        // different workflow name recorded here means the parent is
+        // non-deterministic — re-attaching would hand back the wrong child.
+        if let Some((child_id, recorded)) = self
             .provider
             .check_child_workflow(&self.workflow_id, seq)
             .await?
         {
+            if recorded != name {
+                return Err(Error::unexpected_step(
+                    &self.workflow_id,
+                    seq,
+                    name,
+                    recorded,
+                ));
+            }
             return Ok(WorkflowHandle::polling(child_id, self.provider.clone()));
         }
 
@@ -355,7 +365,7 @@ impl DurableContext {
         Fut: Future<Output = Result<T>>,
     {
         let seq = self.next_seq();
-        if let Some(stored) = self.replay_or_guard::<T>(seq).await? {
+        if let Some(stored) = self.replay_or_guard::<T>(seq, name).await? {
             return Ok(stored);
         }
         let started = chrono::Utc::now().timestamp_millis();
@@ -380,7 +390,7 @@ impl DurableContext {
         Fut: Future<Output = Result<T>>,
     {
         let seq = self.next_seq();
-        if let Some(stored) = self.replay_or_guard::<T>(seq).await? {
+        if let Some(stored) = self.replay_or_guard::<T>(seq, &opts.name).await? {
             return Ok(stored);
         }
         // Run with retries; only the final result/error is observed, then
@@ -526,7 +536,10 @@ impl DurableContext {
             return Err(Error::app("select requires at least one branch"));
         }
         let seq = self.next_seq();
-        if let Some(stored) = self.replay_or_guard::<(usize, T)>(seq).await? {
+        if let Some(stored) = self
+            .replay_or_guard::<(usize, T)>(seq, "DBOS.select")
+            .await?
+        {
             return Ok(stored);
         }
         let started = chrono::Utc::now().timestamp_millis();
@@ -551,16 +564,32 @@ impl DurableContext {
 
     /// Shared step preamble: serve a replayed checkpoint if present, otherwise
     /// refuse to start fresh work on a `CANCELLED` workflow. `Ok(Some(v))` means
-    /// "return `v`"; `Ok(None)` means "proceed to run the closure".
-    async fn replay_or_guard<T: DeserializeOwned>(&self, seq: i32) -> Result<Option<T>> {
-        if let Some(outcome) = self
+    /// "return `v`"; `Ok(None)` means "proceed to run the closure". `expected`
+    /// is the operation now executing: a replay that finds a *different*
+    /// operation recorded at this position fails with
+    /// [`Error::UnexpectedStep`] — the workflow is non-deterministic, and the
+    /// stored checkpoint would be the wrong step's result.
+    async fn replay_or_guard<T: DeserializeOwned>(
+        &self,
+        seq: i32,
+        expected: &str,
+    ) -> Result<Option<T>> {
+        if let Some(rec) = self
             .provider
             .get_step_result(&self.workflow_id, seq)
             .await?
         {
+            if rec.name != expected {
+                return Err(Error::unexpected_step(
+                    &self.workflow_id,
+                    seq,
+                    expected,
+                    rec.name,
+                ));
+            }
             // A recorded failure replays as its error, so a failed step is not
             // re-run (and a non-deterministic step cannot succeed on replay).
-            return Ok(Some(outcome_value(outcome)?));
+            return Ok(Some(outcome_value(rec.outcome)?));
         }
         if let Some(status) = self.provider.get_workflow_status(&self.workflow_id).await? {
             if status.status == STATUS_CANCELLED {
@@ -684,7 +713,17 @@ impl DurableContext {
             .get_step_result(&self.workflow_id, seq)
             .await?
         {
-            Some(outcome) => outcome_value(outcome),
+            Some(rec) => {
+                if rec.name != "DBOS.sleep" {
+                    return Err(Error::unexpected_step(
+                        &self.workflow_id,
+                        seq,
+                        "DBOS.sleep",
+                        rec.name,
+                    ));
+                }
+                outcome_value(rec.outcome)
+            }
             None => {
                 let proposed = chrono::Utc::now()
                     + chrono::Duration::from_std(dur).unwrap_or_else(|_| chrono::Duration::zero());
@@ -717,7 +756,7 @@ impl DurableContext {
         topic: &str,
     ) -> Result<()> {
         let seq = self.next_seq();
-        if let Some(_done) = self.replay_or_guard::<Value>(seq).await? {
+        if let Some(_done) = self.replay_or_guard::<Value>(seq, "DBOS.send").await? {
             return Ok(());
         }
         self.provider
@@ -744,7 +783,7 @@ impl DurableContext {
         let seq = self.next_seq();
         let deadline_seq = self.next_seq();
 
-        if let Some(stored) = self.replay_or_guard::<Option<T>>(seq).await? {
+        if let Some(stored) = self.replay_or_guard::<Option<T>>(seq, "DBOS.recv").await? {
             return Ok(stored);
         }
 
@@ -796,7 +835,7 @@ impl DurableContext {
     /// read it with `get_event`.
     pub async fn set_event<T: Serialize>(&self, key: &str, value: T) -> Result<()> {
         let seq = self.next_seq();
-        if let Some(_done) = self.replay_or_guard::<Value>(seq).await? {
+        if let Some(_done) = self.replay_or_guard::<Value>(seq, "DBOS.setEvent").await? {
             return Ok(());
         }
         self.provider
@@ -828,7 +867,10 @@ impl DurableContext {
         let seq = self.next_seq();
         let deadline_seq = self.next_seq();
 
-        if let Some(stored) = self.replay_or_guard::<Option<T>>(seq).await? {
+        if let Some(stored) = self
+            .replay_or_guard::<Option<T>>(seq, "DBOS.getEvent")
+            .await?
+        {
             return Ok(stored);
         }
 
@@ -888,7 +930,11 @@ impl DurableContext {
     /// on replay (at-least-once).
     pub async fn write_stream<T: Serialize>(&self, key: &str, value: T) -> Result<()> {
         let seq = self.next_seq();
-        if self.replay_or_guard::<Value>(seq).await?.is_some() {
+        if self
+            .replay_or_guard::<Value>(seq, "DBOS.writeStream")
+            .await?
+            .is_some()
+        {
             return Ok(());
         }
         self.provider
@@ -918,7 +964,11 @@ impl DurableContext {
     /// errors.
     pub async fn close_stream(&self, key: &str) -> Result<()> {
         let seq = self.next_seq();
-        if self.replay_or_guard::<Value>(seq).await?.is_some() {
+        if self
+            .replay_or_guard::<Value>(seq, "DBOS.closeStream")
+            .await?
+            .is_some()
+        {
             return Ok(());
         }
         self.provider
