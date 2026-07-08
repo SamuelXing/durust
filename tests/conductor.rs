@@ -246,6 +246,77 @@ async fn conductor_handles_workflow_management() -> Result<()> {
     Ok(())
 }
 
+/// A conductor `resume` carrying `queue_name` re-enqueues the resumed workflow
+/// onto that named queue (the reference conductor's resume queue option). No
+/// dispatcher listens on the queue, so the row sits `ENQUEUED` there — proving
+/// the queue option reached the row through the conductor path.
+#[tokio::test]
+async fn conductor_resume_routes_to_named_queue() -> Result<()> {
+    use durust::{StateProvider, WorkflowStatus, STATUS_PENDING};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let resume = exchange(
+            &mut ws,
+            json!({"type":"resume","request_id":"r","workflow_ids":["wf-r"],
+                   "queue_name":"cond-resume-q"}),
+        )
+        .await;
+        let row = exchange(
+            &mut ws,
+            json!({"type":"get_workflow","request_id":"rg","workflow_id":"wf-r"}),
+        )
+        .await;
+        (resume, row)
+    });
+
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("bounce", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n + 1)
+    });
+    let engine = Arc::new(engine);
+    engine.launch().await?;
+
+    // Seed a cancelled (resumable) run. cond-resume-q has no dispatcher, so a
+    // resume onto it leaves the row ENQUEUED there for us to observe.
+    provider
+        .insert_workflow_status(WorkflowStatus::new(
+            "wf-r",
+            "bounce",
+            json!(41),
+            STATUS_PENDING,
+            "",
+            engine.app_version(),
+        ))
+        .await?;
+    engine.cancel_workflow("wf-r").await?;
+
+    let conductor = Conductor::start(
+        engine.clone(),
+        ConductorConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            api_key: "k".into(),
+            app_name: "app".into(),
+            executor_metadata: None,
+            alert_handler: None,
+        },
+    )?;
+
+    let (resume, row) = server.await.unwrap();
+    assert_eq!(resume["success"], true);
+    assert_eq!(row["output"]["WorkflowUUID"], "wf-r");
+    assert_eq!(row["output"]["Status"], "ENQUEUED");
+    assert_eq!(row["output"]["QueueName"], "cond-resume-q");
+
+    conductor.shutdown(Duration::from_secs(2)).await?;
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn conductor_handles_schedule_management() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
