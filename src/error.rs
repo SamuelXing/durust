@@ -25,6 +25,9 @@ pub enum ErrorCode {
     QueueDeduplicated,
     /// The workflow was cancelled; execution was refused.
     WorkflowCancelled,
+    /// Two workflows were registered under the same name (or configured-instance
+    /// key) when building the engine.
+    ConflictingRegistration,
     /// A blocking operation or workflow deadline elapsed.
     Timeout,
     /// A replay found a different step recorded at this position — the
@@ -76,6 +79,12 @@ pub enum Error {
     /// The workflow was cancelled by an operator; execution was refused.
     #[error("workflow `{0}` was cancelled")]
     Cancelled(String),
+
+    /// Two workflows were registered under the same name (or configured-instance
+    /// key) when building the engine — the name→function registry must be
+    /// unambiguous for recovery to re-dispatch correctly.
+    #[error("workflow name `{0}` is registered more than once")]
+    ConflictingRegistration(String),
 
     /// A blocking operation (recv/get_event/get_result) or a workflow deadline
     /// elapsed before completion.
@@ -137,6 +146,11 @@ impl Error {
         Error::NonExistentWorkflow(id.into())
     }
 
+    /// Construct a [`Error::ConflictingRegistration`] for a duplicate name.
+    pub fn conflicting_registration(name: impl Into<String>) -> Self {
+        Error::ConflictingRegistration(name.into())
+    }
+
     /// Construct a [`Error::QueueDeduplicated`] for a rejected enqueue.
     pub fn queue_deduplicated(queue_name: impl Into<String>, dedup_id: impl Into<String>) -> Self {
         Error::QueueDeduplicated {
@@ -172,6 +186,7 @@ impl Error {
             Error::NonExistentWorkflow(_) => ErrorCode::NonExistentWorkflow,
             Error::QueueDeduplicated { .. } => ErrorCode::QueueDeduplicated,
             Error::Cancelled(_) => ErrorCode::WorkflowCancelled,
+            Error::ConflictingRegistration(_) => ErrorCode::ConflictingRegistration,
             Error::Timeout => ErrorCode::Timeout,
             Error::UnexpectedStep { .. } => ErrorCode::UnexpectedStep,
             Error::App(_) | Error::Portable(_) => ErrorCode::Application,

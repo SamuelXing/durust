@@ -367,6 +367,162 @@ pub struct DurableEngine {
     runtime: std::sync::OnceLock<Arc<Runtime>>,
 }
 
+/// Builds a [`DurableEngine`] with a complete, conflict-checked registry.
+///
+/// Obtained from [`DurableEngine::builder`] or [`DurableEngine::connect`].
+/// Collect all registrations, then call [`build`](Self::build) once. Registering
+/// is only possible on the builder — so, unlike the [`new`](DurableEngine::new) +
+/// `&mut` [`register`](DurableEngine::register) path, a registration after the
+/// engine is running cannot be expressed, and a duplicate name is a build-time
+/// [`Error::ConflictingRegistration`] instead of a silent overwrite.
+pub struct DurableEngineBuilder {
+    provider: Arc<dyn StateProvider>,
+    config: EngineConfig,
+    /// Explicit registrations in call order (keyed like the engine's map: plain
+    /// `name`, or `name/config` for a configured instance).
+    workflows: Vec<(String, WorkflowFn)>,
+    queues: Vec<WorkflowQueue>,
+    listen_filter: Option<std::collections::HashSet<String>>,
+    max_recovery_attempts: i32,
+}
+
+impl DurableEngineBuilder {
+    /// Register a workflow handler under `name`. See [`DurableEngine::register`].
+    pub fn register<I, O, F, Fut>(&mut self, name: &str, f: F) -> &mut Self
+    where
+        I: DeserializeOwned + Send + 'static,
+        O: Serialize + Send + 'static,
+        F: Fn(DurableContext, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<O>> + Send + 'static,
+    {
+        self.workflows.push((name.to_string(), erase(f)));
+        self
+    }
+
+    /// Register a configured-instance handler. See
+    /// [`DurableEngine::register_configured`].
+    pub fn register_configured<I, O, F, Fut>(
+        &mut self,
+        name: &str,
+        config_name: &str,
+        f: F,
+    ) -> &mut Self
+    where
+        I: DeserializeOwned + Send + 'static,
+        O: Serialize + Send + 'static,
+        F: Fn(DurableContext, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<O>> + Send + 'static,
+    {
+        self.workflows
+            .push((registry_key(name, Some(config_name)), erase(f)));
+        self
+    }
+
+    /// Register a durable queue. See [`DurableEngine::register_queue`].
+    pub fn register_queue(&mut self, queue: WorkflowQueue) -> &mut Self {
+        self.queues.push(queue);
+        self
+    }
+
+    /// Restrict which registered queues this process dispatches. See
+    /// [`DurableEngine::listen_queues`].
+    pub fn listen_queues<I, S>(&mut self, names: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.listen_filter = Some(names.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Set the application version (still overridden by `DBOS__APPVERSION`). See
+    /// [`EngineConfig`].
+    pub fn app_version(&mut self, version: impl Into<String>) -> &mut Self {
+        self.config.app_version = Some(version.into());
+        self
+    }
+
+    /// Set this process's executor id (still overridden by `DBOS__VMID`).
+    pub fn executor_id(&mut self, id: impl Into<String>) -> &mut Self {
+        self.config.executor_id = Some(id.into());
+        self
+    }
+
+    /// Set the recovery-attempt cap before a workflow is parked in
+    /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED` (default 100).
+    pub fn max_recovery_attempts(&mut self, max: i32) -> &mut Self {
+        self.max_recovery_attempts = max;
+        self
+    }
+
+    /// Initialize the backend and build the engine, collecting every
+    /// `#[durust::workflow]` in the binary plus the explicit registrations into
+    /// one registry. Errors with [`Error::ConflictingRegistration`] if any name
+    /// (or configured-instance key) is registered twice.
+    pub async fn build(self) -> Result<DurableEngine> {
+        let app_version = self.config.resolve_app_version();
+        let executor_id = self.config.resolve_executor_id();
+        self.provider.init().await?;
+
+        let mut workflows: HashMap<String, WorkflowFn> = HashMap::new();
+        let mut scheduled = Vec::new();
+        // Reserve the internal debouncer workflow first, so a user workflow
+        // colliding with its reserved name is rejected by the checks below
+        // rather than silently overwriting — or being overwritten by — it.
+        workflows.insert(
+            crate::debounce::DEBOUNCER_WF.to_string(),
+            erase(crate::debounce::internal_debouncer),
+        );
+        // Auto-registered `#[durust::workflow]`s.
+        for reg in inventory::iter::<WorkflowRegistration> {
+            if workflows
+                .insert(reg.name.to_string(), (reg.builder)())
+                .is_some()
+            {
+                return Err(Error::conflicting_registration(reg.name));
+            }
+            if let Some(spec) = reg.schedule {
+                scheduled.push((reg.name.to_string(), spec.to_string()));
+            }
+        }
+        // Explicit registrations — strict: no silent overwrite.
+        for (key, f) in self.workflows {
+            if workflows.insert(key.clone(), f).is_some() {
+                return Err(Error::conflicting_registration(key));
+            }
+        }
+
+        // Reserve the internal queue first, then add user queues strictly: a
+        // duplicate queue name — or a collision with the reserved internal
+        // queue that resume/fork/debouncer route through — is rejected, not
+        // silently merged.
+        let mut queues = HashMap::new();
+        queues.insert(INTERNAL_QUEUE.to_string(), Arc::new(internal_queue()));
+        for q in self.queues {
+            let name = q.name.clone();
+            if queues.insert(name.clone(), Arc::new(q)).is_some() {
+                return Err(Error::conflicting_registration(name));
+            }
+        }
+
+        Ok(DurableEngine {
+            provider: self.provider,
+            workflows,
+            queues,
+            listen_filter: self.listen_filter,
+            scheduled,
+            executor_id,
+            app_version,
+            max_recovery_attempts: self.max_recovery_attempts,
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            deactivated: Arc::new(AtomicBool::new(false)),
+            inflight: Arc::new(AtomicUsize::new(0)),
+            dispatchers: std::sync::Mutex::new(Vec::new()),
+            runtime: std::sync::OnceLock::new(),
+        })
+    }
+}
+
 impl DurableEngine {
     /// Create an engine with a generated executor id and a default app version.
     ///
@@ -437,6 +593,70 @@ impl DurableEngine {
             dispatchers: std::sync::Mutex::new(Vec::new()),
             runtime: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Start building an engine over `provider`, sealing registration behind
+    /// [`build`](DurableEngineBuilder::build).
+    ///
+    /// This is the recommended construction path. Unlike [`new`](Self::new) +
+    /// [`register`](Self::register), the builder collects every registration up
+    /// front and `build()` rejects a duplicate workflow name with
+    /// [`Error::ConflictingRegistration`] — so an ambiguous name→function
+    /// registry (which recovery cannot dispatch correctly) is a build-time error
+    /// rather than a silent last-writer-wins overwrite. Every
+    /// `#[durust::workflow]` in the binary is collected automatically, as with
+    /// [`new`](Self::new).
+    ///
+    /// ```no_run
+    /// # use durust::{DurableEngine, PostgresProvider};
+    /// # async fn f() -> durust::Result<()> {
+    /// # let provider = std::sync::Arc::new(PostgresProvider::connect("postgres://localhost/db").await?);
+    /// let mut b = DurableEngine::builder(provider);
+    /// b.app_version("1.2.0");
+    /// let engine = b.build().await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn builder(provider: Arc<dyn StateProvider>) -> DurableEngineBuilder {
+        DurableEngineBuilder {
+            provider,
+            config: EngineConfig::default(),
+            workflows: Vec::new(),
+            queues: Vec::new(),
+            listen_filter: None,
+            max_recovery_attempts: 100,
+        }
+    }
+
+    /// Connect to a state backend from a URL and return a [builder](DurableEngineBuilder).
+    ///
+    /// The scheme selects the provider: `postgres://…` / `postgresql://…` →
+    /// [`PostgresProvider`](crate::PostgresProvider), `sqlite://…` /
+    /// `sqlite::memory:` → [`SqliteProvider`](crate::SqliteProvider), and
+    /// `memory:` / `memory://` → [`InMemoryProvider`](crate::InMemoryProvider).
+    /// For a custom pool or system-DB schema, construct the provider yourself and
+    /// use [`builder`](Self::builder).
+    ///
+    /// ```no_run
+    /// # use durust::DurableEngine;
+    /// # async fn f() -> durust::Result<()> {
+    /// let engine = DurableEngine::connect("postgres://localhost/db").await?.build().await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn connect(url: &str) -> Result<DurableEngineBuilder> {
+        let provider: Arc<dyn StateProvider> =
+            if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+                Arc::new(crate::PostgresProvider::connect(url).await?)
+            } else if url.starts_with("sqlite:") {
+                Arc::new(crate::SqliteProvider::connect(url).await?)
+            } else if url == "memory:" || url == "memory://" {
+                Arc::new(crate::InMemoryProvider::new())
+            } else {
+                return Err(crate::error::Error::app(format!(
+                    "unrecognized state-backend URL scheme in `{url}` \
+                 (expected postgres://, sqlite://, or memory:)"
+                )));
+            };
+        Ok(Self::builder(provider))
     }
 
     /// The shared execution core, built once from the current registrations.
