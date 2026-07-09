@@ -38,9 +38,14 @@ use tokio::task::JoinHandle;
 ///   post-restart waits.
 ///
 /// [`clone`](Clone::clone) is cheap and yields another handle to the *same*
-/// workflow. The local task can only be awaited once, so whichever clone
-/// resolves first consumes it; the others fall back to durable polling (the
-/// owning task persists its terminal status, so they still observe the result).
+/// workflow. The in-process task can be awaited only once, so whichever clone
+/// resolves first consumes it and the rest fall back to polling the persisted
+/// status. Every normal outcome — success, error, cancellation, timeout — is
+/// written to that status before the task returns, so all clones observe the
+/// same result. A *panicking* workflow is the exception: the clone that owns
+/// the task surfaces the panic as an error, while the others poll a status the
+/// panic never wrote and keep waiting until the run is recovered. (Idiomatic
+/// failures return `Err`, which is terminal, so this affects only real panics.)
 pub struct WorkflowHandle<O> {
     id: String,
     provider: Arc<dyn StateProvider>,
