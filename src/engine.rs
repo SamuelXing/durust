@@ -466,7 +466,14 @@ impl DurableEngineBuilder {
 
         let mut workflows: HashMap<String, WorkflowFn> = HashMap::new();
         let mut scheduled = Vec::new();
-        // Auto-registered `#[durust::workflow]`s first.
+        // Reserve the internal debouncer workflow first, so a user workflow
+        // colliding with its reserved name is rejected by the checks below
+        // rather than silently overwriting — or being overwritten by — it.
+        workflows.insert(
+            crate::debounce::DEBOUNCER_WF.to_string(),
+            erase(crate::debounce::internal_debouncer),
+        );
+        // Auto-registered `#[durust::workflow]`s.
         for reg in inventory::iter::<WorkflowRegistration> {
             if workflows
                 .insert(reg.name.to_string(), (reg.builder)())
@@ -484,16 +491,18 @@ impl DurableEngineBuilder {
                 return Err(Error::conflicting_registration(key));
             }
         }
-        // The internal debouncer workflow is always available (reserved name).
-        workflows.insert(
-            crate::debounce::DEBOUNCER_WF.to_string(),
-            erase(crate::debounce::internal_debouncer),
-        );
 
+        // Reserve the internal queue first, then add user queues strictly: a
+        // duplicate queue name — or a collision with the reserved internal
+        // queue that resume/fork/debouncer route through — is rejected, not
+        // silently merged.
         let mut queues = HashMap::new();
         queues.insert(INTERNAL_QUEUE.to_string(), Arc::new(internal_queue()));
         for q in self.queues {
-            queues.insert(q.name.clone(), Arc::new(q));
+            let name = q.name.clone();
+            if queues.insert(name.clone(), Arc::new(q)).is_some() {
+                return Err(Error::conflicting_registration(name));
+            }
         }
 
         Ok(DurableEngine {

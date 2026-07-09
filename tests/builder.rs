@@ -1,8 +1,11 @@
 //! The `DurableEngineBuilder` construction path: it builds a working engine,
-//! seals registration (duplicate names are a build-time error), and
+//! seals registration (duplicate workflow *and* queue names — plus collisions
+//! with the reserved internal names — are a build-time error), and
 //! `DurableEngine::connect` scheme-dispatches a provider from a URL.
 
-use durust::{DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, Result};
+use durust::{
+    DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, Result, WorkflowQueue,
+};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -73,6 +76,55 @@ async fn builder_configured_instances_do_not_conflict() -> Result<()> {
     });
     let Err(err) = b2.build().await else {
         panic!("same config twice must error");
+    };
+    assert_eq!(err.code(), ErrorCode::ConflictingRegistration);
+    Ok(())
+}
+
+/// Registering two queues under the same name is a build-time
+/// `ConflictingRegistration`, not a silent last-writer-wins overwrite —
+/// mirroring the guarantee already in place for workflows.
+#[tokio::test]
+async fn builder_rejects_duplicate_queue_names() -> Result<()> {
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut b = DurableEngine::builder(provider);
+    b.register_queue(WorkflowQueue::new("orders"));
+    b.register_queue(WorkflowQueue::new("orders"));
+    let Err(err) = b.build().await else {
+        panic!("duplicate queue name must error");
+    };
+    assert_eq!(err.code(), ErrorCode::ConflictingRegistration);
+    assert!(err.to_string().contains("orders"));
+    Ok(())
+}
+
+/// A user queue that collides with the reserved internal queue name is
+/// rejected — otherwise it would silently replace the queue that
+/// resume/fork/debouncer route through.
+#[tokio::test]
+async fn builder_rejects_reserved_queue_name() -> Result<()> {
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut b = DurableEngine::builder(provider);
+    b.register_queue(WorkflowQueue::new("_dbos_internal_queue"));
+    let Err(err) = b.build().await else {
+        panic!("reserved queue name must error");
+    };
+    assert_eq!(err.code(), ErrorCode::ConflictingRegistration);
+    Ok(())
+}
+
+/// A user workflow that collides with the reserved internal debouncer name is
+/// rejected rather than silently shadowed by (or shadowing) the built-in.
+#[tokio::test]
+async fn builder_rejects_reserved_debouncer_workflow_name() -> Result<()> {
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut b = DurableEngine::builder(provider);
+    b.register(
+        "_dbos_debouncer",
+        |_ctx: DurableContext, _: ()| async move { Ok::<_, Error>(()) },
+    );
+    let Err(err) = b.build().await else {
+        panic!("reserved workflow name must error");
     };
     assert_eq!(err.code(), ErrorCode::ConflictingRegistration);
     Ok(())
