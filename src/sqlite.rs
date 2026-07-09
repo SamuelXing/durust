@@ -42,12 +42,19 @@ pub struct SqliteProvider {
 
 impl SqliteProvider {
     /// Connect using a sqlx SQLite URL, e.g. `sqlite://durust.db` (created if
-    /// missing) or `sqlite::memory:`. Foreign keys are enabled on every
-    /// connection, as the schema's `ON DELETE CASCADE` relationships require.
+    /// missing) or `sqlite::memory:`. Every connection is configured for
+    /// write-heavy concurrent use: foreign keys on (the schema's `ON DELETE
+    /// CASCADE` relationships require them), WAL journaling (concurrent reads
+    /// alongside writes; the setting is database-wide and sticks),
+    /// `synchronous = NORMAL` (safe under WAL, much faster than `FULL`), and a
+    /// 5s busy timeout so writers block on lock conflicts instead of failing.
     pub async fn connect(database_url: &str) -> Result<Self> {
         let opts = SqliteConnectOptions::from_str(database_url)?
             .create_if_missing(true)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+            .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(opts)

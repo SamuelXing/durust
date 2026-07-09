@@ -2882,3 +2882,180 @@ async fn sqlite_renamed_transaction_fails_as_unexpected_step() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// Mid-flight recovery of a transaction step: a workflow that crashed AFTER
+/// its transaction committed (checkpoint written, row still PENDING) must, on
+/// recovery, replay the recorded outcome without re-running the body — the
+/// exactly-once guarantee for a transaction's writes across a process crash.
+#[tokio::test]
+async fn sqlite_transaction_replays_on_recovery_without_rerunning_body() -> Result<()> {
+    use durust::{params, StateProvider, TxBody, WorkflowStatus, STATUS_PENDING};
+    static TX_RUNS: AtomicUsize = AtomicUsize::new(0);
+    let (url, path) = temp_db_url("txn-recover");
+
+    let provider = Arc::new(SqliteProvider::connect(&url).await?);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("txrec", |ctx: DurableContext, _: ()| async move {
+        ctx.transaction_with(TransactionOptions::new("tx-a"), |tx| {
+            Box::pin(async move {
+                tx.execute("SELECT 1", &params![]).await?;
+                TX_RUNS.fetch_add(1, Ordering::SeqCst);
+                Ok(7_i64)
+            })
+        })
+        .await
+    });
+    engine.launch().await?;
+
+    // Simulate the crash window: the workflow row exists (PENDING) and the
+    // transaction step's outcome is committed, but the workflow never finished.
+    let id = "wf-txrec";
+    provider
+        .insert_workflow_status(WorkflowStatus::new(
+            id,
+            "txrec",
+            serde_json::Value::Null,
+            STATUS_PENDING,
+            "",
+            engine.app_version(),
+        ))
+        .await?;
+    let body: TxBody = Box::new(|tx| {
+        Box::pin(async move {
+            tx.execute("SELECT 1", &params![]).await?;
+            TX_RUNS.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!(7))
+        })
+    });
+    let committed = provider
+        .run_transaction_step(
+            id,
+            0,
+            chrono::Utc::now().timestamp_millis(),
+            &TransactionOptions::new("tx-a"),
+            body,
+        )
+        .await?;
+    assert_eq!(committed, serde_json::json!(7));
+    assert_eq!(TX_RUNS.load(Ordering::SeqCst), 1, "the body ran once");
+
+    // Recovery re-runs the PENDING workflow from its checkpoints: the
+    // transaction replays its recorded outcome, the body does not run again.
+    let recovered = engine.recover().await?;
+    assert!(recovered >= 1, "the seeded PENDING workflow was recovered");
+    let mut h = engine.retrieve_workflow::<i64>(id).await?;
+    assert_eq!(h.get_result().await?, 7);
+    assert_eq!(
+        TX_RUNS.load(Ordering::SeqCst),
+        1,
+        "the transaction body must not re-run on recovery"
+    );
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// System-DB shape after `init()`: every schema table exists, the migration
+/// ledger is populated, WAL journaling is on, the provider's own connections
+/// enforce foreign keys, and a re-open + re-init is idempotent (no error, no
+/// data loss, no re-applied migrations).
+#[tokio::test]
+async fn sqlite_schema_migrations_and_pragmas() -> Result<()> {
+    use durust::{params, StateProvider, TxBody, WorkflowStatus, STATUS_PENDING};
+    let (url, path) = temp_db_url("schema");
+
+    let provider = SqliteProvider::connect(&url).await?;
+    provider.init().await?;
+
+    // Every schema table (plus sqlx's migration ledger) exists.
+    let pool = sqlx::SqlitePool::connect(&url).await?;
+    let tables: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .fetch_all(&pool)
+            .await?;
+    for t in [
+        "workflow_status",
+        "operation_outputs",
+        "notifications",
+        "workflow_events",
+        "workflow_events_history",
+        "streams",
+        "event_dispatch_kv",
+        "queues",
+        "workflow_schedules",
+        "application_versions",
+        "_sqlx_migrations",
+    ] {
+        assert!(tables.iter().any(|n| n == t), "missing table `{t}`");
+    }
+
+    // The migration ledger recorded every applied migration, all successful.
+    let (applied, ok): (i64, i64) =
+        sqlx::query_as("SELECT COUNT(*), SUM(success) FROM _sqlx_migrations")
+            .fetch_one(&pool)
+            .await?;
+    assert!(
+        applied > 30,
+        "expected the full migration set, got {applied}"
+    );
+    assert_eq!(applied, ok, "every migration recorded success");
+
+    // WAL journaling is set (persistent, so any connection observes it).
+    let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(mode.to_lowercase(), "wal");
+    pool.close().await;
+
+    // Foreign keys are enforced on the PROVIDER's own connections (a
+    // per-connection pragma, so it must be asserted through the provider). A
+    // transaction body runs on the provider pool.
+    provider
+        .insert_workflow_status(WorkflowStatus::new(
+            "wf-pragma",
+            "probe",
+            serde_json::Value::Null,
+            STATUS_PENDING,
+            "",
+            "v-schema",
+        ))
+        .await?;
+    let body: TxBody = Box::new(|tx| {
+        Box::pin(async move {
+            let row = tx.query_one("PRAGMA foreign_keys", &params![]).await?;
+            Ok(serde_json::json!(row.get::<i64>("foreign_keys")))
+        })
+    });
+    let fk = provider
+        .run_transaction_step(
+            "wf-pragma",
+            0,
+            chrono::Utc::now().timestamp_millis(),
+            &durust::TransactionOptions::new("pragma-probe"),
+            body,
+        )
+        .await?;
+    assert_eq!(fk, serde_json::json!(1), "provider connections enforce FKs");
+
+    // Re-open + re-init: idempotent, nothing re-applied, data intact.
+    drop(provider);
+    let reopened = SqliteProvider::connect(&url).await?;
+    reopened.init().await?;
+    let pool = sqlx::SqlitePool::connect(&url).await?;
+    let applied_again: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        applied_again, applied,
+        "re-init must not re-apply migrations"
+    );
+    assert!(
+        reopened.get_workflow_status("wf-pragma").await?.is_some(),
+        "existing data survives a re-open + re-init"
+    );
+    pool.close().await;
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}

@@ -835,3 +835,78 @@ async fn client_resume_missing_and_completed() -> Result<()> {
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
+
+/// A client enqueue persists the full options surface: an initial `DELAYED`
+/// status with `delay_until` set, the workflow timeout, and the auth identity
+/// — and a timed workflow can be cancelled while it waits.
+#[tokio::test]
+async fn client_enqueue_persists_delay_timeout_and_auth() -> Result<()> {
+    use durust::StateProvider;
+    let provider = Arc::new(InMemoryProvider::new());
+    let client = Client::new(provider.clone());
+
+    let before = chrono::Utc::now().timestamp_millis();
+    let opts = WorkflowOptions {
+        workflow_id: Some("opt-1".to_string()),
+        delay: Some(Duration::from_secs(60)),
+        timeout: Some(Duration::from_secs(120)),
+        ..WorkflowOptions::default()
+            .authenticated_user("alice")
+            .assumed_role("operator")
+            .authenticated_roles(["admin"])
+    };
+    client.enqueue::<_, ()>("q", "job", (), opts).await?;
+
+    let row = provider.get_workflow_status("opt-1").await?.unwrap();
+    assert_eq!(row.status, "DELAYED", "a delayed enqueue starts DELAYED");
+    let until = row.delay_until_ms.expect("delay_until persisted");
+    assert!(
+        until >= before + 59_000 && until <= before + 61_500,
+        "delay_until ≈ now + 60s (got {} vs now {})",
+        until,
+        before
+    );
+    assert_eq!(row.timeout_ms, Some(120_000), "timeout persisted");
+    assert_eq!(row.authenticated_user.as_deref(), Some("alice"));
+    assert_eq!(row.assumed_role.as_deref(), Some("operator"));
+    assert_eq!(row.authenticated_roles, ["admin"]);
+
+    // A waiting timed workflow can be cancelled outright.
+    client.cancel_workflow("opt-1").await?;
+    let row = provider.get_workflow_status("opt-1").await?.unwrap();
+    assert_eq!(row.status, "CANCELLED");
+    Ok(())
+}
+
+/// Cancel → resume of a DELAYED workflow bypasses the remaining delay: resume
+/// re-queues it onto the internal queue, so it runs promptly instead of
+/// waiting out the original `delay_until`.
+#[tokio::test]
+async fn client_delayed_cancel_then_resume_bypasses_delay() -> Result<()> {
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("late", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n * 2)
+    });
+    engine.register_queue(WorkflowQueue::new("q"));
+    engine.launch().await?;
+
+    let client = Client::new(provider.clone());
+    let opts = WorkflowOptions {
+        workflow_id: Some("late-1".to_string()),
+        delay: Some(Duration::from_secs(3600)),
+        ..Default::default()
+    };
+    client.enqueue::<_, i64>("q", "late", 21i64, opts).await?;
+    client.cancel_workflow("late-1").await?;
+
+    let started = std::time::Instant::now();
+    let mut h = client.resume_workflow::<i64>("late-1").await?;
+    assert_eq!(h.get_result().await?, 42);
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the resumed run must not wait out the original 1h delay"
+    );
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
