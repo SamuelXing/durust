@@ -2,29 +2,67 @@ use crate::error::{Error, Result};
 use crate::provider::{is_terminal, StateProvider, WorkflowStatus, STATUS_CANCELLED, STATUS_ERROR};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::future::{Future, IntoFuture};
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
 /// A reference to a workflow execution.
 ///
-/// Returned by [`crate::DurableEngine::run_workflow`] (and, later,
-/// `enqueue` / `retrieve_workflow`). It lets the caller await the workflow's
-/// result without blocking the call that started it.
+/// Returned by [`crate::DurableEngine::run_workflow`], `enqueue`, and
+/// `retrieve_workflow`. It lets the caller observe the workflow's result
+/// without blocking the call that started it.
 ///
-/// Two flavors:
-/// - **Local**: started on this process, so we hold its [`JoinHandle`] and
-///   `get_result` awaits the task directly.
+/// Await it directly for the typed output, or share it:
+///
+/// ```no_run
+/// # use durust::{DurableEngine, WorkflowHandle, Result};
+/// # async fn f(engine: &DurableEngine) -> Result<()> {
+/// let handle: WorkflowHandle<i64> = engine.run_workflow("add", 1_i64, Default::default()).await?;
+/// let observer = handle.clone();          // hand a copy to another task
+/// let total: i64 = handle.await?;         // or `handle.result().await?`
+/// # let _ = observer;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Two flavors, transparent to the caller:
+/// - **Local**: started on this process, so the handle holds the task's
+///   [`JoinHandle`] and awaits it directly (lowest latency, and a panicking
+///   task surfaces as an error rather than hanging).
 /// - **Polling**: obtained for a workflow running elsewhere (or already
-///   persisted); `get_result` polls the status row until it reaches a terminal
-///   state. This is how DBOS handles cross-process / post-restart waits.
+///   persisted); the result is observed by polling the status row until it
+///   reaches a terminal state. This is how DBOS handles cross-process /
+///   post-restart waits.
+///
+/// [`clone`](Clone::clone) is cheap and yields another handle to the *same*
+/// workflow. The local task can only be awaited once, so whichever clone
+/// resolves first consumes it; the others fall back to durable polling (the
+/// owning task persists its terminal status, so they still observe the result).
 pub struct WorkflowHandle<O> {
     id: String,
     provider: Arc<dyn StateProvider>,
-    join: Option<JoinHandle<Result<Value>>>,
+    // Shared so a handle stays `Clone`. The local task can be awaited only once;
+    // the first resolver `take`s it and the rest poll the persisted status.
+    join: Arc<Mutex<Option<JoinHandle<Result<Value>>>>>,
     poll_interval: Duration,
-    _marker: PhantomData<O>,
+    // `fn() -> O` keeps the handle `Send + Sync` regardless of `O` (it never
+    // holds an `O` — the output is deserialized on demand).
+    _marker: PhantomData<fn() -> O>,
+}
+
+impl<O> Clone for WorkflowHandle<O> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            provider: self.provider.clone(),
+            join: self.join.clone(),
+            poll_interval: self.poll_interval,
+            _marker: PhantomData,
+        }
+    }
 }
 
 impl<O> WorkflowHandle<O> {
@@ -37,7 +75,7 @@ impl<O> WorkflowHandle<O> {
         Self {
             id,
             provider,
-            join: Some(join),
+            join: Arc::new(Mutex::new(Some(join))),
             poll_interval: Duration::from_millis(100),
             _marker: PhantomData,
         }
@@ -49,7 +87,7 @@ impl<O> WorkflowHandle<O> {
         Self {
             id,
             provider,
-            join: None,
+            join: Arc::new(Mutex::new(None)),
             poll_interval: Duration::from_millis(100),
             _marker: PhantomData,
         }
@@ -72,13 +110,21 @@ impl<O> WorkflowHandle<O> {
 impl<O: DeserializeOwned> WorkflowHandle<O> {
     /// Wait for the workflow to finish and return its typed output.
     ///
-    /// For a local handle this awaits the in-process task. For a polling handle
-    /// it reads the status row every `poll_interval` until the workflow reaches a
-    /// terminal state, then deserializes the stored output. A `CANCELLED`
-    /// workflow yields [`Error::Cancelled`]; an `ERROR` workflow yields the
-    /// recorded application error.
-    pub async fn get_result(&mut self) -> Result<O> {
-        if let Some(join) = self.join.take() {
+    /// For a local handle this awaits the in-process task the first time it is
+    /// called; for a polling handle (or a clone whose sibling already consumed
+    /// the task) it reads the status row every `poll_interval` until the
+    /// workflow reaches a terminal state, then deserializes the stored output.
+    /// A `CANCELLED` workflow yields [`Error::Cancelled`]; an `ERROR` workflow
+    /// yields the recorded application error.
+    pub async fn result(&self) -> Result<O> {
+        // Claim the in-process task exactly once. The guard is a temporary of
+        // this statement, so it is dropped here — never held across the await.
+        let owned = self
+            .join
+            .lock()
+            .expect("workflow handle mutex poisoned")
+            .take();
+        if let Some(join) = owned {
             // Own the task: await it directly, surfacing panics as errors.
             return match join.await {
                 Ok(res) => {
@@ -89,9 +135,9 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
             };
         }
 
-        // No task: poll the status row until terminal. A polling handle may name
-        // a workflow that does not exist yet (e.g. a debounced run the collector
-        // has not started); treat that as "not ready" and keep waiting.
+        // No task to await: poll the status row until terminal. A polling handle
+        // may name a workflow that does not exist yet (e.g. a debounced run the
+        // collector has not started); treat that as "not ready" and keep waiting.
         loop {
             match self.get_status().await {
                 Ok(status) if is_terminal(&status.status) => {
@@ -102,6 +148,15 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
             }
             tokio::time::sleep(self.poll_interval).await;
         }
+    }
+
+    /// Wait for the workflow to finish and return its typed output.
+    ///
+    /// Prefer [`result`](Self::result), which takes `&self`. This `&mut`
+    /// spelling is retained so existing callers keep compiling; it simply
+    /// delegates.
+    pub async fn get_result(&mut self) -> Result<O> {
+        self.result().await
     }
 
     /// Convert a terminal status row into a typed `Result`.
@@ -124,5 +179,16 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
                 Ok(serde_json::from_value(output)?)
             }
         }
+    }
+}
+
+/// `handle.await` resolves to the workflow's typed output — sugar for
+/// [`result`](WorkflowHandle::result) that consumes the handle.
+impl<O: DeserializeOwned + 'static> IntoFuture for WorkflowHandle<O> {
+    type Output = Result<O>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Result<O>> + Send>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move { self.result().await })
     }
 }
