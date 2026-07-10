@@ -354,9 +354,22 @@ pub fn transaction(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     };
     let tx_ty = &*tx_pt.ty;
-    // The caller's arguments are everything after `ctx` and `tx`; each is
-    // re-cloned per attempt so the `Fn` body can move its own copy in.
-    let arg_idents: Vec<&Ident> = inputs[2..].iter().filter_map(|a| param_ident(a)).collect();
+    // The caller's arguments are everything after `ctx` and `tx`. Each must be a
+    // plain `name: Ty` binding so it can be re-cloned per attempt; a destructured
+    // arg couldn't be, and would silently make the body `FnOnce` — a confusing
+    // "expected `Fn`" error far from the cause — so reject it cleanly here.
+    let mut arg_idents: Vec<&Ident> = Vec::new();
+    for &arg in &inputs[2..] {
+        let Some(id) = param_ident(arg) else {
+            return syn::Error::new_spanned(
+                arg,
+                "arguments of a `#[transaction]` fn must be plain `name: Ty` bindings",
+            )
+            .to_compile_error()
+            .into();
+        };
+        arg_idents.push(id);
+    }
 
     // The public signature drops `tx` (index 1) — the runtime supplies it.
     let mut sig = func.sig.clone();
