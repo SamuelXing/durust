@@ -92,6 +92,12 @@ pub use tx::{IsolationLevel, Param, Row, TransactionOptions, Tx, TxBody};
 /// auto-registered with every [`DurableEngine`] in the binary.
 pub use durust_macros::workflow;
 
+/// The `#[step]` attribute macro. Annotate an
+/// `async fn(&DurableContext, args..) -> Result<T>` to have its body run as a
+/// durable [`DurableContext::step`] — checkpointed once, replayed thereafter —
+/// so it reads like an ordinary async call.
+pub use durust_macros::step;
+
 /// Re-exported so the `#[workflow]` macro can reference `durust::inventory::*`
 /// from user crates without them depending on `inventory` directly.
 #[doc(hidden)]
