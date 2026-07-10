@@ -89,7 +89,7 @@ async fn step_retries_exhausted_propagates_error() -> Result<()> {
     });
 
     let res: Result<()> = engine.start_typed("always_fails", "wf-fail", ()).await;
-    assert!(matches!(res, Err(Error::App(ref m)) if m == "boom"));
+    assert!(matches!(res, Err(Error::App { ref message, .. }) if message == "boom"));
     Ok(())
 }
 
