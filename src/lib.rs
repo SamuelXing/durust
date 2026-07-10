@@ -98,6 +98,12 @@ pub use durust_macros::workflow;
 /// so it reads like an ordinary async call.
 pub use durust_macros::step;
 
+/// The `#[transaction]` attribute macro. Annotate an
+/// `async fn(&DurableContext, &mut Tx, args..) -> Result<T>` to have its body
+/// run as a durable [`DurableContext::transaction`] — the SQL writes and the
+/// checkpoint commit atomically — without the `|tx| Box::pin(..)` wrapper.
+pub use durust_macros::transaction;
+
 /// Re-exported so the `#[workflow]` macro can reference `durust::inventory::*`
 /// from user crates without them depending on `inventory` directly.
 #[doc(hidden)]
