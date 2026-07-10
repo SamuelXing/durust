@@ -109,9 +109,16 @@ pub enum Error {
         recorded: String,
     },
 
-    /// An error raised by user code inside a step or workflow.
-    #[error("{0}")]
-    App(String),
+    /// An error raised by user code inside a step or workflow, with an optional
+    /// underlying `source` so `{:?}` and error-reporting tools can walk the
+    /// cause chain. The `source` is a live, in-process detail — a checkpointed
+    /// error stores only its `message`, so the chain does not survive a replay.
+    #[error("{message}")]
+    App {
+        message: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    },
 
     /// A structured, cross-language error raised by user code: a type/class
     /// `name`, a human `message`, and optional app-level `code`/`data`. Under
@@ -126,7 +133,24 @@ pub enum Error {
 impl Error {
     /// Construct an application-level error from anything string-like.
     pub fn app(msg: impl Into<String>) -> Self {
-        Error::App(msg.into())
+        Error::App {
+            message: msg.into(),
+            source: None,
+        }
+    }
+
+    /// Like [`app`](Self::app), but keeping an underlying error as the
+    /// [`source`](std::error::Error::source) so `{:?}` and error-reporting tools
+    /// can walk the cause chain — instead of flattening it into the message.
+    /// Only the message is persisted on a checkpoint; the source is in-process.
+    pub fn app_source(
+        msg: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Error::App {
+            message: msg.into(),
+            source: Some(Box::new(source)),
+        }
     }
 
     /// Construct a structured cross-language error with a type `name` and a
@@ -189,7 +213,7 @@ impl Error {
             Error::ConflictingRegistration(_) => ErrorCode::ConflictingRegistration,
             Error::Timeout => ErrorCode::Timeout,
             Error::UnexpectedStep { .. } => ErrorCode::UnexpectedStep,
-            Error::App(_) | Error::Portable(_) => ErrorCode::Application,
+            Error::App { .. } | Error::Portable(_) => ErrorCode::Application,
         }
     }
 
@@ -285,6 +309,23 @@ mod tests {
         assert!(!e.is_retryable());
         assert!(!e.is_unique_violation());
         assert!(!e.is_foreign_key_violation());
+    }
+
+    #[test]
+    fn app_source_exposes_the_cause_chain() {
+        use std::error::Error as _;
+        let cause = std::io::Error::other("disk gone");
+        let err = Error::app_source("save failed", cause);
+        // Display is the message; the code is still Application.
+        assert_eq!(err.to_string(), "save failed");
+        assert_eq!(err.code(), ErrorCode::Application);
+        // The underlying cause is reachable via `source()`.
+        assert_eq!(
+            err.source().expect("app_source sets a source").to_string(),
+            "disk gone"
+        );
+        // Plain `app()` has no source.
+        assert!(Error::app("x").source().is_none());
     }
 
     #[test]
