@@ -1,11 +1,13 @@
 //! Procedural macros for `durust`.
 //!
-//! The only macro is [`macro@workflow`]. It leaves your async fn untouched and,
-//! alongside it, emits two things: a compile-time registration so the engine
-//! discovers the workflow automatically (no manual `engine.register(...)`, and
-//! the name defaults to the function name), and a typed marker — an
-//! `UpperCamelCase` zero-sized struct implementing `durust::WorkflowDef` — so
-//! the workflow can be started by a type-checked reference rather than a string.
+//! - [`macro@workflow`] leaves your async fn untouched and, alongside it, emits
+//!   a compile-time registration (so the engine auto-discovers the workflow —
+//!   no manual `engine.register(...)`) plus a typed `UpperCamelCase` marker
+//!   implementing `durust::WorkflowDef`, so the workflow can be started by a
+//!   type-checked reference rather than a string.
+//! - [`macro@step`] wraps an async fn's body in a durable
+//!   `ctx.step(...)` checkpoint, so a step reads like an ordinary `async fn`
+//!   call — no closure, no `Box::pin`, no `Ok::<_, Error>` annotation.
 
 use heck::ToUpperCamelCase;
 use proc_macro::TokenStream;
@@ -145,6 +147,103 @@ pub fn workflow(attr: TokenStream, item: TokenStream) -> TokenStream {
                 builder: || durust::erase(#ident),
                 schedule: #schedule,
             }
+        }
+    };
+
+    expanded.into()
+}
+
+/// Parsed `#[step(...)]` arguments: an optional name override — a bare literal
+/// (`#[step("charge")]`) or `name = "..."` — defaulting to the function name.
+struct StepArgs {
+    name: Option<String>,
+}
+
+impl Parse for StepArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        if input.is_empty() {
+            return Ok(StepArgs { name: None });
+        }
+        if input.peek(LitStr) {
+            return Ok(StepArgs {
+                name: Some(input.parse::<LitStr>()?.value()),
+            });
+        }
+        let key: Ident = input.parse()?;
+        input.parse::<Token![=]>()?;
+        let val: LitStr = input.parse()?;
+        if key != "name" {
+            return Err(syn::Error::new(
+                key.span(),
+                format!("unknown `#[step]` argument `{key}` (expected `name`)"),
+            ));
+        }
+        Ok(StepArgs {
+            name: Some(val.value()),
+        })
+    }
+}
+
+/// Turn an `async fn(&DurableContext, args..) -> Result<T>` into a durable
+/// [`step`](durust::DurableContext::step): the body is checkpointed on first run
+/// and served from the checkpoint on replay — exactly like calling
+/// `ctx.step("name", || async move { ... })` by hand, but without the closure,
+/// the `Box::pin`, or the `Ok::<_, Error>` annotation.
+///
+/// ```ignore
+/// #[durust::step]
+/// async fn charge(ctx: &DurableContext, cents: i64) -> Result<Receipt> {
+///     // ordinary async work — runs at most once per logical step
+///     Ok(gateway::charge(cents).await?)
+/// }
+///
+/// // inside a workflow, call it like any async fn:
+/// let receipt = charge(&ctx, 1299).await?;
+/// ```
+///
+/// The step name defaults to the function name; override with `#[step("name")]`
+/// or `#[step(name = "...")]`. The first parameter is the context the step
+/// checkpoints into (usually `ctx: &DurableContext`); the rest are the step's
+/// arguments.
+#[proc_macro_attribute]
+pub fn step(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let func = parse_macro_input!(item as ItemFn);
+    let args = parse_macro_input!(attr as StepArgs);
+
+    let name = args.name.unwrap_or_else(|| func.sig.ident.to_string());
+
+    // The first parameter is the context the step checkpoints into.
+    let ctx_ident = match func.sig.inputs.first() {
+        Some(FnArg::Typed(pt)) => match &*pt.pat {
+            syn::Pat::Ident(pi) => &pi.ident,
+            _ => {
+                return syn::Error::new_spanned(
+                    &pt.pat,
+                    "the first parameter of a `#[step]` fn must be a plain `ctx` binding",
+                )
+                .to_compile_error()
+                .into()
+            }
+        },
+        _ => {
+            return syn::Error::new_spanned(
+                &func.sig,
+                "a `#[step]` fn must take `(&DurableContext, ..)`",
+            )
+            .to_compile_error()
+            .into()
+        }
+    };
+
+    let attrs = &func.attrs;
+    let vis = &func.vis;
+    let sig = &func.sig;
+    let block = &func.block;
+
+    let expanded = quote! {
+        #(#attrs)*
+        #vis #sig {
+            #ctx_ident.step(#name, || async move #block).await
         }
     };
 
