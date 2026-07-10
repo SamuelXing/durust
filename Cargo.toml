@@ -54,3 +54,7 @@ fail = { version = "0.5", features = ["failpoints"] }
 [[example]]
 name = "order"
 path = "examples/order.rs"
+
+[[example]]
+name = "saga"
+path = "examples/saga.rs"

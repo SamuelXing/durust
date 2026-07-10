@@ -20,7 +20,8 @@
 //! but you can still see the workflow run end to end).
 
 use durust::{
-    DurableContext, DurableEngine, Error, InMemoryProvider, PostgresProvider, Result, StateProvider,
+    DurableContext, DurableEngine, InMemoryProvider, PostgresProvider, Result, StateProvider,
+    WorkflowOptions,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -38,43 +39,42 @@ struct Receipt {
     shipment_id: String,
 }
 
+// Each side effect is a durable step: it runs at most once per order and is
+// served from its checkpoint on replay. `#[durust::step]` is all it takes —
+// no closure, no `Box::pin`, no `Ok::<_, Error>`.
+#[durust::step]
+async fn charge_card(ctx: &DurableContext, order_id: String, amount_cents: i64) -> Result<String> {
+    println!("  >> CHARGING card for {amount_cents} cents  (real side effect!)");
+    Ok(format!("ch_{order_id}"))
+}
+
+#[durust::step]
+async fn create_shipment(ctx: &DurableContext, order_id: String) -> Result<String> {
+    println!("  >> creating shipment");
+    Ok(format!("sh_{order_id}"))
+}
+
+#[durust::step]
+async fn send_email(ctx: &DurableContext, to: String) -> Result<()> {
+    println!("  >> emailing receipt to {to}");
+    Ok(())
+}
+
 #[durust::workflow]
 async fn process_order(ctx: DurableContext, order: Order) -> Result<Receipt> {
-    // STEP 1 — the side effect we must never repeat.
-    let charge_id = ctx
-        .step("charge_card", || async {
-            println!(
-                "  >> CHARGING card for {} cents  (real side effect!)",
-                order.amount_cents
-            );
-            Ok::<_, Error>(format!("ch_{}", order.id))
-        })
-        .await?;
+    let charge_id = charge_card(&ctx, order.id.clone(), order.amount_cents).await?;
     println!("  charge_id = {charge_id}");
 
-    // Simulate a hard crash between steps via a failpoint. Activate it with
-    // `FAILPOINTS=after_charge=return` (see the module docs); otherwise this is
-    // a no-op and the workflow runs straight through.
+    // Simulate a hard crash between steps via a failpoint. Arm it with
+    // `FAILPOINTS=after_charge=return` (see the module docs); otherwise it is a
+    // no-op and the workflow runs straight through.
     fail::fail_point!("after_charge", |_| {
         println!("  !! failpoint `after_charge` fired — crashing after charge");
         std::process::exit(1);
     });
 
-    // STEP 2
-    let shipment_id = ctx
-        .step("create_shipment", || async {
-            println!("  >> creating shipment");
-            Ok::<_, Error>(format!("sh_{}", order.id))
-        })
-        .await?;
-
-    // STEP 3
-    let email = order.email.clone();
-    ctx.step("send_email", || async {
-        println!("  >> emailing receipt to {email}");
-        Ok::<_, Error>(())
-    })
-    .await?;
+    let shipment_id = create_shipment(&ctx, order.id.clone()).await?;
+    send_email(&ctx, order.email.clone()).await?;
 
     Ok(Receipt {
         charge_id,
@@ -102,7 +102,8 @@ async fn main() -> Result<()> {
     // No manual register: `#[durust::workflow]` auto-registers process_order.
     let engine = DurableEngine::new(provider).await?;
 
-    // Resume anything a previous crashed run left incomplete.
+    // Resume anything a previous crashed run left incomplete (a direct workflow
+    // is re-run inline from its last checkpoint).
     let resumed = engine.recover().await?;
     if resumed > 0 {
         println!("[recover] resumed {resumed} incomplete workflow(s)");
@@ -114,11 +115,18 @@ async fn main() -> Result<()> {
         email: "sam@example.com".to_string(),
     };
 
+    // Start by typed reference — `ProcessOrder` is the marker `#[durust::workflow]`
+    // emits, so the input type is checked and the output type is inferred (no
+    // string name, no turbofish). Await the handle for the result.
     println!("[start] process_order wf-order-1001");
-    match engine
-        .start_typed::<_, Receipt>("process_order", "wf-order-1001", order)
-        .await
-    {
+    let handle = engine
+        .start_with(
+            ProcessOrder,
+            order,
+            WorkflowOptions::with_id("wf-order-1001"),
+        )
+        .await?;
+    match handle.await {
         Ok(receipt) => println!("[done] {receipt:?}"),
         Err(e) => println!("[error] {e}"),
     }
