@@ -56,6 +56,9 @@ pub use client::Client;
 pub use conductor::{AlertHandler, Conductor, ConductorConfig};
 pub use context::{AuthContext, DurableContext, RetryPredicate, StepOptions};
 pub use debounce::{Debouncer, DebouncerClient};
+/// Macro plumbing referenced by `#[durust::workflow]`; not public API.
+#[doc(hidden)]
+pub use engine::WorkflowResult;
 pub use engine::{
     erase, DeduplicationPolicy, DurableEngine, DurableEngineBuilder, EngineConfig,
     RegisteredWorkflow, WorkflowDef, WorkflowFn, WorkflowOptions, WorkflowRegistration,

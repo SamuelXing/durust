@@ -126,6 +126,21 @@ pub trait WorkflowDef {
     const NAME: &'static str;
 }
 
+/// Projects the `Ok` type out of a `Result` at the type level. Lets the
+/// `#[durust::workflow]` macro name a workflow's output as
+/// `<ReturnType as WorkflowResult>::Ok` instead of parsing the return type's
+/// tokens — the compiler does the extraction, through any `Result` alias.
+/// Macro plumbing, not public API.
+#[doc(hidden)]
+pub trait WorkflowResult {
+    /// The `Ok` type of the `Result`.
+    type Ok;
+}
+
+impl<T, E> WorkflowResult for std::result::Result<T, E> {
+    type Ok = T;
+}
+
 /// A workflow registered on a [`DurableEngine`], as reported by
 /// [`DurableEngine::list_registered_workflows`]. The `name` is the identifier
 /// the workflow is registered and persisted under.

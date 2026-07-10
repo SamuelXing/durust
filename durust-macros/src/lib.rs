@@ -11,10 +11,7 @@ use heck::ToUpperCamelCase;
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
-use syn::{
-    parse_macro_input, FnArg, GenericArgument, Ident, ItemFn, LitStr, PathArguments, ReturnType,
-    Token, Type,
-};
+use syn::{parse_macro_input, FnArg, Ident, ItemFn, LitStr, ReturnType, Token};
 
 /// Parsed `#[workflow(...)]` arguments. Supports a bare name literal
 /// (`#[workflow("orders.process")]`) and/or keyed args
@@ -55,28 +52,6 @@ impl Parse for WorkflowArgs {
         }
         Ok(WorkflowArgs { name, schedule })
     }
-}
-
-/// The `Ok` type of a `Result<Ok, ..>` return: the first type argument of the
-/// return type's last path segment. Errors if the fn has no `-> Result<..>`.
-fn ok_type(ret: &ReturnType) -> syn::Result<Type> {
-    if let ReturnType::Type(_, ty) = ret {
-        if let Type::Path(tp) = &**ty {
-            if let Some(seg) = tp.path.segments.last() {
-                if let PathArguments::AngleBracketed(ab) = &seg.arguments {
-                    for arg in &ab.args {
-                        if let GenericArgument::Type(t) = arg {
-                            return Ok(t.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Err(syn::Error::new_spanned(
-        ret,
-        "a `#[workflow]` fn must return `Result<Output>`",
-    ))
 }
 
 /// Register an `async fn(DurableContext, Input) -> Result<Output>` as a durable
@@ -131,10 +106,19 @@ pub fn workflow(attr: TokenStream, item: TokenStream) -> TokenStream {
             .into()
         }
     };
-    // Output type: the `Ok` type of the returned `Result`.
-    let output_ty = match ok_type(&func.sig.output) {
-        Ok(t) => t,
-        Err(e) => return e.to_compile_error().into(),
+    // Return type: `Result<Output>`. The macro does not parse `Output` out of
+    // the tokens — it projects `<ReturnType as WorkflowResult>::Ok` below and
+    // lets the compiler extract it (through any `Result` alias).
+    let return_ty = match &func.sig.output {
+        ReturnType::Type(_, ty) => &**ty,
+        ReturnType::Default => {
+            return syn::Error::new_spanned(
+                &func.sig,
+                "a `#[workflow]` fn must return `Result<Output>`",
+            )
+            .to_compile_error()
+            .into()
+        }
     };
     // Marker type name: `UpperCamelCase` of the function identifier.
     let marker = Ident::new(&ident.to_string().to_upper_camel_case(), ident.span());
@@ -149,7 +133,7 @@ pub fn workflow(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         impl durust::WorkflowDef for #marker {
             type Input = #input_ty;
-            type Output = #output_ty;
+            type Output = <#return_ty as durust::WorkflowResult>::Ok;
             const NAME: &'static str = #name;
         }
 
