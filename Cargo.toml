@@ -11,6 +11,15 @@ documentation = "https://docs.rs/durare"
 readme = "README.md"
 keywords = ["durable-execution", "workflow", "dbos", "orchestration", "postgres"]
 categories = ["asynchronous", "database"]
+# Keep repo infrastructure and internal planning docs out of the published
+# crate — CI/agent config and local-only trackers, not crate source.
+exclude = [
+    ".github/",
+    ".cargo/",
+    "API_REVIEW.md",
+    "ROADMAP.md",
+    "PARITY.md",
+]
 
 # Make the companion proc-macro crate a workspace member (it is already a path
 # dependency below), so `cargo <cmd> -p durare-macros` works from the root and
