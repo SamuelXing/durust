@@ -1,6 +1,6 @@
 # Parity sync agent
 
-Keeps **durust** aligned with the upstream DBOS Transact SDKs by watching their
+Keeps **durare** aligned with the upstream DBOS Transact SDKs by watching their
 GitHub activity and filing tracking issues here for the parity-relevant changes.
 
 ## What it does
@@ -10,9 +10,9 @@ Weekly (and on demand), it:
 1. **Fetches** recently merged PRs + updated issues from the four upstream SDKs —
    `dbos-transact-{ts,py,golang,java}` (`fetch.sh` → `upstream.json`).
 2. **Classifies** each item with Claude Code (`classify-and-file.md`): is it a
-   feature / bugfix / semantic change durust should match, and which `PARITY.md`
+   feature / bugfix / semantic change durare should match, and which `PARITY.md`
    phase does it map to? Docs, CI, and dependency bumps are dropped.
-3. **Files** a deduplicated, labelled tracking issue in `SamuelXing/durust` for
+3. **Files** a deduplicated, labelled tracking issue in `SamuelXing/durare` for
    each new parity-relevant item, mapped to a PARITY phase with a suggested
    action.
 
@@ -44,7 +44,7 @@ features are filed as "early signal."
   filing, so overlapping fetch windows and re-runs never duplicate. The lookback
   window just bounds the fetch — make it comfortably larger than the cron
   interval (default 21 days for a weekly run).
-- **Triage, not mirror.** It surfaces what durust should *consider*, mapped to
+- **Triage, not mirror.** It surfaces what durare should *consider*, mapped to
   the roadmap — it does not copy issues verbatim and does not edit `PARITY.md`
   or source. You stay the gate: triage the filed issues into work.
 - **First run.** Trigger manually with a wider `since` (e.g. 90 days) once to

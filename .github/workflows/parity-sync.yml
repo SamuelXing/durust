@@ -1,6 +1,6 @@
 name: parity-sync
 
-# Weekly sweep of the four upstream DBOS Transact SDKs (ts/py/go/java): fetch
+# Daily sweep of the four upstream DBOS Transact SDKs (ts/py/go/java): fetch
 # recently merged PRs + updated issues, then have Claude Code classify the
 # parity-relevant ones and file deduplicated tracking issues in this repo.
 #
@@ -11,14 +11,14 @@ name: parity-sync
 
 on:
   schedule:
-    - cron: "0 14 * * 1" # Mondays 14:00 UTC
+    - cron: "0 14 * * *" # daily 14:00 UTC
   workflow_dispatch:
     inputs:
       since:
         description: "Override lookback start (YYYY-MM-DD) for a one-off sweep"
         required: false
       lookback_days:
-        description: "Days to look back (default 21)"
+        description: "Days to look back (default 3)"
         required: false
 
 permissions:

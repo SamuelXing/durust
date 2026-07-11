@@ -12,10 +12,10 @@
 
 set -euo pipefail
 
-LOOKBACK_DAYS="${LOOKBACK_DAYS:-21}"
+LOOKBACK_DAYS="${LOOKBACK_DAYS:-3}"
 OUT="${1:-upstream.json}"
 
-# The four upstream DBOS Transact SDKs (durust tracks these for parity).
+# The four upstream DBOS Transact SDKs (durare tracks these for parity).
 REPOS=(dbos-transact-ts dbos-transact-py dbos-transact-golang dbos-transact-java)
 
 # Resolve the lookback start date. Honour an explicit override, else compute
