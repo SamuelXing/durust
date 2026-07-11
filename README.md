@@ -3,12 +3,12 @@
 [![CI](https://github.com/SamuelXing/durust/actions/workflows/ci.yml/badge.svg)](https://github.com/SamuelXing/durust/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-durare (Latin *durāre*, "to last") is a durable-execution library for Rust.
-Write ordinary async functions; durare checkpoints each step to your database
+`durare` (Latin *durāre*, "to last") is a durable-execution library for Rust.
+Write ordinary async functions; `durare` checkpoints each step to your database
 and, after a crash, restart, or redeploy, resumes every unfinished workflow
 exactly where it stopped. Completed steps are never re-run.
 
-durare is a Rust SDK for [DBOS](https://docs.dbos.dev) durable execution,
+`durare` is a Rust SDK for [DBOS](https://docs.dbos.dev) durable execution,
 aligned by design with the DBOS Transact SDKs for Python, Go, and TypeScript:
 the same programming model, the same semantics, and the same system schema on
 the same database. There is no server to operate and no sidecar — the engine
@@ -148,7 +148,7 @@ separate primitive.
 
 ## DBOS compatibility
 
-durare implements the DBOS durable-execution model and stores its state in the
+`durare` implements the DBOS durable-execution model and stores its state in the
 DBOS system schema. On Postgres the tables live in the `dbos` schema — the same
 schema, tables, and columns the DBOS Transact SDKs for Python, Go, and
 TypeScript use: `workflow_status`, `operation_outputs`, `workflow_events`,
@@ -157,7 +157,7 @@ registry, applied through embedded per-dialect migrations.
 
 In practice this means:
 
-- Workflow state is inspectable with plain SQL, and rows written by a durare
+- Workflow state is inspectable with plain SQL, and rows written by a `durare`
   worker are legible to standard DBOS tooling pointed at the same database.
 - Arguments, outputs, and errors use the portable serialization envelope, with
   a structured cross-SDK error format. Custom codecs can be installed through
@@ -171,7 +171,7 @@ SELECT workflow_uuid, name, status FROM dbos.workflow_status;
 SELECT workflow_uuid, function_id, function_name, output FROM dbos.operation_outputs;
 ```
 
-durare is community-maintained.
+`durare` is community-maintained.
 
 ## Backends
 
