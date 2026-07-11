@@ -19,6 +19,7 @@ exclude = [
     "API_REVIEW.md",
     "ROADMAP.md",
     "PARITY.md",
+    "CONFORMANCE.md",
     "RELEASING.md",
 ]
 
@@ -33,7 +34,11 @@ resolver = "2"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order`: keep JSON object keys in insertion order (a struct's field
+# order) rather than sorting them. Required for cross-SDK wire compatibility —
+# the DBOS portable_json format is byte-identical across SDKs only if key order
+# is preserved (see tests/interop.rs).
+serde_json = { version = "1", features = ["preserve_order"] }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.9"

@@ -6,6 +6,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Cross-SDK serialization conformance tests (`tests/interop.rs`) asserting durare
+  reproduces the shared DBOS golden `portable_json` strings byte-for-byte
+  (encode, decode, both input-envelope orderings, structured errors, round-trip).
+
+### Changed
+
+- **(breaking)** `Error::Portable` now wraps a `Box<PortableWorkflowError>`
+  rather than a bare `PortableWorkflowError`, so `Error` (and every
+  `Result<_, Error>`) stays small after the `preserve_order` change enlarged
+  `serde_json::Value`. Construct it as
+  `Error::Portable(Box::new(PortableWorkflowError { … }))` or via the unchanged
+  `Error::portable(name, message)` constructor; field access on a matched value
+  is unaffected (the `Box` auto-derefs).
+
+### Fixed
+
+- **Portable serialization now preserves object key order** (enabled
+  `serde_json`'s `preserve_order`). durare previously sorted object keys
+  alphabetically, so its `portable_json` records — though still readable — were
+  not byte-identical to those written by the Python, Go, TypeScript, and Java
+  SDKs. Cross-SDK portable records are now byte-compatible.
+
 ## [0.1.1] - 2026-07-11
 
 Documentation-only release: no library code changed, so `durare-macros` stays at

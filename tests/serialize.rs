@@ -117,12 +117,12 @@ async fn portable_typed_error_round_trips() -> Result<()> {
             .with_serializer(Serializer::Portable);
         let mut engine = DurableEngine::new(Arc::new(provider)).await?;
         engine.register("validate", |_ctx: DurableContext, _: ()| async move {
-            Err::<(), _>(Error::Portable(PortableWorkflowError {
+            Err::<(), _>(Error::Portable(Box::new(PortableWorkflowError {
                 name: "ValidationError".to_string(),
                 message: "bad email".to_string(),
                 code: Some(serde_json::json!(400)),
                 data: Some(serde_json::json!({"field": "email"})),
-            }))
+            })))
         });
         let outcome = engine
             .start::<_, ()>("validate", (), WorkflowOptions::with_id("wf-typed"))

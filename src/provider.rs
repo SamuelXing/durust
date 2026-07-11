@@ -896,7 +896,7 @@ impl StepOutcome {
         match self {
             StepOutcome::Output(v) => Ok(v),
             StepOutcome::Failure { message, info } => Err(match info {
-                Some(pe) => Error::Portable(pe),
+                Some(pe) => Error::Portable(Box::new(pe)),
                 None => Error::app(message),
             }),
         }

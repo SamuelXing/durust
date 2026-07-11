@@ -4,3 +4,5 @@ Cargo.lock
 .env
 # Internal Go-parity development tracker; not for the public repo.
 /PARITY.md
+# Internal cross-SDK conformance tracker; not for the public repo.
+/CONFORMANCE.md

@@ -138,8 +138,11 @@ pub enum Error {
     /// envelope so an observer in any language reads its structure; the display
     /// form is the message (like the other SDKs' `Error()`). A workflow that
     /// failed under portable mode is read back as this variant.
+    // Boxed so this (otherwise large) structured envelope — its two
+    // `Option<Value>` fields dominate the enum's size — does not inflate every
+    // `Result<_, Error>` that flows through the hot path.
     #[error("{}", .0.message)]
-    Portable(PortableWorkflowError),
+    Portable(Box<PortableWorkflowError>),
 }
 
 impl Error {
@@ -166,15 +169,16 @@ impl Error {
     }
 
     /// Construct a structured cross-language error with a type `name` and a
-    /// `message` (no `code`/`data`). Build [`Error::Portable`] directly to set
-    /// those — its [`PortableWorkflowError`] fields are public.
+    /// `message` (no `code`/`data`). To set those, build the variant with a
+    /// boxed [`PortableWorkflowError`] — its fields are public:
+    /// `Error::Portable(Box::new(PortableWorkflowError { … }))`.
     pub fn portable(name: impl Into<String>, message: impl Into<String>) -> Self {
-        Error::Portable(PortableWorkflowError {
+        Error::Portable(Box::new(PortableWorkflowError {
             name: name.into(),
             message: message.into(),
             code: None,
             data: None,
-        })
+        }))
     }
 
     /// Construct a [`Error::NonExistentWorkflow`] for the given workflow id.
