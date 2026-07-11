@@ -6,6 +6,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-11
+
+Documentation-only release: no library code changed, so `durare-macros` stays at
+`0.1.0`. Every improvement below is visible on [docs.rs](https://docs.rs/durare).
+
 ### Documentation
 
 - Documented every public API item and enabled `#![warn(missing_docs)]`, now
@@ -60,5 +65,6 @@ workflows after a crash.
   tables the DBOS Transact SDKs use, plus a portable cross-SDK serialization
   envelope.
 
-[Unreleased]: https://github.com/SamuelXing/durare/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/SamuelXing/durare/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/SamuelXing/durare/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/SamuelXing/durare/releases/tag/v0.1.0

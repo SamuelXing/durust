@@ -1,8 +1,12 @@
 # Releasing
 
 `durare` is a two-crate workspace: the proc-macro crate **`durare-macros`** and
-the library **`durare`**, which depends on it. They are versioned in lockstep and
-published together, macros first.
+the library **`durare`**, which depends on it via a caret requirement
+(`version = "0.1"`). The two are **versioned independently** — each release
+bumps and publishes only the crate(s) that actually changed (the
+tokio / tokio-macros model). A docs-only or library-only release touches
+`durare` alone; `durare-macros` keeps its version and is not republished, and
+the caret dependency resolves it fine. Bump both only when both changed.
 
 During `0.x` the API is allowed to change: a release with breaking changes bumps
 the **minor** version (`0.1 → 0.2`), a backward-compatible release bumps the
@@ -20,15 +24,15 @@ the **minor** version (`0.1 → 0.2`), a backward-compatible release bumps the
 
 ### 1. Bump the version
 
-Set the same `version` in both crates, and the macro dependency's version to
-match:
+Bump `[package] version` in the manifest of each crate that changed:
 
-- `Cargo.toml` → `[package] version`
-- `durare-macros/Cargo.toml` → `[package] version`
-- `Cargo.toml` → `durare-macros = { path = "durare-macros", version = "X.Y" }`
+- `Cargo.toml` for a `durare` (library) change
+- `durare-macros/Cargo.toml` for a `durare-macros` (proc-macro) change
 
-Keep `rust-version` (MSRV) accurate in both manifests if the floor moved; CI has a
-job pinned to it.
+Leave the caret dependency `durare-macros = { path = "durare-macros", version =
+"0.1" }` alone unless a new library release *requires* a newer macro version —
+the caret already admits any `0.1.x`. Keep `rust-version` (MSRV) accurate in the
+touched manifests if the floor moved; CI has a job pinned to it.
 
 ### 2. Update the changelog
 
@@ -50,8 +54,8 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 cargo package --list -p durare | grep -E '^\.github/|^\.cargo/|API_REVIEW|ROADMAP|PARITY' \
   && echo "!! internal files would ship — fix [package] exclude" || echo "package contents clean"
 
-# Dry-run both publishes (no upload). A clean tree is required; see the note below.
-cargo publish -p durare-macros --dry-run
+# Dry-run each crate you are publishing (no upload). A clean tree is required;
+# see the note below. (Add `-p durare-macros --dry-run` only if it changed.)
 cargo publish -p durare --dry-run
 ```
 
@@ -65,13 +69,20 @@ git tag -a vX.Y.Z -m "durare X.Y.Z"
 git push origin vX.Y.Z
 ```
 
-### 5. Publish — macros first
+### 5. Publish the changed crate(s)
 
-The order matters: `durare` depends on `durare-macros`, so the macro version must
-already be on the registry when `durare` is verified.
+Publish only what you bumped. For a library-only release that is just:
 
 ```bash
-cargo publish -p durare-macros
+cargo publish -p durare
+```
+
+**If this release also changed `durare-macros`, publish it first** — `durare`
+depends on it, so the new macro version must already be on the registry when
+`durare` is verified:
+
+```bash
+cargo publish -p durare-macros   # only when it changed
 cargo publish -p durare
 ```
 
