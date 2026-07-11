@@ -1,6 +1,6 @@
 [package]
 name = "durare"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 description = "A DBOS-compatible durable execution SDK for Rust: write ordinary async code, checkpoint every step to Postgres or SQLite, and resume exactly where you left off after a crash."
@@ -12,7 +12,8 @@ readme = "README.md"
 keywords = ["durable-execution", "workflow", "dbos", "orchestration", "postgres"]
 categories = ["asynchronous", "database"]
 # Keep repo infrastructure and internal planning docs out of the published
-# crate — CI/agent config and local-only trackers, not crate source.
+# crate — CI/agent config, local-only trackers, and work-in-progress tests, not
+# crate source.
 exclude = [
     ".github/",
     ".cargo/",
@@ -21,6 +22,7 @@ exclude = [
     "PARITY.md",
     "CONFORMANCE.md",
     "RELEASING.md",
+    "tests/cycle_demo.rs",
 ]
 
 # Make the companion proc-macro crate a workspace member (it is already a path

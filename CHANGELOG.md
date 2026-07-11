@@ -6,6 +6,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-11
+
+This release proves durare's on-the-wire compatibility with the other DBOS
+Transact SDKs (Python, Go, TypeScript, Java) and carries one small breaking
+change to keep `Result<_, Error>` cheap. `durare-macros` is unchanged and stays
+at `0.1.0`.
+
 ### Added
 
 - Cross-SDK serialization conformance tests (`tests/interop.rs`) asserting durare
@@ -98,6 +105,7 @@ workflows after a crash.
   tables the DBOS Transact SDKs use, plus a portable cross-SDK serialization
   envelope.
 
-[Unreleased]: https://github.com/SamuelXing/durare/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/SamuelXing/durare/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/SamuelXing/durare/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/SamuelXing/durare/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/SamuelXing/durare/releases/tag/v0.1.0
