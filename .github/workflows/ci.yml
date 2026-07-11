@@ -39,6 +39,19 @@ jobs:
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
 
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The declared minimum supported Rust version (Cargo.toml `rust-version`).
+      # Driven by transitive deps (home, icu); this job fails if a dep bump
+      # raises the floor, so the pin can't silently rot.
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check (lib)
+        run: cargo check --lib
+
   test:
     name: test (in-memory + sqlite + postgres)
     runs-on: ubuntu-latest
