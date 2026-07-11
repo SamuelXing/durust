@@ -14,28 +14,64 @@
 //! schema as the DBOS Transact SDKs for Python, Go, and TypeScript — the SDKs
 //! interoperate on one database.
 //!
+//! The problem this solves: any multi-step operation has crash windows — after
+//! the card is charged but before the receipt is sent, the process dies, and a
+//! naive retry charges twice. In `durare` the workflow id is an idempotency key
+//! and every step is checkpointed, so a duplicate trigger (a retried webhook, a
+//! double-click, a crashed-and-rerun caller) attaches to the same run instead
+//! of repeating its effects. This example is a test — the assertions at the
+//! bottom hold on every commit:
+//!
 //! ```
 //! use durare::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
 //! use std::sync::Arc;
+//! use std::sync::atomic::{AtomicU32, Ordering};
+//!
+//! /// Stand-in for a payment API we must never call twice for the same order.
+//! static CHARGES: AtomicU32 = AtomicU32::new(0);
 //!
 //! #[durare::workflow]
-//! async fn hello(ctx: DurableContext, name: String) -> Result<String> {
-//!     let greeting = ctx.step("build_greeting", || async {
-//!         Ok::<_, Error>(format!("hello, {name}"))
+//! async fn process_order(ctx: DurableContext, order_id: String) -> Result<String> {
+//!     // Each step runs once; its result is checkpointed before moving on.
+//!     let charge_id = ctx.step("charge_card", || async {
+//!         CHARGES.fetch_add(1, Ordering::SeqCst);
+//!         Ok::<_, Error>(format!("ch_{order_id}"))
 //!     }).await?;
-//!     Ok(greeting)
+//!
+//!     ctx.step("send_receipt", || async {
+//!         // A crash here does NOT re-charge: on restart, `charge_card` is
+//!         // served from its checkpoint and the workflow resumes from this step.
+//!         Ok::<_, Error>(())
+//!     }).await?;
+//!
+//!     Ok(charge_id)
 //! }
 //!
 //! # #[tokio::main(flavor = "current_thread")]
 //! # async fn main() -> Result<()> {
 //! let engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-//! engine.recover().await?; // resume anything left unfinished by a prior crash
-//! // `Hello` is the typed marker `#[durare::workflow]` generated from `hello`.
-//! let handle = engine.start_with(Hello, "world".into(), WorkflowOptions::with_id("wf-1")).await?;
-//! assert_eq!(handle.await?, "hello, world");
+//! engine.recover().await?; // after a crash: resume every unfinished workflow
+//!
+//! let handle = engine
+//!     .start_with(ProcessOrder, "1001".into(), WorkflowOptions::with_id("order-1001"))
+//!     .await?;
+//! assert_eq!(handle.await?, "ch_1001");
+//!
+//! // The same trigger arrives again — same workflow id, no second charge.
+//! let duplicate = engine
+//!     .start_with(ProcessOrder, "1001".into(), WorkflowOptions::with_id("order-1001"))
+//!     .await?;
+//! assert_eq!(duplicate.await?, "ch_1001");          // served from the checkpoint
+//! assert_eq!(CHARGES.load(Ordering::SeqCst), 1);    // charged exactly once
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! Swap [`InMemoryProvider`] for [`PostgresProvider`] and the same guarantees
+//! hold across processes, restarts, and a fleet of workers. For the full
+//! crash-and-recover demo — a process killed mid-workflow, restarted, and
+//! finishing without repeating work — run
+//! [`examples/order.rs`](https://github.com/SamuelXing/durare/blob/main/examples/order.rs).
 //!
 //! # What's in the crate
 //!
