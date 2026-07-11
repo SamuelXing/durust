@@ -90,9 +90,6 @@ durare = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-Until 0.1 reaches crates.io, use a git dependency:
-`durare = { git = "https://github.com/SamuelXing/durare" }`.
-
 The repository ships ten self-contained examples, one per primitive:
 
 | Example | Shows |
