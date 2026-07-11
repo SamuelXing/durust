@@ -183,14 +183,9 @@ durare is community-maintained.
 
 All three implement one trait, `StateProvider`, which is also the seam for
 adding further backends. Application tests can run workflows against
-`InMemoryProvider` with no infrastructure at all.
-
-## Status
-
-Pre-1.0, under active development. The feature surface above is implemented and
-exercised by the test suite against all three backends on every commit; the
-Postgres tests run against a live server in CI. Until 1.0, minor versions may
-contain breaking API changes.
+`InMemoryProvider` with no infrastructure at all; the crate's own test suite
+runs against all three backends on every commit, with Postgres against a live
+server in CI.
 
 ## License
 
