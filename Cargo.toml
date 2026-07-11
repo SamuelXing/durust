@@ -78,3 +78,15 @@ path = "examples/approval.rs"
 [[example]]
 name = "client"
 path = "examples/client.rs"
+
+[[example]]
+name = "timer"
+path = "examples/timer.rs"
+
+[[example]]
+name = "subworkflow"
+path = "examples/subworkflow.rs"
+
+[[example]]
+name = "stream"
+path = "examples/stream.rs"
