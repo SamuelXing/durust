@@ -12,6 +12,14 @@ readme = "README.md"
 keywords = ["durable-execution", "workflow", "dbos", "orchestration", "postgres"]
 categories = ["asynchronous", "database"]
 
+# Make the companion proc-macro crate a workspace member (it is already a path
+# dependency below), so `cargo <cmd> -p durare-macros` works from the root and
+# the two crates share one lockfile. Publishing stays two steps: durare-macros
+# first, then durare.
+[workspace]
+members = ["durare-macros"]
+resolver = "2"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
