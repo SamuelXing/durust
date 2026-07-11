@@ -51,21 +51,22 @@ pub(crate) fn decode_roles(stored: Option<&str>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Workflow lifecycle states — the values stored in the `status` column.
-///
-/// `ENQUEUED` — sitting in a queue, waiting to be claimed by a dispatcher.
-/// `DELAYED` — enqueued with a delay; transitions to `ENQUEUED` when due.
-/// `PENDING` — claimed by an executor and running.
-/// `SUCCESS` / `ERROR` — terminal outcomes.
-/// `CANCELLED` — terminated by an operator; replay is refused.
-/// `MAX_RECOVERY_ATTEMPTS_EXCEEDED` — recovered too many times; parked until
-/// manually resumed.
+// The workflow lifecycle states stored in the `status` column. These string
+// constants are the on-disk values, shared verbatim with the other DBOS SDKs.
+
+/// Enqueued and waiting to be claimed by a dispatcher.
 pub const STATUS_ENQUEUED: &str = "ENQUEUED";
+/// Enqueued with a delay; transitions to [`STATUS_ENQUEUED`] once it is due.
 pub const STATUS_DELAYED: &str = "DELAYED";
+/// Claimed by an executor and currently running.
 pub const STATUS_PENDING: &str = "PENDING";
+/// Terminal: the workflow completed and its output is recorded.
 pub const STATUS_SUCCESS: &str = "SUCCESS";
+/// Terminal: the workflow failed and its error is recorded.
 pub const STATUS_ERROR: &str = "ERROR";
+/// Terminated by an operator; replay is refused.
 pub const STATUS_CANCELLED: &str = "CANCELLED";
+/// Recovered too many times; parked until manually resumed.
 pub const STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED: &str = "MAX_RECOVERY_ATTEMPTS_EXCEEDED";
 
 /// Value written into a stream's `value` column to mark it closed. Stored
@@ -90,11 +91,18 @@ pub(crate) const WORKFLOW_EVENTS_CHANNEL: &str = "dbos_workflow_events_channel";
 pub enum ChangeWait<'a> {
     /// A notification delivered to `workflow_id`'s mailbox on `topic`.
     Notification {
+        /// Recipient workflow whose mailbox is being watched.
         workflow_id: &'a str,
+        /// Topic the awaited message is sent on.
         topic: &'a str,
     },
     /// Event `key` set on `workflow_id`.
-    Event { workflow_id: &'a str, key: &'a str },
+    Event {
+        /// Workflow whose event is being watched.
+        workflow_id: &'a str,
+        /// Event key being awaited.
+        key: &'a str,
+    },
 }
 
 impl ChangeWait<'_> {
@@ -381,9 +389,13 @@ pub fn is_terminal(status: &str) -> bool {
 /// schema stays stable as those features land.
 #[derive(Clone, Debug)]
 pub struct WorkflowStatus {
+    /// Unique workflow id (the `workflow_uuid` primary key).
     pub id: String,
+    /// Registered name of the workflow function.
     pub name: String,
+    /// Current lifecycle state — one of the `STATUS_*` constants.
     pub status: String,
+    /// The workflow's input, serialized as stored.
     pub input: Value,
     /// Present once the workflow reaches `SUCCESS`.
     pub output: Option<Value>,
@@ -442,7 +454,9 @@ pub struct WorkflowStatus {
     /// the *same* workflow name (one per configured instance), and is durably
     /// recorded so recovery re-dispatches to the same instance.
     pub config_name: Option<String>,
+    /// When the row was first created.
     pub created_at: DateTime<Utc>,
+    /// When the row was last modified.
     pub updated_at: DateTime<Utc>,
 }
 
@@ -500,6 +514,7 @@ impl WorkflowStatus {
 /// `completed_*`/`dequeued_*` bounds match `completed_at`/`started_at`.
 #[derive(Clone)]
 pub struct ListFilter {
+    /// Match any of these exact workflow ids (OR).
     pub workflow_ids: Vec<String>,
     /// Match any workflow whose id starts with one of these prefixes (OR).
     pub workflow_id_prefix: Vec<String>,
@@ -511,6 +526,7 @@ pub struct ListFilter {
     pub queue_name: Vec<String>,
     /// Match any of these application versions (OR).
     pub app_version: Vec<String>,
+    /// Match any of these executor ids (OR).
     pub executor_ids: Vec<String>,
     /// Match any of these authenticated users (OR).
     pub authenticated_users: Vec<String>,
@@ -521,19 +537,26 @@ pub struct ListFilter {
     /// `Some(true)` keeps only workflows that were themselves created by a fork;
     /// `Some(false)` only those that were not; `None` does not filter on it.
     pub was_forked_from: Option<bool>,
+    /// Lower bound (inclusive) on `created_at`, epoch ms.
     pub start_time_ms: Option<i64>,
+    /// Upper bound (inclusive) on `created_at`, epoch ms.
     pub end_time_ms: Option<i64>,
-    /// Lower/upper bound on `completed_at` (epoch ms).
+    /// Lower bound on `completed_at` (epoch ms).
     pub completed_after_ms: Option<i64>,
+    /// Upper bound on `completed_at` (epoch ms).
     pub completed_before_ms: Option<i64>,
-    /// Lower/upper bound on `started_at` — when the workflow was dequeued/started
+    /// Lower bound on `started_at` — when the workflow was dequeued/started
     /// (epoch ms).
     pub dequeued_after_ms: Option<i64>,
+    /// Upper bound on `started_at` — when the workflow was dequeued/started
+    /// (epoch ms).
     pub dequeued_before_ms: Option<i64>,
     /// `Some(true)` keeps only workflows that have a parent; `Some(false)` only
     /// those that don't; `None` does not filter on parentage.
     pub has_parent: Option<bool>,
+    /// Maximum number of rows to return; `None` for no limit.
     pub limit: Option<i64>,
+    /// Number of matching rows to skip before returning (for pagination).
     pub offset: Option<i64>,
     /// Sort by `created_at` descending instead of ascending.
     pub sort_desc: bool,
@@ -588,10 +611,15 @@ impl Default for ListFilter {
 /// the filter fields narrow which workflows are counted before grouping.
 #[derive(Clone, Default)]
 pub struct WorkflowAggregateQuery {
+    /// Group by workflow `status`.
     pub by_status: bool,
+    /// Group by workflow `name`.
     pub by_name: bool,
+    /// Group by `queue_name`.
     pub by_queue_name: bool,
+    /// Group by `executor_id`.
     pub by_executor_id: bool,
+    /// Group by `application_version`.
     pub by_app_version: bool,
     /// Select the per-group row count.
     pub select_count: bool,
@@ -606,21 +634,31 @@ pub struct WorkflowAggregateQuery {
     /// Also group by `created_at` bucket of this size in milliseconds.
     pub time_bucket_ms: Option<i64>,
     // Filters (all ANDed; empty/`None` ignored).
+    /// Keep only these statuses.
     pub status: Vec<String>,
+    /// Keep only these workflow names.
     pub name: Vec<String>,
+    /// Keep only these application versions.
     pub app_version: Vec<String>,
+    /// Keep only these executor ids.
     pub executor_ids: Vec<String>,
+    /// Keep only these queue names.
     pub queue_names: Vec<String>,
+    /// Keep only workflows whose id starts with this prefix.
     pub workflow_id_prefix: Option<String>,
-    /// Lower/upper bound on `created_at` (epoch ms).
+    /// Lower bound on `created_at` (epoch ms).
     pub start_time_ms: Option<i64>,
+    /// Upper bound on `created_at` (epoch ms).
     pub end_time_ms: Option<i64>,
-    /// Lower/upper bound on `completed_at` (epoch ms).
+    /// Lower bound on `completed_at` (epoch ms).
     pub completed_after_ms: Option<i64>,
+    /// Upper bound on `completed_at` (epoch ms).
     pub completed_before_ms: Option<i64>,
-    /// Lower/upper bound on `started_at` — when the workflow was dequeued/started
+    /// Lower bound on `started_at` — when the workflow was dequeued/started
     /// (epoch ms).
     pub dequeued_after_ms: Option<i64>,
+    /// Upper bound on `started_at` — when the workflow was dequeued/started
+    /// (epoch ms).
     pub dequeued_before_ms: Option<i64>,
     /// Cap on the number of group rows returned.
     pub limit: Option<i64>,
@@ -727,7 +765,10 @@ pub(crate) const STEP_STATUS_EXPR: &str =
 /// at least one `select_*` flag must be set.
 #[derive(Clone, Default)]
 pub struct StepAggregateQuery {
+    /// Group by step `function_name`.
     pub by_function_name: bool,
+    /// Group by derived step status: `SUCCESS` when the step's `error` is null,
+    /// else `ERROR`.
     pub by_status: bool,
     /// Select the per-group row count.
     pub select_count: bool,
@@ -737,10 +778,15 @@ pub struct StepAggregateQuery {
     /// Also group by `completed_at` bucket of this size in milliseconds.
     pub time_bucket_ms: Option<i64>,
     // Filters (all ANDed; empty/`None` ignored).
+    /// Keep only these derived statuses (`SUCCESS`/`ERROR`).
     pub status: Vec<String>,
+    /// Keep only these step function names.
     pub function_name: Vec<String>,
+    /// Keep only steps of workflows whose id starts with this prefix.
     pub workflow_id_prefix: Option<String>,
+    /// Lower bound on `completed_at` (epoch ms).
     pub completed_after_ms: Option<i64>,
+    /// Upper bound on `completed_at` (epoch ms).
     pub completed_before_ms: Option<i64>,
     /// Cap on the number of group rows returned.
     pub limit: Option<i64>,
@@ -833,7 +879,9 @@ pub enum StepOutcome {
     /// The step failed; carries the human message and — for a portable row — the
     /// structured error, mirroring [`WorkflowStatus::error`]/`error_info`.
     Failure {
+        /// Human-readable error message.
         message: String,
+        /// Structured error, present when the row used portable serialization.
         info: Option<crate::PortableWorkflowError>,
     },
 }
@@ -915,14 +963,19 @@ pub struct VersionInfo {
 /// another.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ExportedWorkflow {
+    /// The `workflow_status` row as a column-keyed JSON object.
     #[serde(default)]
     pub workflow_status: Map<String, Value>,
+    /// The workflow's `operation_outputs` (step checkpoint) rows.
     #[serde(default, deserialize_with = "null_seq")]
     pub operation_outputs: Vec<Map<String, Value>>,
+    /// The workflow's current `workflow_events` rows.
     #[serde(default, deserialize_with = "null_seq")]
     pub workflow_events: Vec<Map<String, Value>>,
+    /// The workflow's `workflow_events_history` rows.
     #[serde(default, deserialize_with = "null_seq")]
     pub workflow_events_history: Vec<Map<String, Value>>,
+    /// The workflow's `streams` rows.
     #[serde(default, deserialize_with = "null_seq")]
     pub streams: Vec<Map<String, Value>>,
 }
@@ -1009,6 +1062,7 @@ pub struct ForkParams {
     /// fork stays runnable by the executors that could run the original).
     pub app_version: Option<String>,
     /// Queue the fork is enqueued on.
+    /// Queue the fork is enqueued on.
     pub queue_name: String,
     /// Partition key when `queue_name` is a partitioned queue.
     pub partition_key: Option<String>,
@@ -1019,6 +1073,7 @@ pub struct ForkParams {
 /// layer stays decoupled from the queue type.
 #[derive(Clone, Debug)]
 pub struct DequeueRequest {
+    /// Queue to claim workflows from.
     pub queue_name: String,
     /// Executor claiming the workflows.
     pub executor_id: String,
@@ -1036,6 +1091,7 @@ pub struct DequeueRequest {
     /// If set with `rate_limit_period_ms`: cap claims so the number of
     /// rate-limited starts within the trailing period stays under this.
     pub rate_limit_max: Option<i64>,
+    /// Trailing window (epoch ms) the `rate_limit_max` cap is measured over.
     pub rate_limit_period_ms: Option<i64>,
 }
 

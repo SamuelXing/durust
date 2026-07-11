@@ -120,8 +120,16 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
     /// called; for a polling handle (or a clone whose sibling already consumed
     /// the task) it reads the status row every `poll_interval` until the
     /// workflow reaches a terminal state, then deserializes the stored output.
-    /// A `CANCELLED` workflow yields [`Error::Cancelled`]; an `ERROR` workflow
-    /// yields the recorded application error.
+    ///
+    /// A handle can also be awaited directly (`handle.await?`), which consumes
+    /// it; `result(&self)` borrows, so it works on a shared or cloned handle.
+    ///
+    /// # Errors
+    ///
+    /// The workflow's own error if it finished in `ERROR` (reconstructed from
+    /// its checkpoint — a portable error keeps its structure);
+    /// [`Error::Cancelled`] if it was cancelled; a decode error if the stored
+    /// output does not deserialize as `O`.
     pub async fn result(&self) -> Result<O> {
         // Claim the in-process task exactly once. The guard is a temporary of
         // this statement, so it is dropped here — never held across the await.

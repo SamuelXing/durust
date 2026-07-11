@@ -44,12 +44,15 @@ pub enum ErrorCode {
 /// the `is_*` helpers to classify the underlying database failure.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// A database error from the underlying `sqlx` driver.
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 
+    /// A schema migration failed to apply.
     #[error("migration error: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
 
+    /// A JSON (de)serialization error.
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
 
@@ -58,9 +61,11 @@ pub enum Error {
     #[error("serialization format error: {0}")]
     Serialization(String),
 
+    /// No workflow is registered under the given name.
     #[error("no workflow registered under name `{0}`")]
     UnknownWorkflow(String),
 
+    /// No queue is registered under the given name.
     #[error("no queue registered under name `{0}`")]
     UnknownQueue(String),
 
@@ -72,7 +77,9 @@ pub enum Error {
     /// deduplication key on the queue.
     #[error("deduplication id `{dedup_id}` already in use on queue `{queue_name}`")]
     QueueDeduplicated {
+        /// The queue the collision occurred on.
         queue_name: String,
+        /// The deduplication id already held by another active workflow.
         dedup_id: String,
     },
 
@@ -101,7 +108,9 @@ pub enum Error {
          is recorded there — the workflow function is non-deterministic"
     )]
     UnexpectedStep {
+        /// The workflow whose replay diverged.
         workflow_id: String,
+        /// The step position (function id) at which the divergence was detected.
         step_id: i32,
         /// The operation the workflow is executing now.
         expected: String,
@@ -115,7 +124,10 @@ pub enum Error {
     /// error stores only its `message`, so the chain does not survive a replay.
     #[error("{message}")]
     App {
+        /// The error message.
         message: String,
+        /// Optional underlying cause. An in-process detail only — it is not
+        /// checkpointed, so it does not survive a replay.
         #[source]
         source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
     },
@@ -275,6 +287,7 @@ fn is_retryable_db_code(code: &str) -> bool {
     code.parse::<i32>().is_ok_and(|n| matches!(n & 0xFF, 5 | 6))
 }
 
+/// The crate-wide result type: `Result<T, Error>`.
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]

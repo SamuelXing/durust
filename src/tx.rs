@@ -24,11 +24,17 @@ use std::time::Duration;
 /// [`params!`](crate::params) rather than by hand in the common case.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Param {
+    /// SQL `NULL`.
     Null,
+    /// A signed 64-bit integer.
     Int(i64),
+    /// A 64-bit floating-point number.
     Float(f64),
+    /// A UTF-8 text value.
     Text(String),
+    /// A boolean.
     Bool(bool),
+    /// A binary blob.
     Bytes(Vec<u8>),
 }
 
@@ -243,9 +249,12 @@ pub type TxBody<'a> = Box<
 /// SQLite runs every transaction serializably, so the level is advisory there.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IsolationLevel {
+    /// `READ COMMITTED` — the default.
     #[default]
     ReadCommitted,
+    /// `REPEATABLE READ` — a stabler snapshot; may raise a serialization conflict.
     RepeatableRead,
+    /// `SERIALIZABLE` — the strongest guarantee; may raise a serialization conflict.
     Serializable,
 }
 
@@ -274,8 +283,11 @@ impl IsolationLevel {
 /// `max_retries` of 0 an application error fails immediately, as before.
 #[derive(Clone)]
 pub struct TransactionOptions {
+    /// Checkpoint name recorded for this transactional step.
     pub name: String,
+    /// Isolation level the transaction runs at.
     pub isolation: IsolationLevel,
+    /// Hint that the transaction performs no writes (`READ ONLY` on Postgres).
     pub read_only: bool,
     /// Additional attempts after the first failure (0 = run once, no retry).
     pub max_retries: u32,
@@ -349,7 +361,9 @@ impl TransactionOptions {
     /// at once (the error propagates), so a permanent failure doesn't burn
     /// attempts:
     ///
-    /// ```ignore
+    /// ```
+    /// use durare::{Error, TransactionOptions};
+    ///
     /// let opts = TransactionOptions::new("transfer")
     ///     .max_retries(5)
     ///     .retry_if(|e: &Error| e.is_retryable());

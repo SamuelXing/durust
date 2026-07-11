@@ -1,5 +1,7 @@
 # durare
 
+[![Crates.io](https://img.shields.io/crates/v/durare.svg)](https://crates.io/crates/durare)
+[![Documentation](https://docs.rs/durare/badge.svg)](https://docs.rs/durare)
 [![CI](https://github.com/SamuelXing/durare/actions/workflows/ci.yml/badge.svg)](https://github.com/SamuelXing/durare/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
@@ -13,7 +15,8 @@ aligned by design with the DBOS Transact SDKs for Python, Go, and TypeScript:
 the same programming model, the same semantics, and the same system schema on
 the same database. There is no server to operate and no sidecar — the engine
 is a library inside your process that talks directly to Postgres or SQLite.
-See [DBOS compatibility](#dbos-compatibility).
+See [DBOS compatibility](#dbos-compatibility). Full API documentation is on
+[docs.rs](https://docs.rs/durare).
 
 ```rust
 use std::time::Duration;
@@ -183,6 +186,18 @@ adding further backends. Application tests can run workflows against
 `InMemoryProvider` with no infrastructure at all; the crate's own test suite
 runs against all three backends on every commit, with Postgres against a live
 server in CI.
+
+## Minimum supported Rust version
+
+`durare` builds on Rust **1.88** and later, enforced by a dedicated CI job.
+Raising the MSRV is a semver-minor change (it will never happen in a patch
+release).
+
+## Contributing
+
+Bug reports and pull requests are welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md) for the development setup and the checks to
+run before submitting.
 
 ## License
 

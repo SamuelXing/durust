@@ -110,12 +110,24 @@ inventory::collect!(WorkflowRegistration);
 /// function's own signature, so the call is checked without a turbofish and a
 /// wrong input type is a compile error:
 ///
-/// ```ignore
-/// #[durare::workflow]
-/// async fn process_order(ctx: DurableContext, order: Order) -> Result<Receipt> { /* … */ }
+/// ```
+/// use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
+/// use std::sync::Arc;
 ///
-/// let handle = engine.start_with(ProcessOrder, order, opts).await?; // input: Order, checked
-/// let receipt: Receipt = handle.await?;                             // output: Receipt, inferred
+/// #[durare::workflow]
+/// async fn process_order(ctx: DurableContext, order_id: String) -> Result<String> {
+///     Ok(format!("receipt for {order_id}"))
+/// }
+///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> Result<()> {
+/// # let engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+/// // input checked as String, output inferred as String:
+/// let handle = engine.start_with(ProcessOrder, "1001".into(), WorkflowOptions::default()).await?;
+/// let receipt: String = handle.await?;
+/// # assert_eq!(receipt, "receipt for 1001");
+/// # Ok(())
+/// # }
 /// ```
 pub trait WorkflowDef {
     /// The workflow's input type — its second parameter.
@@ -255,6 +267,11 @@ pub enum DeduplicationPolicy {
     ReturnExisting,
 }
 
+/// Per-invocation options for starting or enqueuing a workflow — its
+/// idempotency key, queue and priority, deduplication, timeout, app version, and
+/// authenticated identity. Build with the chained setters (e.g.
+/// [`WorkflowOptions::with_id`] then [`queue`](WorkflowOptions::queue)); all
+/// fields default to unset.
 #[derive(Clone, Default)]
 pub struct WorkflowOptions {
     /// Explicit idempotency key. If `None`, a uuid is generated.
@@ -848,9 +865,14 @@ impl DurableEngine {
 
     /// Create a durable cron schedule that fires `workflow_name` on each tick of
     /// `cron` (a 6-field, second-precision spec). The reconciler started by
-    /// [`launch`](Self::launch) installs it on its next pass. Errors if the cron
-    /// spec is invalid, the workflow is not registered here, or a schedule with
-    /// this name already exists.
+    /// [`launch`](Self::launch) installs it on its next pass.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the cron spec or `ScheduleOptions` timezone is invalid, the
+    /// workflow is not registered here, or a schedule with this name already
+    /// exists.
+    #[doc(alias = "cron")]
     pub async fn create_schedule(
         &self,
         schedule_name: &str,
@@ -1190,6 +1212,36 @@ impl DurableEngine {
     /// any executor claims and runs it. If the id already exists in a terminal
     /// state, a polling handle over the stored result is returned instead of
     /// re-running.
+    ///
+    /// ```
+    /// # use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
+    /// # use std::sync::Arc;
+    /// # #[durare::workflow]
+    /// # async fn greet(ctx: DurableContext, name: String) -> Result<String> {
+    /// #     Ok(format!("hello, {name}"))
+    /// # }
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<()> {
+    /// # let engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    /// // Start by registered name; the id is the idempotency key.
+    /// let handle = engine
+    ///     .start::<_, String>("greet", "world".to_string(), WorkflowOptions::with_id("greet-1"))
+    ///     .await?;
+    /// assert_eq!(handle.await?, "hello, world");
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// For compile-time input/output checking without the turbofish, use
+    /// [`start_with`](Self::start_with).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnknownWorkflow`] if `name` is not registered;
+    /// [`Error::QueueDeduplicated`] if `opts.dedup_id` collides with an active
+    /// workflow on the queue (under the default `Reject` policy); an
+    /// application error if a deduplication policy is set without a
+    /// deduplication id.
     pub async fn start<I, O>(
         &self,
         name: &str,
@@ -1272,9 +1324,22 @@ impl DurableEngine {
     /// signature, so neither needs a turbofish and a wrong input type is a
     /// compile error:
     ///
-    /// ```ignore
+    /// ```
+    /// # use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
+    /// # use std::sync::Arc;
+    /// # #[durare::workflow]
+    /// # async fn process_order(ctx: DurableContext, order: String) -> Result<String> {
+    /// #     Ok(format!("receipt for {order}"))
+    /// # }
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<()> {
+    /// # let engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    /// # let order = String::from("1001");
     /// let handle = engine.start_with(ProcessOrder, order, WorkflowOptions::default()).await?;
-    /// let receipt: Receipt = handle.await?;
+    /// let receipt: String = handle.await?;
+    /// # assert_eq!(receipt, "receipt for 1001");
+    /// # Ok(())
+    /// # }
     /// ```
     ///
     /// This is sugar for [`start`](Self::start) with the name
@@ -1298,6 +1363,11 @@ impl DurableEngine {
     /// handler nudging a waiting workflow). Not durable — there is no calling
     /// workflow to checkpoint into; from workflow code use
     /// [`DurableContext::send`] instead.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NonExistentWorkflow`] if the destination workflow does not
+    /// exist.
     pub async fn send<T: Serialize>(
         &self,
         destination_id: &str,

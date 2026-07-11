@@ -171,8 +171,10 @@ pub fn decode_opt(
 /// (always present, `{}` when empty) — the byte form Go and Python both emit.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PortableWorkflowArgs {
+    /// Positional arguments, in order.
     #[serde(rename = "positionalArgs", default)]
     pub positional_args: Vec<Value>,
+    /// Keyword arguments by name (`{}` when there are none).
     #[serde(rename = "namedArgs", default)]
     pub named_args: Map<String, Value>,
 }
@@ -275,10 +277,14 @@ pub const PORTABLE_ERROR_NAME: &str = "Portable Error";
 /// portable error written by any SDK.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PortableWorkflowError {
+    /// Error type/class name (the generic [`PORTABLE_ERROR_NAME`] for a native error).
     pub name: String,
+    /// Human-readable error message.
     pub message: String,
+    /// Optional application-level error code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<Value>,
+    /// Optional structured, application-level error payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }

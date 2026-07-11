@@ -79,7 +79,9 @@ impl StepOptions {
     /// consulted on every failure before backoff; returning `false` stops retries
     /// at once (the error propagates), so permanent errors don't burn attempts:
     ///
-    /// ```ignore
+    /// ```
+    /// use durare::{Error, StepOptions};
+    ///
     /// let opts = StepOptions::new("fetch")
     ///     .max_retries(5)
     ///     .retry_if(|e: &Error| e.is_retryable());
@@ -165,6 +167,7 @@ impl DurableContext {
         }
     }
 
+    /// The id of the workflow this context belongs to.
     pub fn workflow_id(&self) -> &str {
         &self.workflow_id
     }
@@ -206,12 +209,16 @@ impl DurableContext {
     /// This lets you change a workflow's body while long-lived workflows are
     /// still running. Wrap the changed region in a patch:
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use durare::{DurableContext, Result};
+    /// # async fn demo(ctx: DurableContext) -> Result<()> {
     /// if ctx.patch("use-v2-pricing").await? {
     ///     // new code
     /// } else {
     ///     // old code
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     ///
     /// A workflow that reaches this point for the first time (new, or one that
@@ -279,6 +286,32 @@ impl DurableContext {
     /// field — each auth field set on `opts` overrides just that field — and
     /// records its `parent_workflow_id`. Pass
     /// `opts.queue` to route the child through a queue instead of running it inline.
+    ///
+    /// ```no_run
+    /// # use durare::{DurableContext, Result, WorkflowOptions};
+    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// // Fan out durable children, then gather their results.
+    /// let mut handles = Vec::new();
+    /// for region in ["us", "eu", "ap"] {
+    ///     let h = ctx
+    ///         .start_workflow::<_, u64>("count_orders", region.to_string(), WorkflowOptions::default())
+    ///         .await?;
+    ///     handles.push(h);
+    /// }
+    /// let mut total = 0;
+    /// for h in handles {
+    ///     total += h.result().await?;
+    /// }
+    /// # let _ = total;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnknownWorkflow`] if `name` is not registered on this engine,
+    /// or [`Error::UnexpectedStep`] if a replay finds a different child (or
+    /// operation) recorded at this position.
     pub async fn start_workflow<I, O>(
         &self,
         name: &str,
@@ -364,8 +397,30 @@ impl DurableContext {
     /// is returned and `f` is **not** run again — so side effects inside `f`
     /// execute at most once per logical step under normal operation.
     ///
+    /// ```no_run
+    /// # use durare::{DurableContext, Error, Result};
+    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// let charge_id = ctx
+    ///     .step("charge_card", || async {
+    ///         // Any side effect: an HTTP call, an email, a write to another system.
+    ///         Ok::<_, Error>("ch_123".to_string())
+    ///     })
+    ///     .await?;
+    /// # let _ = charge_id;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// `f` is `FnOnce`: it is invoked at most once per call. For automatic
     /// retries, use [`step_with`](Self::step_with).
+    ///
+    /// # Errors
+    ///
+    /// Returns the error `f` failed with — checkpointed, so a replay yields the
+    /// same error without re-running `f`. Also [`Error::Cancelled`] if the
+    /// workflow was cancelled, and [`Error::UnexpectedStep`] if a replay finds a
+    /// different operation recorded at this step position (a non-deterministic
+    /// workflow function).
     pub async fn step<T, F, Fut>(&self, name: &str, f: F) -> Result<T>
     where
         T: Serialize + DeserializeOwned,
@@ -391,6 +446,29 @@ impl DurableContext {
     /// fresh (non-replayed) attempt, the workflow's status is checked: a
     /// `CANCELLED` workflow refuses to run the step and returns
     /// [`Error::Cancelled`].
+    ///
+    /// ```no_run
+    /// # use durare::{DurableContext, Error, Result, StepOptions};
+    /// # async fn fetch_quote() -> Result<f64> { Ok(1.0) }
+    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// let quote = ctx
+    ///     .step_with(
+    ///         StepOptions::new("fetch_quote").max_retries(5),
+    ///         || async { fetch_quote().await },
+    ///     )
+    ///     .await?;
+    /// # let _ = quote;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns the **final** error once retries are exhausted (or immediately,
+    /// if a [`retry_if`](StepOptions::retry_if) predicate rejects it) —
+    /// checkpointed, so a replay yields the same error without re-running.
+    /// Also [`Error::Cancelled`] if the workflow was cancelled, and
+    /// [`Error::UnexpectedStep`] on a divergent replay.
     pub async fn step_with<T, F, Fut>(&self, opts: StepOptions, mut f: F) -> Result<T>
     where
         T: Serialize + DeserializeOwned,
@@ -525,13 +603,20 @@ impl DurableContext {
     /// operation and, on replay, the branches are not polled at all, so any
     /// durable calls nested inside would desynchronize the step sequence.
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use durare::{DurableContext, Result};
+    /// # async fn fetch_primary() -> String { String::new() }
+    /// # async fn fetch_fallback() -> String { String::new() }
+    /// # async fn demo(ctx: DurableContext) -> Result<()> {
     /// let (winner, value) = ctx
     ///     .select(vec![
     ///         Box::pin(async { fetch_primary().await }),
     ///         Box::pin(async { fetch_fallback().await }),
     ///     ])
     ///     .await?;
+    /// # let _ = (winner, value);
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn select<T>(
         &self,
@@ -695,7 +780,24 @@ impl DurableContext {
     /// The absolute wake time is fixed and persisted on the first call as an
     /// ordinary `DBOS.sleep` step in `operation_outputs`, so the timer does not
     /// drift if the workflow crashes and is replayed: a replay reads the same
-    /// wake instant and only waits the *remaining* time.
+    /// wake instant and only waits the *remaining* time. A workflow can safely
+    /// sleep for days:
+    ///
+    /// ```no_run
+    /// # use durare::{DurableContext, Result};
+    /// # use std::time::Duration;
+    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// ctx.sleep(Duration::from_secs(7 * 24 * 3600)).await?; // a restart doesn't reset it
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Fails only on a storage error, or [`Error::UnexpectedStep`] on a
+    /// divergent replay.
+    #[doc(alias = "timer")]
+    #[doc(alias = "delay")]
     pub async fn sleep(&self, dur: Duration) -> Result<()> {
         let seq = self.next_seq();
         let wake_at = self.durable_wake_at(seq, dur).await?;
@@ -752,11 +854,26 @@ impl DurableContext {
     }
 
     /// Durably send a message to another workflow on `topic`. Recorded as a
-    /// `DBOS.send` step, so a replay does not re-send. Errors if the destination
-    /// workflow does not exist.
+    /// `DBOS.send` step, so a replay does not re-send.
+    ///
+    /// ```no_run
+    /// # use durare::{DurableContext, Result};
+    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// ctx.send("order-1001", "approved".to_string(), "review").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// Like any step side effect, the send commits before its checkpoint: a
-    /// crash in that window re-sends on replay (at-least-once).
+    /// crash in that window re-sends on replay (at-least-once). The receiving
+    /// side ([`recv`](Self::recv)) consumes exactly once.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NonExistentWorkflow`] if the destination workflow does not
+    /// exist; otherwise storage errors, [`Error::Cancelled`], or
+    /// [`Error::UnexpectedStep`] on a divergent replay.
+    #[doc(alias = "signal")]
     pub async fn send<T: Serialize>(
         &self,
         destination_id: &str,
@@ -783,6 +900,26 @@ impl DurableContext {
     /// another. Returns `None` on timeout (also recorded, so a replay does not
     /// wait again). The timeout deadline itself is durable: a crash mid-wait
     /// resumes with the *remaining* time, not a fresh timeout.
+    ///
+    /// ```no_run
+    /// # use durare::{DurableContext, Result};
+    /// # use std::time::Duration;
+    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// // Block this workflow until an approval message arrives (or a day passes).
+    /// match ctx.recv::<String>("review", Duration::from_secs(24 * 3600)).await? {
+    ///     Some(decision) => println!("decision: {decision}"),
+    ///     None => println!("timed out waiting for review"),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// A timeout is **not** an error — it is `Ok(None)`. Fails on storage or
+    /// decode errors, [`Error::Cancelled`], or [`Error::UnexpectedStep`] on a
+    /// divergent replay.
+    #[doc(alias = "signal")]
     pub async fn recv<T: DeserializeOwned>(
         &self,
         topic: &str,
@@ -840,7 +977,21 @@ impl DurableContext {
 
     /// Publish (or overwrite) the value of event `key` on this workflow.
     /// Recorded as a `DBOS.setEvent` step; other workflows and external code
-    /// read it with `get_event`.
+    /// read it with `get_event` — the natural way to expose progress or a
+    /// result to observers:
+    ///
+    /// ```no_run
+    /// # use durare::{DurableContext, Result};
+    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// ctx.set_event("status", "shipped".to_string()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Fails on a storage error, [`Error::Cancelled`], or
+    /// [`Error::UnexpectedStep`] on a divergent replay.
     pub async fn set_event<T: Serialize>(&self, key: &str, value: T) -> Result<()> {
         let seq = self.next_seq();
         if let Some(_done) = self.replay_or_guard::<Value>(seq, "DBOS.setEvent").await? {
@@ -866,6 +1017,24 @@ impl DurableContext {
     /// be set. The value observed is recorded as a `DBOS.getEvent` step, so
     /// replays see the same value even if the event is overwritten later.
     /// Returns `None` on timeout.
+    ///
+    /// ```no_run
+    /// # use durare::{DurableContext, Result};
+    /// # use std::time::Duration;
+    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// let status: Option<String> = ctx
+    ///     .get_event("order-1001", "status", Duration::from_secs(60))
+    ///     .await?;
+    /// # let _ = status;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// A timeout is **not** an error — it is `Ok(None)`. Fails on storage or
+    /// decode errors, [`Error::Cancelled`], or [`Error::UnexpectedStep`] on a
+    /// divergent replay.
     pub async fn get_event<T: DeserializeOwned>(
         &self,
         target_workflow_id: &str,
@@ -932,10 +1101,25 @@ impl DurableContext {
     /// Each write lands at the next offset; readers drain values in order with
     /// [`DurableEngine::read_stream`](crate::DurableEngine::read_stream).
     ///
-    /// Errors if the stream was already closed by
-    /// [`close_stream`](Self::close_stream). Like any step side effect, the
-    /// append commits before its checkpoint: a crash in that window re-appends
-    /// on replay (at-least-once).
+    /// Like any step side effect, the append commits before its checkpoint: a
+    /// crash in that window re-appends on replay (at-least-once).
+    ///
+    /// ```no_run
+    /// # use durare::{DurableContext, Result};
+    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// for i in 0..3 {
+    ///     ctx.write_stream("progress", format!("chunk {i}")).await?;
+    /// }
+    /// ctx.close_stream("progress").await?; // seal it; readers stop cleanly
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Fails if the stream was already closed by
+    /// [`close_stream`](Self::close_stream); otherwise storage errors,
+    /// [`Error::Cancelled`], or [`Error::UnexpectedStep`] on a divergent replay.
     pub async fn write_stream<T: Serialize>(&self, key: &str, value: T) -> Result<()> {
         let seq = self.next_seq();
         if self
@@ -1034,12 +1218,16 @@ impl DurableContext {
     /// the final `Err` item. Also a live read (not checkpointed). Consume it with
     /// [`StreamExt::next`](futures_util::StreamExt::next):
     ///
-    /// ```ignore
+    /// ```no_run
     /// use durare::StreamExt;
+    /// # use durare::{DurableContext, Result};
+    /// # async fn demo(ctx: DurableContext, id: &str) -> Result<()> {
     /// let mut values = ctx.read_stream_values::<String>(id, "events");
     /// while let Some(v) = values.next().await {
     ///     println!("{}", v?);
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn read_stream_values<T: DeserializeOwned + 'static>(
         &self,
