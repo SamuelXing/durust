@@ -54,3 +54,39 @@ fail = { version = "0.5", features = ["failpoints"] }
 [[example]]
 name = "order"
 path = "examples/order.rs"
+
+[[example]]
+name = "saga"
+path = "examples/saga.rs"
+
+[[example]]
+name = "pipeline"
+path = "examples/pipeline.rs"
+
+[[example]]
+name = "scheduled"
+path = "examples/scheduled.rs"
+
+[[example]]
+name = "transfer"
+path = "examples/transfer.rs"
+
+[[example]]
+name = "approval"
+path = "examples/approval.rs"
+
+[[example]]
+name = "client"
+path = "examples/client.rs"
+
+[[example]]
+name = "timer"
+path = "examples/timer.rs"
+
+[[example]]
+name = "subworkflow"
+path = "examples/subworkflow.rs"
+
+[[example]]
+name = "stream"
+path = "examples/stream.rs"
