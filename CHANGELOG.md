@@ -11,6 +11,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Cross-SDK serialization conformance tests (`tests/interop.rs`) asserting durare
   reproduces the shared DBOS golden `portable_json` strings byte-for-byte
   (encode, decode, both input-envelope orderings, structured errors, round-trip).
+- End-to-end cross-SDK conformance test (`tests/interop_db.rs`, SQLite +
+  Postgres) mirroring the other SDKs' direct-insert replay: portable rows are
+  written to the `dbos` schema via raw SQL (as a Python/Go/TS/Java producer
+  would), and durare's engine claims the `ENQUEUED` workflow, runs it (portable
+  input → event → stream → consuming a portable message), and writes
+  byte-identical output/event/stream.
 
 ### Changed
 
