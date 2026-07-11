@@ -23,27 +23,33 @@
 //! bottom hold on every commit:
 //!
 //! ```
-//! use durare::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
+//! use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
 //! use std::sync::Arc;
 //! use std::sync::atomic::{AtomicU32, Ordering};
 //!
 //! /// Stand-in for a payment API we must never call twice for the same order.
 //! static CHARGES: AtomicU32 = AtomicU32::new(0);
 //!
+//! #[durare::step]
+//! async fn charge_card(ctx: &DurableContext, order_id: String) -> Result<String> {
+//!     CHARGES.fetch_add(1, Ordering::SeqCst);
+//!     Ok(format!("ch_{order_id}"))
+//! }
+//!
+//! #[durare::step]
+//! async fn send_receipt(ctx: &DurableContext, charge_id: String) -> Result<()> {
+//!     // A crash between the two steps does NOT re-charge: on restart,
+//!     // `charge_card` is served from its checkpoint and the workflow
+//!     // resumes right here.
+//!     println!("emailing receipt for {charge_id}");
+//!     Ok(())
+//! }
+//!
 //! #[durare::workflow]
 //! async fn process_order(ctx: DurableContext, order_id: String) -> Result<String> {
-//!     // Each step runs once; its result is checkpointed before moving on.
-//!     let charge_id = ctx.step("charge_card", || async {
-//!         CHARGES.fetch_add(1, Ordering::SeqCst);
-//!         Ok::<_, Error>(format!("ch_{order_id}"))
-//!     }).await?;
-//!
-//!     ctx.step("send_receipt", || async {
-//!         // A crash here does NOT re-charge: on restart, `charge_card` is
-//!         // served from its checkpoint and the workflow resumes from this step.
-//!         Ok::<_, Error>(())
-//!     }).await?;
-//!
+//!     // Reads like ordinary async code; each step checkpoints once.
+//!     let charge_id = charge_card(&ctx, order_id).await?;
+//!     send_receipt(&ctx, charge_id.clone()).await?;
 //!     Ok(charge_id)
 //! }
 //!
