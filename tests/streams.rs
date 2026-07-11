@@ -22,7 +22,7 @@ async fn write_close_then_read_in_order() -> Result<()> {
     engine
         .run_workflow::<_, ()>("producer", (), WorkflowOptions::with_id("p"))
         .await?
-        .get_result()
+        .result()
         .await?;
 
     let (values, closed): (Vec<i64>, bool) = engine.read_stream("p", "nums").await?;
@@ -59,7 +59,7 @@ async fn read_stops_when_producer_finishes_without_close() -> Result<()> {
     engine
         .run_workflow::<_, ()>("producer", (), WorkflowOptions::with_id("p2"))
         .await?
-        .get_result()
+        .result()
         .await?;
 
     let (values, closed): (Vec<String>, bool) = engine.read_stream("p2", "s").await?;
@@ -83,7 +83,7 @@ async fn snapshot_reads_available_from_offset() -> Result<()> {
     engine
         .run_workflow::<_, ()>("producer", (), WorkflowOptions::with_id("p3"))
         .await?
-        .get_result()
+        .result()
         .await?;
 
     let (head, closed): (Vec<i64>, bool) = engine.read_stream_snapshot("p3", "nums", 0).await?;
@@ -109,7 +109,7 @@ async fn writing_to_closed_stream_errors() -> Result<()> {
     let res = engine
         .run_workflow::<_, ()>("bad", (), WorkflowOptions::with_id("p4"))
         .await?
-        .get_result()
+        .result()
         .await;
     assert!(res.is_err(), "writing after close must fail");
     Ok(())
@@ -139,7 +139,7 @@ async fn workflow_reads_another_workflows_stream() -> Result<()> {
     engine
         .run_workflow::<_, ()>("producer", (), WorkflowOptions::with_id("prod"))
         .await?
-        .get_result()
+        .result()
         .await?;
 
     let values: Vec<i64> = engine
@@ -149,7 +149,7 @@ async fn workflow_reads_another_workflows_stream() -> Result<()> {
             WorkflowOptions::with_id("cons"),
         )
         .await?
-        .get_result()
+        .result()
         .await?;
     assert_eq!(values, vec![1, 2, 3]);
 
@@ -176,7 +176,7 @@ async fn async_stream_yields_values_incrementally() -> Result<()> {
         Ok::<_, Error>(())
     });
 
-    let mut producer = engine
+    let producer = engine
         .run_workflow::<_, ()>("slow_producer", (), WorkflowOptions::with_id("p6"))
         .await?;
 
@@ -188,7 +188,7 @@ async fn async_stream_yields_values_incrementally() -> Result<()> {
     }
     assert_eq!(got, vec![1, 2, 3]);
 
-    producer.get_result().await?;
+    producer.result().await?;
     Ok(())
 }
 
@@ -229,7 +229,7 @@ async fn async_stream_drains_when_producer_finishes_without_close() -> Result<()
     engine
         .run_workflow::<_, ()>("p_noclose", (), WorkflowOptions::with_id("pnc"))
         .await?
-        .get_result()
+        .result()
         .await?;
 
     let mut got = Vec::new();
@@ -259,12 +259,12 @@ async fn read_drains_while_producer_runs() -> Result<()> {
     });
 
     // Start the producer in the background, then block draining its stream.
-    let mut producer = engine
+    let producer = engine
         .run_workflow::<_, ()>("slow_producer", (), WorkflowOptions::with_id("p5"))
         .await?;
     let (values, closed): (Vec<i64>, bool) = engine.read_stream("p5", "s").await?;
     assert_eq!(values, vec![1, 2]);
     assert!(closed);
-    producer.get_result().await?;
+    producer.result().await?;
     Ok(())
 }

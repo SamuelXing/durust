@@ -41,10 +41,10 @@ async fn admin_server_endpoints() -> Result<()> {
     engine.launch().await?;
 
     // Produce one finished workflow under a known id.
-    let mut h = engine
+    let h = engine
         .run_workflow::<_, String>("echo", "hi".to_string(), WorkflowOptions::with_id("wf-1"))
         .await?;
-    assert_eq!(h.get_result().await?, "hi");
+    assert_eq!(h.result().await?, "hi");
 
     let admin = AdminServer::start(engine.clone(), 0).await?;
     let port = admin.port();
@@ -150,10 +150,10 @@ async fn admin_fork_endpoint_returns_new_id() -> Result<()> {
     let engine = Arc::new(engine);
     engine.launch().await?;
 
-    let mut h = engine
+    let h = engine
         .run_workflow::<_, String>("echo", "hi".to_string(), WorkflowOptions::with_id("orig"))
         .await?;
-    h.get_result().await?;
+    h.result().await?;
 
     let admin = AdminServer::start(engine.clone(), 0).await?;
     let port = admin.port();

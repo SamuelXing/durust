@@ -16,10 +16,10 @@ async fn child_workflow_runs_and_links_to_parent() -> Result<()> {
         Ok::<_, Error>(n * 3)
     });
     engine.register("parent", |ctx: DurableContext, n: i64| async move {
-        let mut child = ctx
+        let child = ctx
             .start_workflow::<_, i64>("triple", n, WorkflowOptions::default())
             .await?;
-        Ok::<_, Error>(child.get_result().await? + 1)
+        Ok::<_, Error>(child.result().await? + 1)
     });
 
     let out: i64 = engine.start_typed("parent", "p1", 7_i64).await?;
@@ -42,17 +42,17 @@ async fn child_workflow_inherits_identity() -> Result<()> {
         Ok::<_, Error>(ctx.authenticated_user().unwrap_or("-").to_string())
     });
     engine.register("delegator", |ctx: DurableContext, _: ()| async move {
-        let mut child = ctx
+        let child = ctx
             .start_workflow::<_, String>("whoami", (), WorkflowOptions::default())
             .await?;
-        child.get_result().await
+        child.result().await
     });
 
     let opts = WorkflowOptions::with_id("boss").authenticated_user("alice");
-    let mut handle = engine
+    let handle = engine
         .run_workflow::<_, String>("delegator", (), opts)
         .await?;
-    assert_eq!(handle.get_result().await?, "alice");
+    assert_eq!(handle.result().await?, "alice");
 
     // The identity is also persisted on the child row.
     let child = engine.retrieve_workflow::<String>("boss-0").await?;
@@ -75,10 +75,10 @@ async fn workflow_steps_introspection_in_memory() -> Result<()> {
         let v = ctx
             .step("compute", || async { Ok::<_, Error>(7_i64) })
             .await?;
-        let mut child = ctx
+        let child = ctx
             .start_workflow::<_, i64>("kid", v, WorkflowOptions::default())
             .await?;
-        child.get_result().await
+        child.result().await
     });
 
     engine.start_typed::<_, i64>("worker", "w", ()).await?;
@@ -121,8 +121,8 @@ async fn child_workflow_can_be_queued() -> Result<()> {
             queue: Some("kids".to_string()),
             ..Default::default()
         };
-        let mut child = ctx.start_workflow::<_, i64>("square", n, opts).await?;
-        child.get_result().await
+        let child = ctx.start_workflow::<_, i64>("square", n, opts).await?;
+        child.result().await
     });
     engine.register_queue(
         WorkflowQueue::new("kids").base_polling_interval(Duration::from_millis(10)),
@@ -155,18 +155,18 @@ async fn empty_workflow_id_is_regenerated() -> Result<()> {
     engine.register("parent", |ctx: DurableContext, n: i64| async move {
         // A child started with an explicit empty id must get the deterministic
         // `{parent}-{seq}` id, not an empty one.
-        let mut child = ctx
+        let child = ctx
             .start_workflow::<_, i64>("noop", n, WorkflowOptions::with_id(""))
             .await?;
-        child.get_result().await
+        child.result().await
     });
 
     // Top-level: an empty id regenerates a fresh, non-empty id.
-    let mut handle = engine
+    let handle = engine
         .run_workflow::<_, i64>("noop", 5_i64, WorkflowOptions::with_id(""))
         .await?;
     assert!(!handle.id().is_empty(), "top-level id must be regenerated");
-    assert_eq!(handle.get_result().await?, 5);
+    assert_eq!(handle.result().await?, 5);
 
     // Child: an empty id regenerates the deterministic `{parent}-{seq}`, linked home.
     let out: i64 = engine.start_typed("parent", "p1", 7_i64).await?;

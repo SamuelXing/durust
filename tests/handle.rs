@@ -1,6 +1,6 @@
 //! `WorkflowHandle` ergonomics: await it directly (`IntoFuture`), resolve it
 //! through a shared `&self` (`result`), and `clone` it to observe the same
-//! workflow from another task. The legacy `get_result(&mut self)` still works.
+//! workflow from another task.
 
 use durust::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
 use std::sync::Arc;
@@ -61,20 +61,6 @@ async fn handle_clones_and_is_send_across_spawn() -> Result<()> {
     let there: i64 = spawned.await.expect("spawned task panicked")?;
     assert_eq!(here, 11);
     assert_eq!(there, 11);
-    engine.shutdown(Duration::from_secs(1)).await?;
-    Ok(())
-}
-
-/// The legacy `get_result(&mut self)` still resolves the output (it delegates to
-/// `result`), so existing callers keep compiling.
-#[tokio::test]
-async fn get_result_shim_still_works() -> Result<()> {
-    let engine = engine_with_quick().await?;
-    let mut handle = engine
-        .run_workflow::<_, i64>("quick", 7_i64, WorkflowOptions::default())
-        .await?;
-    let out: i64 = handle.get_result().await?;
-    assert_eq!(out, 8);
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }

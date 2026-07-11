@@ -34,7 +34,7 @@ async fn config_name_routes_to_matching_instance() -> Result<()> {
             WorkflowOptions::default().config_name("en"),
         )
         .await?
-        .get_result()
+        .result()
         .await?;
     let fr: String = engine
         .run_workflow::<_, String>(
@@ -43,13 +43,13 @@ async fn config_name_routes_to_matching_instance() -> Result<()> {
             WorkflowOptions::default().config_name("fr"),
         )
         .await?
-        .get_result()
+        .result()
         .await?;
     assert_eq!(en, "Hello, Sam");
     assert_eq!(fr, "Bonjour, Sam");
 
     // Queue dispatch (a claiming dispatcher must route by the persisted config).
-    let mut qen: WorkflowHandle<String> = engine
+    let qen: WorkflowHandle<String> = engine
         .enqueue(
             "q",
             "greet",
@@ -59,7 +59,7 @@ async fn config_name_routes_to_matching_instance() -> Result<()> {
                 .class_name("Greeter"),
         )
         .await?;
-    let mut qfr: WorkflowHandle<String> = engine
+    let qfr: WorkflowHandle<String> = engine
         .enqueue(
             "q",
             "greet",
@@ -67,8 +67,8 @@ async fn config_name_routes_to_matching_instance() -> Result<()> {
             WorkflowOptions::default().config_name("fr"),
         )
         .await?;
-    assert_eq!(qen.get_result().await?, "Hello, Q");
-    assert_eq!(qfr.get_result().await?, "Bonjour, Q");
+    assert_eq!(qen.result().await?, "Hello, Q");
+    assert_eq!(qfr.result().await?, "Bonjour, Q");
 
     // The config/class names round-trip on the persisted row.
     let status = engine
@@ -125,7 +125,7 @@ async fn plain_registration_unaffected_by_config_routing() -> Result<()> {
     let out: i64 = engine
         .run_workflow::<_, i64>("plain", 41_i64, WorkflowOptions::default())
         .await?
-        .get_result()
+        .result()
         .await?;
     assert_eq!(out, 42);
 
@@ -158,14 +158,14 @@ async fn fork_of_configured_run_routes_to_same_instance() -> Result<()> {
                 .class_name("Greeter"),
         )
         .await?
-        .get_result()
+        .result()
         .await?;
     assert_eq!(fr, "Bonjour, Sam");
 
-    let mut forked = engine
+    let forked = engine
         .fork_workflow::<String>("wf-fr", 0, WorkflowOptions::with_id("wf-fr-fork"))
         .await?;
-    assert_eq!(forked.get_result().await?, "Bonjour, Sam");
+    assert_eq!(forked.result().await?, "Bonjour, Sam");
 
     let status = engine
         .retrieve_workflow::<String>("wf-fr-fork")

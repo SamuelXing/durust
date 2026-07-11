@@ -44,7 +44,7 @@ async fn cross_format(writer: Serializer, reader: Serializer, tag: &str) -> Resu
                 WorkflowOptions::with_id("wf-ser"),
             )
             .await?
-            .get_result()
+            .result()
             .await?;
         assert_eq!(out, "hi ada");
     }
@@ -53,11 +53,11 @@ async fn cross_format(writer: Serializer, reader: Serializer, tag: &str) -> Resu
     // format must still decode the persisted input, step output, and result.
     {
         let engine = engine_with(&url, reader).await?;
-        let mut handle = engine.retrieve_workflow::<String>("wf-ser").await?;
+        let handle = engine.retrieve_workflow::<String>("wf-ser").await?;
         let status = handle.get_status().await?;
         assert_eq!(status.input, serde_json::json!("ada"));
         assert_eq!(status.output, Some(serde_json::json!("hi ada")));
-        assert_eq!(handle.get_result().await?, "hi ada");
+        assert_eq!(handle.result().await?, "hi ada");
     }
 
     let _ = std::fs::remove_file(path);
@@ -83,7 +83,7 @@ async fn portable_error_is_stored_as_envelope() -> Result<()> {
     let outcome = engine
         .run_workflow::<_, ()>("boom", (), WorkflowOptions::with_id("wf-err"))
         .await?
-        .get_result()
+        .result()
         .await;
     assert!(outcome.is_err());
 
@@ -105,7 +105,7 @@ async fn portable_error_is_stored_as_envelope() -> Result<()> {
 /// A workflow that raises a structured `Error::Portable` under portable mode
 /// stores its full type name + code + data, and a separate reader recovers them
 /// — both as the structured `error_info` and as a reconstructed `Error::Portable`
-/// from `get_result`, the cross-language structured-error round-trip.
+/// from `result`, the cross-language structured-error round-trip.
 #[tokio::test]
 async fn portable_typed_error_round_trips() -> Result<()> {
     let (url, path) = temp_db_url("err-typed");
@@ -127,7 +127,7 @@ async fn portable_typed_error_round_trips() -> Result<()> {
         let outcome = engine
             .run_workflow::<_, ()>("validate", (), WorkflowOptions::with_id("wf-typed"))
             .await?
-            .get_result()
+            .result()
             .await;
         // The owning caller gets the typed error straight back.
         assert!(matches!(outcome, Err(Error::Portable(ref pe)) if pe.name == "ValidationError"));
@@ -149,9 +149,9 @@ async fn portable_typed_error_round_trips() -> Result<()> {
         assert_eq!(info.code, Some(serde_json::json!(400)));
         assert_eq!(info.data, Some(serde_json::json!({"field": "email"})));
 
-        // get_result reconstructs the typed error for the observer.
-        let mut handle = handle;
-        match handle.get_result().await {
+        // result reconstructs the typed error for the observer.
+        let handle = handle;
+        match handle.result().await {
             Err(Error::Portable(pe)) => {
                 assert_eq!(pe.name, "ValidationError");
                 assert_eq!(pe.message, "bad email");
@@ -179,7 +179,7 @@ async fn default_error_stays_bare() -> Result<()> {
     let outcome = engine
         .run_workflow::<_, ()>("boom", (), WorkflowOptions::with_id("wf-err"))
         .await?
-        .get_result()
+        .result()
         .await;
     assert!(outcome.is_err());
 

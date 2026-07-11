@@ -51,7 +51,7 @@ async fn expense_approval(ctx: DurableContext, exp: Expense) -> Result<String> {
 /// Start one expense, watch it reach `awaiting_approval` from the outside, then
 /// send it `decision`. Returns the final outcome.
 async fn decide(engine: &DurableEngine, id: &str, exp: Expense, decision: &str) -> Result<String> {
-    let mut handle = engine
+    let handle = engine
         .start_with(ExpenseApproval, exp, WorkflowOptions::with_id(id))
         .await?;
 
@@ -68,7 +68,7 @@ async fn decide(engine: &DurableEngine, id: &str, exp: Expense, decision: &str) 
     println!("  [manager] sending '{decision}' to {id}");
     engine.send(id, decision.to_string(), "decision").await?;
 
-    handle.get_result().await
+    handle.result().await
 }
 
 #[tokio::main]

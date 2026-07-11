@@ -194,10 +194,10 @@ async fn conductor_handles_workflow_management() -> Result<()> {
     });
     let engine = Arc::new(engine);
     engine.launch().await?;
-    let mut h = engine
+    let h = engine
         .run_workflow::<_, String>("work", "hi".to_string(), WorkflowOptions::with_id("wf-1"))
         .await?;
-    assert_eq!(h.get_result().await?, "hi!");
+    assert_eq!(h.result().await?, "hi!");
 
     let conductor = Conductor::start(
         engine.clone(),
@@ -503,10 +503,10 @@ async fn conductor_handles_registry_and_aggregates() -> Result<()> {
     engine.register_queue(WorkflowQueue::new("myq").worker_concurrency(3));
     let engine = Arc::new(engine);
     engine.launch().await?; // registers application version 2.0.0
-    let mut h = engine
+    let h = engine
         .run_workflow::<_, String>("work", "hi".to_string(), WorkflowOptions::with_id("wf-1"))
         .await?;
-    h.get_result().await?;
+    h.result().await?;
 
     let conductor = Conductor::start(
         engine.clone(),
@@ -621,10 +621,10 @@ async fn conductor_handles_events_and_streams() -> Result<()> {
     });
     let engine = Arc::new(engine);
     engine.launch().await?;
-    let mut h = engine
+    let h = engine
         .run_workflow::<_, String>("producer", String::new(), WorkflowOptions::with_id("p-1"))
         .await?;
-    h.get_result().await?;
+    h.result().await?;
     // A notification delivered to the workflow's mailbox.
     engine.send("p-1", "hello", "greetings").await?;
 
@@ -715,10 +715,10 @@ async fn conductor_handles_metrics_and_retention() -> Result<()> {
     engine.launch().await?;
 
     // One completed workflow (with a step) ...
-    let mut h = engine
+    let h = engine
         .run_workflow::<_, String>("work", "hi".to_string(), WorkflowOptions::with_id("wf-1"))
         .await?;
-    h.get_result().await?;
+    h.result().await?;
     // ... and one long-delayed workflow that stays DELAYED (cancellable).
     let _delayed = engine
         .run_workflow::<_, String>(
@@ -839,7 +839,7 @@ async fn conductor_exports_and_imports_workflow() -> Result<()> {
     engine
         .run_workflow::<_, i64>("producer", 21_i64, WorkflowOptions::with_id("p-1"))
         .await?
-        .get_result()
+        .result()
         .await?;
 
     let conductor = Conductor::start(

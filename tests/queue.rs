@@ -24,10 +24,10 @@ async fn enqueue_dispatches_and_completes() -> Result<()> {
     engine.register_queue(test_queue("q"));
     engine.launch().await?;
 
-    let mut handle = engine
+    let handle = engine
         .enqueue::<_, i64>("q", "add_one", 41_i64, WorkflowOptions::default())
         .await?;
-    assert_eq!(handle.get_result().await?, 42);
+    assert_eq!(handle.result().await?, 42);
 
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
@@ -78,7 +78,7 @@ async fn worker_concurrency_is_enforced() -> Result<()> {
         );
     }
     for h in &mut handles {
-        h.get_result().await?;
+        h.result().await?;
     }
 
     assert_eq!(
@@ -142,12 +142,12 @@ async fn delayed_enqueue_waits_then_runs() -> Result<()> {
     let started = Instant::now();
     let mut opts = WorkflowOptions::with_id("wf-delayed");
     opts.delay = Some(Duration::from_millis(150));
-    let mut handle = engine
+    let handle = engine
         .enqueue::<_, i64>("later", "echo", 7_i64, opts)
         .await?;
 
     assert_eq!(handle.get_status().await?.status, STATUS_DELAYED);
-    assert_eq!(handle.get_result().await?, 7);
+    assert_eq!(handle.result().await?, 7);
     assert!(
         started.elapsed() >= Duration::from_millis(120),
         "workflow must not run before its delay expires"
@@ -172,7 +172,7 @@ async fn set_workflow_delay_reschedules() -> Result<()> {
     // Enqueue with a 60s delay so it would never run during the test...
     let mut opts = WorkflowOptions::with_id("wf-resched");
     opts.delay = Some(Duration::from_secs(60));
-    let mut handle = engine
+    let handle = engine
         .enqueue::<_, i64>("resched", "echo", 9_i64, opts)
         .await?;
     assert_eq!(handle.get_status().await?.status, STATUS_DELAYED);
@@ -185,7 +185,7 @@ async fn set_workflow_delay_reschedules() -> Result<()> {
             .await?,
         "rescheduling a DELAYED workflow must report a match"
     );
-    assert_eq!(handle.get_result().await?, 9);
+    assert_eq!(handle.result().await?, 9);
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "the workflow must run on the shortened delay, not the original 60s"
@@ -381,10 +381,10 @@ async fn listen_queues_dispatches_only_listened() -> Result<()> {
     engine.launch().await?;
 
     // The listened queue runs to completion.
-    let mut run = engine
+    let run = engine
         .enqueue::<_, i64>("listened", "add_one", 41_i64, WorkflowOptions::default())
         .await?;
-    assert_eq!(run.get_result().await?, 42);
+    assert_eq!(run.result().await?, 42);
 
     // The ignored queue accepts the enqueue but never dispatches it here.
     let idle = engine
@@ -416,12 +416,12 @@ async fn queues_only_filters_to_queued_workflows() -> Result<()> {
     engine
         .run_workflow::<_, ()>("noop", (), WorkflowOptions::with_id("direct"))
         .await?
-        .get_result()
+        .result()
         .await?;
     engine
         .enqueue::<_, ()>("q", "noop", (), WorkflowOptions::with_id("queued"))
         .await?
-        .get_result()
+        .result()
         .await?;
 
     let queued: Vec<String> = engine
@@ -473,7 +473,7 @@ async fn partitioned_queue_concurrency_is_per_partition() -> Result<()> {
         );
     }
     for h in &mut handles {
-        h.get_result().await?;
+        h.result().await?;
     }
 
     assert_eq!(

@@ -45,7 +45,7 @@ async fn patch_pre_patch_workflow_takes_old_path() -> Result<()> {
     let patched: bool = engine
         .run_workflow::<_, bool>("wf", (), WorkflowOptions::with_id("old"))
         .await?
-        .get_result()
+        .result()
         .await?;
     assert!(
         !patched,

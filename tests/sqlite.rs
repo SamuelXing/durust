@@ -28,10 +28,10 @@ async fn sqlite_persists_and_runs_workflow() -> Result<()> {
         Ok::<_, Error>(n + 1)
     });
 
-    let mut handle = engine
+    let handle = engine
         .run_workflow::<_, i64>("add_one", 41_i64, WorkflowOptions::with_id("wf-sqlite-1"))
         .await?;
-    assert_eq!(handle.get_result().await?, 42);
+    assert_eq!(handle.result().await?, 42);
     assert_eq!(handle.get_status().await?.status, STATUS_SUCCESS);
 
     let _ = std::fs::remove_file(path);
@@ -411,7 +411,7 @@ async fn sqlite_queue_dispatch_and_dedup() -> Result<()> {
     // slot (it is ENQUEUED, not yet completed) when the duplicate is attempted.
     let mut opts = WorkflowOptions::with_id("wf-q-1");
     opts.dedup_id = Some("only-once".to_string());
-    let mut handle = engine
+    let handle = engine
         .enqueue::<_, i64>("q", "double", 21_i64, opts)
         .await?;
 
@@ -427,7 +427,7 @@ async fn sqlite_queue_dispatch_and_dedup() -> Result<()> {
 
     // Now launch the dispatcher and let wf-q-1 run to completion.
     engine.launch().await?;
-    assert_eq!(handle.get_result().await?, 42);
+    assert_eq!(handle.result().await?, 42);
 
     // The destination FK is enforced: sending to an unknown id is typed.
     let err = engine
@@ -459,7 +459,7 @@ async fn sqlite_config_name_routes_on_queue_dispatch() -> Result<()> {
     engine.register_queue(WorkflowQueue::new("q").base_polling_interval(Duration::from_millis(10)));
     engine.launch().await?;
 
-    let mut fr = engine
+    let fr = engine
         .enqueue::<_, String>(
             "q",
             "greet",
@@ -469,7 +469,7 @@ async fn sqlite_config_name_routes_on_queue_dispatch() -> Result<()> {
                 .class_name("Greeter"),
         )
         .await?;
-    let mut en = engine
+    let en = engine
         .enqueue::<_, String>(
             "q",
             "greet",
@@ -477,8 +477,8 @@ async fn sqlite_config_name_routes_on_queue_dispatch() -> Result<()> {
             WorkflowOptions::with_id("wf-en").config_name("en"),
         )
         .await?;
-    assert_eq!(fr.get_result().await?, "Bonjour, Sam");
-    assert_eq!(en.get_result().await?, "Hello, Sam");
+    assert_eq!(fr.result().await?, "Bonjour, Sam");
+    assert_eq!(en.result().await?, "Hello, Sam");
 
     let status = engine
         .retrieve_workflow::<String>("wf-fr")
@@ -511,7 +511,7 @@ async fn sqlite_messaging_and_events() -> Result<()> {
         ))
     });
 
-    let mut handle = engine
+    let handle = engine
         .run_workflow::<_, String>("exchange", (), WorkflowOptions::with_id("wf-comm"))
         .await?;
 
@@ -523,7 +523,7 @@ async fn sqlite_messaging_and_events() -> Result<()> {
 
     engine.send("wf-comm", "m1".to_string(), "t").await?;
     engine.send("wf-comm", "m2".to_string(), "t").await?;
-    assert_eq!(handle.get_result().await?, "m1,m2");
+    assert_eq!(handle.result().await?, "m1,m2");
 
     // FK on destination_uuid: sending to a missing workflow errors.
     assert!(engine.send("ghost", "boo".to_string(), "t").await.is_err());
@@ -555,8 +555,8 @@ async fn sqlite_auth_context_persists_and_propagates() -> Result<()> {
         .authenticated_user("alice")
         .assumed_role("admin")
         .authenticated_roles(["admin", "user"]);
-    let mut handle = engine.run_workflow::<_, String>("whoami", (), opts).await?;
-    assert_eq!(handle.get_result().await?, "alice/admin/admin,user");
+    let handle = engine.run_workflow::<_, String>("whoami", (), opts).await?;
+    assert_eq!(handle.result().await?, "alice/admin/admin,user");
 
     // The identity is durable on the row.
     let status = handle.get_status().await?;
@@ -574,10 +574,10 @@ async fn sqlite_auth_context_persists_and_propagates() -> Result<()> {
     assert_eq!(fstatus.authenticated_roles, vec!["admin", "user"]);
 
     // A workflow started without an identity carries empty auth.
-    let mut bare = engine
+    let bare = engine
         .run_workflow::<_, String>("whoami", (), WorkflowOptions::with_id("wf-bare"))
         .await?;
-    assert_eq!(bare.get_result().await?, "-/-/");
+    assert_eq!(bare.result().await?, "-/-/");
     let bstatus = bare.get_status().await?;
     assert_eq!(bstatus.authenticated_user, None);
     assert!(bstatus.authenticated_roles.is_empty());
@@ -599,10 +599,10 @@ async fn sqlite_child_workflow_runs_once_across_restart() -> Result<()> {
             Ok::<_, Error>(n + 100)
         });
         engine.register("parent", |ctx: DurableContext, n: i64| async move {
-            let mut child = ctx
+            let child = ctx
                 .start_workflow::<_, i64>("child", n, WorkflowOptions::default())
                 .await?;
-            child.get_result().await
+            child.result().await
         });
     };
 
@@ -650,10 +650,10 @@ async fn sqlite_workflow_steps_introspection() -> Result<()> {
             .step("alpha", || async { Ok::<_, Error>(1_i64) })
             .await?;
         let b = ctx.step("beta", || async { Ok::<_, Error>(a + 1) }).await?;
-        let mut child = ctx
+        let child = ctx
             .start_workflow::<_, i64>("kid", b, WorkflowOptions::default())
             .await?;
-        child.get_result().await?;
+        child.result().await?;
         // Two steps + one child invocation consumed seqs 0,1,2 → next is 3.
         Ok::<_, Error>(ctx.current_step_id() as i64)
     });
@@ -769,10 +769,10 @@ async fn sqlite_management() -> Result<()> {
     assert_eq!(listed[0].id, "wf-1");
 
     // Fork from step 1: step 0 reused, step 1 re-runs (SQL copy of operation_outputs).
-    let mut forked = engine
+    let forked = engine
         .fork_workflow::<i64>("wf-1", 1, WorkflowOptions::with_id("wf-fork"))
         .await?;
-    assert_eq!(forked.get_result().await?, 15);
+    assert_eq!(forked.result().await?, 15);
     assert_eq!(SECOND_RUNS.load(Ordering::SeqCst), 2);
     let frow = engine.retrieve_workflow::<i64>("wf-fork").await?;
     assert_eq!(
@@ -784,13 +784,13 @@ async fn sqlite_management() -> Result<()> {
     engine
         .run_workflow::<_, i64>("pipeline", (), WorkflowOptions::with_id("wf-2"))
         .await?
-        .get_result()
+        .result()
         .await?;
     engine.cancel_workflow("wf-2").await?;
     // Already terminal (SUCCESS) → cancel is a no-op, and resume is a found
     // no-op whose handle reads the recorded outcome.
-    let mut done = engine.resume_workflow::<i64>("wf-2").await?;
-    assert_eq!(done.get_result().await?, 15);
+    let done = engine.resume_workflow::<i64>("wf-2").await?;
+    assert_eq!(done.result().await?, 15);
 
     // A genuinely cancellable workflow.
     use durust::{StateProvider, WorkflowStatus, STATUS_PENDING};
@@ -815,8 +815,8 @@ async fn sqlite_management() -> Result<()> {
             .status,
         STATUS_CANCELLED
     );
-    let mut resumed = engine.resume_workflow::<i64>("wf-3").await?;
-    assert_eq!(resumed.get_result().await?, 15);
+    let resumed = engine.resume_workflow::<i64>("wf-3").await?;
+    assert_eq!(resumed.result().await?, 15);
 
     engine.shutdown(Duration::from_secs(1)).await?;
     let _ = std::fs::remove_file(path);
@@ -869,8 +869,8 @@ async fn sqlite_bulk_ops() -> Result<()> {
         .resume_workflows::<()>(&["wf-1".into(), "wf-2".into()])
         .await?;
     assert_eq!(handles.len(), 2);
-    for mut h in handles {
-        h.get_result().await?;
+    for h in handles {
+        h.result().await?;
     }
     assert_eq!(
         provider.get_workflow_status("wf-1").await?.unwrap().status,
@@ -914,7 +914,7 @@ async fn sqlite_set_workflow_delay() -> Result<()> {
 
     let mut opts = WorkflowOptions::with_id("wf-d");
     opts.delay = Some(Duration::from_secs(60));
-    let mut handle = engine.enqueue::<_, i64>("d", "echo", 5_i64, opts).await?;
+    let handle = engine.enqueue::<_, i64>("d", "echo", 5_i64, opts).await?;
     assert_eq!(handle.get_status().await?.status, STATUS_DELAYED);
 
     let started = std::time::Instant::now();
@@ -923,7 +923,7 @@ async fn sqlite_set_workflow_delay() -> Result<()> {
             .set_workflow_delay("wf-d", Duration::from_millis(20))
             .await?
     );
-    assert_eq!(handle.get_result().await?, 5);
+    assert_eq!(handle.result().await?, 5);
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "must run on the shortened delay, not the original 60s"
@@ -954,7 +954,7 @@ async fn sqlite_queues_only_filter() -> Result<()> {
     engine
         .enqueue::<_, ()>("q", "noop", (), WorkflowOptions::with_id("queued"))
         .await?
-        .get_result()
+        .result()
         .await?;
 
     let queued: Vec<String> = engine
@@ -990,7 +990,7 @@ async fn sqlite_partitioned_queue_dispatch() -> Result<()> {
     );
     engine.launch().await?;
 
-    let mut a = engine
+    let a = engine
         .enqueue::<_, i64>(
             "pq",
             "echo",
@@ -998,7 +998,7 @@ async fn sqlite_partitioned_queue_dispatch() -> Result<()> {
             WorkflowOptions::with_id("a").partition_key("east"),
         )
         .await?;
-    let mut b = engine
+    let b = engine
         .enqueue::<_, i64>(
             "pq",
             "echo",
@@ -1006,8 +1006,8 @@ async fn sqlite_partitioned_queue_dispatch() -> Result<()> {
             WorkflowOptions::with_id("b").partition_key("west"),
         )
         .await?;
-    assert_eq!(a.get_result().await?, 1);
-    assert_eq!(b.get_result().await?, 2);
+    assert_eq!(a.result().await?, 1);
+    assert_eq!(b.result().await?, 2);
 
     // The partition key round-trips through the workflow_status row.
     assert_eq!(
@@ -1035,10 +1035,10 @@ async fn sqlite_list_filters_extended() -> Result<()> {
         Ok::<_, Error>(n * 10)
     });
     engine.register("parent", |ctx: DurableContext, _: ()| async move {
-        let mut h = ctx
+        let h = ctx
             .start_workflow::<i64, i64>("child", 5_i64, WorkflowOptions::default())
             .await?;
-        h.get_result().await
+        h.result().await
     });
     let out: i64 = engine.start_typed("parent", "p", ()).await?;
     assert_eq!(out, 50);
@@ -1461,8 +1461,8 @@ async fn sqlite_client_enqueues_work_an_engine_runs() -> Result<()> {
         workflow_id: Some("job-1".to_string()),
         ..Default::default()
     };
-    let mut handle = client.enqueue::<_, i64>("q", "double", 21i64, opts).await?;
-    assert_eq!(handle.get_result().await?, 42);
+    let handle = client.enqueue::<_, i64>("q", "double", 21i64, opts).await?;
+    assert_eq!(handle.result().await?, 42);
     assert_eq!(
         client.list_workflows(&ListFilter::default()).await?.len(),
         1
@@ -1536,7 +1536,7 @@ async fn sqlite_portable_input_envelope() -> Result<()> {
             WorkflowOptions::with_id("wf-env"),
         )
         .await?
-        .get_result()
+        .result()
         .await?;
     assert_eq!(out, "echo:ada");
 
@@ -1625,7 +1625,7 @@ async fn sqlite_custom_serializer_roundtrips() -> Result<()> {
             WorkflowOptions::with_id("wf-hex"),
         )
         .await?
-        .get_result()
+        .result()
         .await?;
     assert_eq!(out, "hi ADA");
 
@@ -2365,7 +2365,7 @@ async fn sqlite_export_import_round_trip() -> Result<()> {
     let out: i64 = engine
         .run_workflow::<_, i64>("expo", 21_i64, WorkflowOptions::with_id(id))
         .await?
-        .get_result()
+        .result()
         .await?;
     assert_eq!(out, 42);
 
@@ -2435,7 +2435,7 @@ async fn sqlite_was_forked_from_survives_import() -> Result<()> {
     engine
         .run_workflow::<_, i64>("wff", 1i64, WorkflowOptions::with_id("src"))
         .await?
-        .get_result()
+        .result()
         .await?;
     // fork_workflow stamps the source and creates the fork row synchronously; the
     // fork itself need not run for the import-reconstruction check.
@@ -2502,7 +2502,7 @@ async fn sqlite_was_forked_from_reconstructed_when_payload_omits_it() -> Result<
     engine
         .run_workflow::<_, i64>("wff", 1i64, WorkflowOptions::with_id("src"))
         .await?
-        .get_result()
+        .result()
         .await?;
     engine
         .fork_workflow::<i64>("src", 0, WorkflowOptions::with_id("fork"))
@@ -2755,8 +2755,8 @@ async fn sqlite_unhandled_claim_is_released_not_stranded() -> Result<()> {
     );
     y.register_queue(WorkflowQueue::new("q").base_polling_interval(Duration::from_millis(10)));
     y.launch().await?;
-    let mut h = y.retrieve_workflow::<i64>("wf-ghost").await?;
-    let out = tokio::time::timeout(Duration::from_secs(20), h.get_result())
+    let h = y.retrieve_workflow::<i64>("wf-ghost").await?;
+    let out = tokio::time::timeout(Duration::from_secs(20), h.result())
         .await
         .expect("the released workflow must be claimable by an engine with the handler")?;
     assert_eq!(out, 7);
@@ -2943,8 +2943,8 @@ async fn sqlite_transaction_replays_on_recovery_without_rerunning_body() -> Resu
     // transaction replays its recorded outcome, the body does not run again.
     let recovered = engine.recover().await?;
     assert!(recovered >= 1, "the seeded PENDING workflow was recovered");
-    let mut h = engine.retrieve_workflow::<i64>(id).await?;
-    assert_eq!(h.get_result().await?, 7);
+    let h = engine.retrieve_workflow::<i64>(id).await?;
+    assert_eq!(h.result().await?, 7);
     assert_eq!(
         TX_RUNS.load(Ordering::SeqCst),
         1,

@@ -22,8 +22,8 @@ async fn retrieve_and_list() -> Result<()> {
     engine.start_typed::<_, i64>("add", "wf-a", 1_i64).await?;
     engine.start_typed::<_, i64>("add", "wf-b", 2_i64).await?;
 
-    let mut h = engine.retrieve_workflow::<i64>("wf-a").await?;
-    assert_eq!(h.get_result().await?, 2);
+    let h = engine.retrieve_workflow::<i64>("wf-a").await?;
+    assert_eq!(h.result().await?, 2);
 
     assert!(engine.retrieve_workflow::<i64>("ghost").await.is_err());
 
@@ -131,8 +131,8 @@ async fn cancel_then_resume() -> Result<()> {
 
     // Resume re-runs from checkpoints: step 0 is replayed (not re-run), step 1
     // proceeds, workflow completes.
-    let mut h = engine.resume_workflow::<i64>("wf-cancel").await?;
-    assert_eq!(h.get_result().await?, 2);
+    let h = engine.resume_workflow::<i64>("wf-cancel").await?;
+    assert_eq!(h.result().await?, 2);
     assert_eq!(
         STEP_RUNS.load(Ordering::SeqCst),
         0,
@@ -141,8 +141,8 @@ async fn cancel_then_resume() -> Result<()> {
 
     // Resuming a completed workflow is a no-op: the handle reads the recorded
     // outcome without re-running anything (matching the reference SDKs).
-    let mut done = engine.resume_workflow::<i64>("wf-cancel").await?;
-    assert_eq!(done.get_result().await?, 2);
+    let done = engine.resume_workflow::<i64>("wf-cancel").await?;
+    assert_eq!(done.result().await?, 2);
     assert_eq!(STEP_RUNS.load(Ordering::SeqCst), 0, "no step re-ran");
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
@@ -176,10 +176,10 @@ async fn fork_reuses_checkpoints() -> Result<()> {
     assert_eq!(SECOND_RUNS.load(Ordering::SeqCst), 1);
 
     // Fork from step 1: step 0 ("first") is reused, step 1 re-executes.
-    let mut forked = engine
+    let forked = engine
         .fork_workflow::<i64>("wf-orig", 1, WorkflowOptions::with_id("wf-fork"))
         .await?;
-    assert_eq!(forked.get_result().await?, 15);
+    assert_eq!(forked.result().await?, 15);
     assert_eq!(
         SECOND_RUNS.load(Ordering::SeqCst),
         2,
@@ -458,8 +458,8 @@ async fn bulk_cancel_and_resume() -> Result<()> {
         3,
         "every existing id gets a handle; ghost none"
     );
-    for mut h in handles {
-        h.get_result().await?;
+    for h in handles {
+        h.result().await?;
     }
     assert_eq!(status_of(&provider, "wf-done").await, STATUS_SUCCESS);
     assert_eq!(status_of(&provider, "wf-1").await, STATUS_SUCCESS);
@@ -518,10 +518,10 @@ async fn list_filters_parentage_and_load_flags() -> Result<()> {
         Ok::<_, Error>(n * 10)
     });
     engine.register("parent", |ctx: DurableContext, _: ()| async move {
-        let mut h = ctx
+        let h = ctx
             .start_workflow::<i64, i64>("child", 5_i64, WorkflowOptions::default())
             .await?;
-        h.get_result().await
+        h.result().await
     });
     let out: i64 = engine.start_typed("parent", "p", ()).await?;
     assert_eq!(out, 50);
@@ -922,8 +922,8 @@ async fn fork_routes_to_named_queue_and_inherits_version() -> Result<()> {
     // the queue, and the version is the original's.
     let mut opts = WorkflowOptions::with_id("wf-fork-q");
     opts.queue = Some("fork-q".to_string());
-    let mut forked = engine.fork_workflow::<i64>("wf-orig-q", 0, opts).await?;
-    assert_eq!(forked.get_result().await?, 42);
+    let forked = engine.fork_workflow::<i64>("wf-orig-q", 0, opts).await?;
+    assert_eq!(forked.result().await?, 42);
     let row = provider.get_workflow_status("wf-fork-q").await?.unwrap();
     assert_eq!(row.queue_name.as_deref(), Some("fork-q"));
     let orig_row = provider.get_workflow_status("wf-orig-q").await?.unwrap();
@@ -984,8 +984,8 @@ async fn renamed_step_on_replay_fails_as_unexpected_step() -> Result<()> {
         .record_step_result("wf-evolved", 0, "first", serde_json::json!(1), None, None)
         .await?;
 
-    let mut h = engine.resume_workflow::<i64>("wf-evolved").await?;
-    let err = h.get_result().await.expect_err("replay must fail");
+    let h = engine.resume_workflow::<i64>("wf-evolved").await?;
+    let err = h.result().await.expect_err("replay must fail");
     let msg = err.to_string();
     assert!(
         msg.contains("non-deterministic") && msg.contains("renamed") && msg.contains("first"),
@@ -1028,8 +1028,8 @@ async fn changed_child_on_replay_fails_as_unexpected_step() -> Result<()> {
         .record_child_workflow("wf-parent", 0, "child-a", "recorded-child-id")
         .await?;
 
-    let mut h = engine.resume_workflow::<String>("wf-parent").await?;
-    let err = h.get_result().await.expect_err("replay must fail");
+    let h = engine.resume_workflow::<String>("wf-parent").await?;
+    let err = h.result().await.expect_err("replay must fail");
     let msg = err.to_string();
     assert!(
         msg.contains("non-deterministic") && msg.contains("child-b") && msg.contains("child-a"),
@@ -1067,10 +1067,10 @@ async fn resume_routes_to_named_queue() -> Result<()> {
         .await?;
     engine.cancel_workflow("wf-bounce").await?;
 
-    let mut h = engine
+    let h = engine
         .resume_workflow_on::<i64>("wf-bounce", "resume-q")
         .await?;
-    assert_eq!(h.get_result().await?, 42);
+    assert_eq!(h.result().await?, 42);
     let row = provider.get_workflow_status("wf-bounce").await?.unwrap();
     assert_eq!(
         row.queue_name.as_deref(),
@@ -1089,14 +1089,14 @@ async fn child_auth_inherits_per_field() -> Result<()> {
     let mut engine = DurableEngine::new(provider.clone()).await?;
     engine.register("parent", |ctx: DurableContext, _: ()| async move {
         // Override ONLY the assumed role; user and roles must come from the parent.
-        let mut h = ctx
+        let h = ctx
             .start_workflow::<_, i64>(
                 "child",
                 (),
                 WorkflowOptions::default().assumed_role("auditor"),
             )
             .await?;
-        h.get_result().await?;
+        h.result().await?;
         Ok::<_, Error>(h.id().to_string())
     });
     engine.register("child", |ctx: DurableContext, _: ()| async move {
@@ -1107,7 +1107,7 @@ async fn child_auth_inherits_per_field() -> Result<()> {
     });
     engine.launch().await?;
 
-    let mut h = engine
+    let h = engine
         .run_workflow::<_, String>(
             "parent",
             (),
@@ -1117,7 +1117,7 @@ async fn child_auth_inherits_per_field() -> Result<()> {
                 .authenticated_roles(["admin", "user"]),
         )
         .await?;
-    let child_id = h.get_result().await?;
+    let child_id = h.result().await?;
 
     // The persisted child row carries the mixed identity.
     let row = provider.get_workflow_status(&child_id).await?.unwrap();

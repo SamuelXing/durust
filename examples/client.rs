@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
 
     // Enqueue a job the client itself does not know how to run.
     println!("[client] enqueue monthly_report for 2026-07");
-    let mut handle = client
+    let handle = client
         .enqueue::<_, String>(
             "reports",
             "monthly_report",
@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
     );
 
     // Await the result the worker produced.
-    let report = handle.get_result().await?;
+    let report = handle.result().await?;
     println!("[client] result: {report}");
 
     // Inspect its durable steps, and re-attach to it by id later.
@@ -78,8 +78,8 @@ async fn main() -> Result<()> {
         steps.iter().map(|s| &s.name).collect::<Vec<_>>()
     );
 
-    let mut again = client.retrieve_workflow::<String>("report-jul").await?;
-    println!("[client] re-retrieved by id: {}", again.get_result().await?);
+    let again = client.retrieve_workflow::<String>("report-jul").await?;
+    println!("[client] re-retrieved by id: {}", again.result().await?);
 
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())

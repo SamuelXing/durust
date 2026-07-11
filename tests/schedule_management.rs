@@ -141,12 +141,12 @@ async fn trigger_runs_once_now() -> Result<()> {
         .create_schedule("s", "wf", "0 0 12 * * *", ScheduleOptions::new())
         .await?;
 
-    let mut handle: WorkflowHandle<String> = engine.trigger_schedule("s").await?;
+    let handle: WorkflowHandle<String> = engine.trigger_schedule("s").await?;
     assert!(
         handle.id().starts_with("sched-s-trigger-"),
         "distinct trigger id"
     );
-    assert_eq!(handle.get_result().await?, "done");
+    assert_eq!(handle.result().await?, "done");
     assert_eq!(WORK.load(Ordering::SeqCst), 1, "ran exactly once");
 
     assert!(

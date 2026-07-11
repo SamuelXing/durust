@@ -87,8 +87,8 @@ async fn main() -> Result<()> {
 
     // Await every job's result.
     let mut total = 0u64;
-    for mut h in handles {
-        total += h.get_result().await?;
+    for h in handles {
+        total += h.result().await?;
     }
 
     println!("[done] {total} bytes across all thumbnails");

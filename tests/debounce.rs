@@ -32,7 +32,7 @@ async fn debounce_coalesces_to_latest_input() -> Result<()> {
         .debounce("k", delay, "b".to_string())
         .await?;
     tokio::time::sleep(Duration::from_millis(40)).await;
-    let mut h3: WorkflowHandle<String> = engine
+    let h3: WorkflowHandle<String> = engine
         .debouncer("notify")
         .debounce("k", delay, "c".to_string())
         .await?;
@@ -42,7 +42,7 @@ async fn debounce_coalesces_to_latest_input() -> Result<()> {
     assert_eq!(h2.id(), h3.id());
 
     // That single run executes with the latest input.
-    let out = h3.get_result().await?;
+    let out = h3.result().await?;
     assert_eq!(out, "c", "the debounced run used the latest input");
     assert_eq!(RUNS.load(Ordering::SeqCst), 1, "exactly one run");
 
@@ -78,7 +78,7 @@ async fn debounce_from_client_coalesces_to_latest_input() -> Result<()> {
         .debounce("k", delay, "b".to_string())
         .await?;
     tokio::time::sleep(Duration::from_millis(40)).await;
-    let mut h3: WorkflowHandle<String> = client
+    let h3: WorkflowHandle<String> = client
         .debouncer("notify")
         .debounce("k", delay, "c".to_string())
         .await?;
@@ -86,7 +86,7 @@ async fn debounce_from_client_coalesces_to_latest_input() -> Result<()> {
     assert_eq!(h1.id(), h2.id());
     assert_eq!(h2.id(), h3.id());
 
-    let out = h3.get_result().await?;
+    let out = h3.result().await?;
     assert_eq!(out, "c", "the debounced run used the latest input");
     assert_eq!(RUNS.load(Ordering::SeqCst), 1, "exactly one run");
 
@@ -112,12 +112,12 @@ async fn debounce_threads_target_options() -> Result<()> {
     let opts = WorkflowOptions::default()
         .authenticated_user("alice")
         .app_version("9.9.9");
-    let mut h: WorkflowHandle<String> = engine
+    let h: WorkflowHandle<String> = engine
         .debouncer("notify")
         .options(opts)
         .debounce("k", Duration::from_millis(50), "x".to_string())
         .await?;
-    let out = h.get_result().await?;
+    let out = h.result().await?;
     assert_eq!(out, "alice:x", "the target ran under the threaded identity");
 
     // The target's persisted row carries the threaded version + auth.
