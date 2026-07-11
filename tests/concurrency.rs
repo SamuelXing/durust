@@ -2,7 +2,7 @@
 //! `ctx.step` is already durable (each step checkpoints independently), and
 //! `ctx.select` durably races branches and returns the first to complete.
 
-use durust::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
+use durare::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;

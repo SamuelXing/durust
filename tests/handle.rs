@@ -2,7 +2,7 @@
 //! through a shared `&self` (`result`), and `clone` it to observe the same
 //! workflow from another task.
 
-use durust::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
+use durare::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
 use std::sync::Arc;
 use std::time::Duration;
 

@@ -1,7 +1,7 @@
 //! Workflow communication tests: send/recv messaging (FIFO, timeouts, replay
 //! safety) and set_event/get_event, on the in-memory provider.
 
-use durust::{
+use durare::{
     DurableContext, DurableEngine, Error, InMemoryProvider, Result, StateProvider, WorkflowOptions,
     WorkflowStatus, STATUS_PENDING,
 };

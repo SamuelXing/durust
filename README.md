@@ -1,9 +1,14 @@
-# durust
+# durare
 
 A **DBOS-style durable execution** library for Rust, aligned with the
 [DBOS Transact Go SDK](https://github.com/dbos-inc/dbos-transact-golang). Write
 normal async code; each step is checkpointed to a database; after a crash the
 workflow resumes exactly where it left off — completed steps are **not** re-run.
+
+> **durare** is an **independent, community project.** It implements the DBOS
+> durable-execution model and is wire-compatible with the official SDKs on a
+> shared database, but it is **not affiliated with or endorsed by DBOS, Inc.**
+> The name is Latin — *durāre*, "to last, to endure."
 
 There is no separate server. The engine is a library that runs inside your worker
 and talks directly to the state backend. Storage sits behind one trait
@@ -14,9 +19,9 @@ engine.
 ## The model
 
 ```rust
-use durust::{DurableContext, Error, Result};
+use durare::{DurableContext, Error, Result};
 
-#[durust::workflow]
+#[durare::workflow]
 async fn process_order(ctx: DurableContext, order: Order) -> Result<Receipt> {
     let charge_id = ctx.step("charge_card", || async {
         Ok::<_, Error>(charge_card(&order).await?)   // side effect, recorded once
@@ -31,11 +36,11 @@ async fn process_order(ctx: DurableContext, order: Order) -> Result<Receipt> {
 ```
 
 ```rust
-use durust::{DurableEngine, SqliteProvider, WorkflowOptions};
+use durare::{DurableEngine, SqliteProvider, WorkflowOptions};
 use std::sync::Arc;
 
-# async fn run() -> durust::Result<()> {
-let engine = DurableEngine::new(Arc::new(SqliteProvider::connect("sqlite://durust.db").await?)).await?;
+# async fn run() -> durare::Result<()> {
+let engine = DurableEngine::new(Arc::new(SqliteProvider::connect("sqlite://durare.db").await?)).await?;
 engine.recover().await?;           // resume anything a prior crash left incomplete
 engine.launch().await?;            // start queue dispatchers + cron schedulers
 
@@ -54,7 +59,7 @@ deterministic. Non-determinism (wall-clock, RNG, map iteration order) belongs
 
 ## Features
 
-Annotate workflows with `#[durust::workflow]` (auto-registered via `inventory`)
+Annotate workflows with `#[durare::workflow]` (auto-registered via `inventory`)
 or register them manually with `engine.register(name, f)`.
 
 ### Durable steps & retries
@@ -66,7 +71,7 @@ or register them manually with `engine.register(name, f)`.
   step so it doesn't drift across crashes.
 
 ### Workflow handles
-`start` (string name) and `start_with` (a typed `#[durust::workflow]` marker)
+`start` (string name) and `start_with` (a typed `#[durare::workflow]` marker)
 return a `WorkflowHandle<O>` **without blocking**. Resolve it with
 `handle.result().await` (or `handle.await` — the handle is `IntoFuture`); also
 `handle.get_status().await` and `handle.id()`. The handle is `Clone` and resolves
@@ -74,7 +79,7 @@ through `&self`, so several tasks can observe the same workflow.
 
 ### Durable queues
 ```rust
-use durust::{WorkflowQueue, RateLimiter};
+use durare::{WorkflowQueue, RateLimiter};
 use std::time::Duration;
 
 engine.register_queue(
@@ -103,7 +108,7 @@ Postgres claims use `FOR UPDATE SKIP LOCKED`; SQLite uses a transactional claim.
 ```rust
 // 6-field cron (sec min hour dom mon dow). The tick input carries the fire
 // time and any context attached to the schedule.
-#[durust::workflow(schedule = "0 0 * * * *")] // top of every hour
+#[durare::workflow(schedule = "0 0 * * * *")] // top of every hour
 async fn hourly(ctx: DurableContext, tick: ScheduledInput) -> Result<()> {
     println!("fired for {}", tick.scheduled_time);
     Ok(())
@@ -134,8 +139,8 @@ cargo run --example order      # in-memory backend, or set DATABASE_URL for Post
 ### Crash recovery (Postgres)
 
 ```bash
-createdb durust
-export DATABASE_URL=postgres://localhost:5432/durust
+createdb durare
+export DATABASE_URL=postgres://localhost:5432/durare
 
 # Run 1: a fail-rs failpoint crashes the process right after charging.
 FAILPOINTS=after_charge=return cargo run --example order

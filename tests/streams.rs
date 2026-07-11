@@ -2,7 +2,7 @@
 //! append-only stream that an external reader drains in order, observing the
 //! close (or the producer going inactive).
 
-use durust::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
+use durare::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -163,7 +163,7 @@ async fn workflow_reads_another_workflows_stream() -> Result<()> {
 /// them in order while the producer is still running and ending once it closes.
 #[tokio::test]
 async fn async_stream_yields_values_incrementally() -> Result<()> {
-    use durust::StreamExt;
+    use durare::StreamExt;
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
     engine.register("slow_producer", |ctx: DurableContext, _: ()| async move {
@@ -196,7 +196,7 @@ async fn async_stream_yields_values_incrementally() -> Result<()> {
 /// `Err`, then the stream ends.
 #[tokio::test]
 async fn async_stream_errors_on_missing_workflow() -> Result<()> {
-    use durust::StreamExt;
+    use durare::StreamExt;
 
     let engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
     let mut values = engine.read_stream_values::<i64>("nope", "s");
@@ -215,7 +215,7 @@ async fn async_stream_errors_on_missing_workflow() -> Result<()> {
 /// dropped (the lost-value race the blocking `read_stream` also guards against).
 #[tokio::test]
 async fn async_stream_drains_when_producer_finishes_without_close() -> Result<()> {
-    use durust::StreamExt;
+    use durare::StreamExt;
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
     engine.register("p_noclose", |ctx: DurableContext, _: ()| async move {

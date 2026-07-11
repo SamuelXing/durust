@@ -1,9 +1,9 @@
-//! Procedural macros for `durust`.
+//! Procedural macros for `durare`.
 //!
 //! - [`macro@workflow`] leaves your async fn untouched and, alongside it, emits
 //!   a compile-time registration (so the engine auto-discovers the workflow —
 //!   no manual `engine.register(...)`) plus a typed `UpperCamelCase` marker
-//!   implementing `durust::WorkflowDef`, so the workflow can be started by a
+//!   implementing `durare::WorkflowDef`, so the workflow can be started by a
 //!   type-checked reference rather than a string.
 //! - [`macro@step`] wraps an async fn's body in a durable
 //!   `ctx.step(...)` checkpoint, so a step reads like an ordinary `async fn`
@@ -63,16 +63,16 @@ impl Parse for WorkflowArgs {
 /// workflow.
 ///
 /// ```ignore
-/// #[durust::workflow]
+/// #[durare::workflow]
 /// async fn process_order(ctx: DurableContext, order: Order) -> Result<Receipt> { ... }
 ///
 /// // Override the registered name:
-/// #[durust::workflow("orders.process")]
+/// #[durare::workflow("orders.process")]
 /// async fn process_order(ctx: DurableContext, order: Order) -> Result<Receipt> { ... }
 ///
 /// // Run on a cron schedule (6-field cron, second precision). The workflow
 /// // receives the scheduled tick time (RFC 3339) as its input:
-/// #[durust::workflow(schedule = "0 0 * * * *")] // top of every hour
+/// #[durare::workflow(schedule = "0 0 * * * *")] // top of every hour
 /// async fn hourly(ctx: DurableContext, scheduled_at: String) -> Result<()> { ... }
 /// ```
 ///
@@ -82,7 +82,7 @@ impl Parse for WorkflowArgs {
 ///   scheduled ones start firing once [`DurableEngine::launch`] is called;
 /// - a typed marker — an `UpperCamelCase` zero-sized struct named after the
 ///   function (`process_order` → `ProcessOrder`) implementing
-///   `durust::WorkflowDef`, so `engine.start_with(ProcessOrder, order, opts)`
+///   `durare::WorkflowDef`, so `engine.start_with(ProcessOrder, order, opts)`
 ///   is checked on input and output without a turbofish.
 #[proc_macro_attribute]
 pub fn workflow(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -131,23 +131,23 @@ pub fn workflow(attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         #func
 
-        /// Typed reference to this workflow, emitted by `#[durust::workflow]`.
+        /// Typed reference to this workflow, emitted by `#[durare::workflow]`.
         /// Pass it to `DurableEngine::start_with`.
         #[derive(Clone, Copy, Debug)]
         #vis struct #marker;
 
-        impl durust::WorkflowDef for #marker {
+        impl durare::WorkflowDef for #marker {
             type Input = #input_ty;
-            type Output = <#return_ty as durust::WorkflowResult>::Ok;
+            type Output = <#return_ty as durare::WorkflowResult>::Ok;
             const NAME: &'static str = #name;
         }
 
-        durust::inventory::submit! {
-            durust::WorkflowRegistration {
+        durare::inventory::submit! {
+            durare::WorkflowRegistration {
                 name: #name,
                 // A non-capturing closure coerces to `fn() -> WorkflowFn`.
                 // `erase` infers the Input/Output types from the fn signature.
-                builder: || durust::erase(#ident),
+                builder: || durare::erase(#ident),
                 schedule: #schedule,
             }
         }
@@ -188,13 +188,13 @@ impl Parse for StepArgs {
 }
 
 /// Turn an `async fn(&DurableContext, args..) -> Result<T>` into a durable
-/// [`step`](durust::DurableContext::step): the body is checkpointed on first run
+/// [`step`](durare::DurableContext::step): the body is checkpointed on first run
 /// and served from the checkpoint on replay — exactly like calling
 /// `ctx.step("name", || async move { ... })` by hand, but without the closure,
 /// the `Box::pin`, or the `Ok::<_, Error>` annotation.
 ///
 /// ```ignore
-/// #[durust::step]
+/// #[durare::step]
 /// async fn charge(ctx: &DurableContext, cents: i64) -> Result<Receipt> {
 ///     // ordinary async work — runs at most once per logical step
 ///     Ok(gateway::charge(cents).await?)
@@ -296,12 +296,12 @@ fn param_ident(arg: &FnArg) -> Option<&Ident> {
 }
 
 /// Turn an `async fn(&DurableContext, &mut Tx, args..) -> Result<T>` into a
-/// durable [`transaction`](durust::DurableContext::transaction): the body's SQL
+/// durable [`transaction`](durare::DurableContext::transaction): the body's SQL
 /// writes and the step checkpoint commit in one database transaction, without
 /// the `|tx| Box::pin(async move { ... })` wrapper.
 ///
 /// ```ignore
-/// #[durust::transaction]
+/// #[durare::transaction]
 /// async fn debit(ctx: &DurableContext, tx: &mut Tx<'_>, cents: i64, id: i64) -> Result<i64> {
 ///     tx.execute("UPDATE acct SET bal = bal - ? WHERE id = ?", &params![cents, id]).await?;
 ///     let row = tx.query_one("SELECT bal FROM acct WHERE id = ?", &params![id]).await?;

@@ -1,7 +1,7 @@
 //! Engine foundation tests: non-blocking handles, step retries, and engine
 //! lifecycle. All backend-free (in-memory provider).
 
-use durust::{
+use durare::{
     DurableContext, DurableEngine, Error, InMemoryProvider, Result, StepOptions, WorkflowOptions,
     STATUS_CANCELLED, STATUS_PENDING, STATUS_SUCCESS,
 };

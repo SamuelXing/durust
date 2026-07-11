@@ -3,7 +3,7 @@
 //! with the reserved internal names — are a build-time error), and
 //! `DurableEngine::connect` scheme-dispatches a provider from a URL.
 
-use durust::{
+use durare::{
     DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, Result, WorkflowOptions,
     WorkflowQueue,
 };

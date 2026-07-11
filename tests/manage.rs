@@ -1,7 +1,7 @@
 //! Workflow management tests: retrieve, list (filters), cancel, resume, fork,
 //! and version-gated recovery. Backend-free (in-memory provider).
 
-use durust::{
+use durare::{
     DurableContext, DurableEngine, Error, InMemoryProvider, ListFilter, Result, StateProvider,
     StepAggregateQuery, WorkflowAggregate, WorkflowAggregateQuery, WorkflowOptions, WorkflowStatus,
     STATUS_CANCELLED, STATUS_ENQUEUED, STATUS_PENDING, STATUS_SUCCESS,
@@ -410,7 +410,7 @@ async fn recover_caps_attempts() -> Result<()> {
 /// Cancelling a queued workflow removes it from the queue (it never runs).
 #[tokio::test]
 async fn cancel_removes_from_queue() -> Result<()> {
-    use durust::WorkflowQueue;
+    use durare::WorkflowQueue;
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
     engine.register("noop", |_ctx: DurableContext, _: ()| async move {
         Ok::<_, Error>(())
@@ -935,7 +935,7 @@ async fn management_ops_on_missing_workflow() -> Result<()> {
         "cancel of a missing workflow is a no-op"
     );
     // Resume and fork of an unknown id fail with a typed NonExistentWorkflow.
-    use durust::ErrorCode;
+    use durare::ErrorCode;
     let Err(resume_err) = engine.resume_workflow::<()>("ghost").await else {
         panic!("resume of a missing workflow must error");
     };
@@ -964,7 +964,7 @@ async fn status_of(provider: &Arc<InMemoryProvider>, id: &str) -> String {
 /// overridden; a partition key without a queue is rejected up front.
 #[tokio::test]
 async fn fork_routes_to_named_queue_and_inherits_version() -> Result<()> {
-    use durust::WorkflowQueue;
+    use durare::WorkflowQueue;
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
     engine.register("double", |_ctx: DurableContext, n: i64| async move {
@@ -1107,7 +1107,7 @@ async fn changed_child_on_replay_fails_as_unexpected_step() -> Result<()> {
 /// instead of the internal queue, so it runs under that queue's limits.
 #[tokio::test]
 async fn resume_routes_to_named_queue() -> Result<()> {
-    use durust::WorkflowQueue;
+    use durare::WorkflowQueue;
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
     engine.register("bounce", |_ctx: DurableContext, n: i64| async move {

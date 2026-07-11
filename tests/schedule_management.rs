@@ -4,7 +4,7 @@
 //! macro schedule pollutes the reconciler.
 
 use chrono::{TimeZone, Utc};
-use durust::{
+use durare::{
     ApplySchedule, DurableContext, DurableEngine, Error, InMemoryProvider, Result, ScheduleFilter,
     ScheduleOptions, ScheduledInput, StateProvider, WorkflowHandle,
 };

@@ -14,7 +14,7 @@
 //! cargo run --example pipeline
 //! ```
 
-use durust::{
+use durare::{
     DurableContext, DurableEngine, InMemoryProvider, RateLimiter, Result, WorkflowOptions,
     WorkflowQueue,
 };
@@ -29,14 +29,14 @@ static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 
 // The actual work — a durable step, checkpointed once per job.
-#[durust::step]
+#[durare::step]
 async fn resize(ctx: &DurableContext, image: String) -> Result<u64> {
     // Pretend resizing takes a moment, so several jobs overlap.
     tokio::time::sleep(Duration::from_millis(60)).await;
     Ok(image.len() as u64 * 1024)
 }
 
-#[durust::workflow]
+#[durare::workflow]
 async fn make_thumbnail(ctx: DurableContext, image: String) -> Result<u64> {
     let running = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
     PEAK.fetch_max(running, Ordering::SeqCst);

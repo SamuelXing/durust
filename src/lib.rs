@@ -1,4 +1,4 @@
-//! # durust
+//! # durare
 //!
 //! A DBOS-style **durable execution** library for Rust.
 //!
@@ -14,7 +14,7 @@
 //! later without changing the engine.
 //!
 //! ```no_run
-//! use durust::{DurableEngine, DurableContext, InMemoryProvider, Error, Result, WorkflowOptions};
+//! use durare::{DurableEngine, DurableContext, InMemoryProvider, Error, Result, WorkflowOptions};
 //! use std::sync::Arc;
 //!
 //! async fn hello(ctx: DurableContext, name: String) -> Result<String> {
@@ -58,7 +58,7 @@ pub use client::Client;
 pub use conductor::{AlertHandler, Conductor, ConductorConfig};
 pub use context::{AuthContext, DurableContext, RetryPredicate, StepOptions};
 pub use debounce::{Debouncer, DebouncerClient};
-/// Macro plumbing referenced by `#[durust::workflow]`; not public API.
+/// Macro plumbing referenced by `#[durare::workflow]`; not public API.
 #[doc(hidden)]
 pub use engine::WorkflowResult;
 pub use engine::{
@@ -92,21 +92,21 @@ pub use tx::{IsolationLevel, Param, Row, TransactionOptions, Tx, TxBody};
 /// The `#[workflow]` attribute macro. Annotate an
 /// `async fn(DurableContext, Input) -> Result<Output>` to have it
 /// auto-registered with every [`DurableEngine`] in the binary.
-pub use durust_macros::workflow;
+pub use durare_macros::workflow;
 
 /// The `#[step]` attribute macro. Annotate an
 /// `async fn(&DurableContext, args..) -> Result<T>` to have its body run as a
 /// durable [`DurableContext::step`] — checkpointed once, replayed thereafter —
 /// so it reads like an ordinary async call.
-pub use durust_macros::step;
+pub use durare_macros::step;
 
 /// The `#[transaction]` attribute macro. Annotate an
 /// `async fn(&DurableContext, &mut Tx, args..) -> Result<T>` to have its body
 /// run as a durable [`DurableContext::transaction`] — the SQL writes and the
 /// checkpoint commit atomically — without the `|tx| Box::pin(..)` wrapper.
-pub use durust_macros::transaction;
+pub use durare_macros::transaction;
 
-/// Re-exported so the `#[workflow]` macro can reference `durust::inventory::*`
+/// Re-exported so the `#[workflow]` macro can reference `durare::inventory::*`
 /// from user crates without them depending on `inventory` directly.
 #[doc(hidden)]
 pub use inventory;

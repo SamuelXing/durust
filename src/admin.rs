@@ -6,10 +6,10 @@
 //! conductor, `curl` health probes) works against a Rust process.
 //!
 //! ```no_run
-//! # use durust::{DurableEngine, InMemoryProvider, AdminServer};
+//! # use durare::{DurableEngine, InMemoryProvider, AdminServer};
 //! # use std::sync::Arc;
 //! # use std::time::Duration;
-//! # async fn run() -> durust::Result<()> {
+//! # async fn run() -> durare::Result<()> {
 //! let engine = Arc::new(DurableEngine::new(Arc::new(InMemoryProvider::new())).await?);
 //! engine.launch().await?;
 //! let admin = AdminServer::start(engine.clone(), 3001).await?; // 0 = ephemeral port

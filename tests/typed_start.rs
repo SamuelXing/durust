@@ -1,19 +1,19 @@
-//! Typed workflow references. `#[durust::workflow]` emits an `UpperCamelCase`
+//! Typed workflow references. `#[durare::workflow]` emits an `UpperCamelCase`
 //! marker whose `WorkflowDef` impl carries the input/output types, so
 //! `engine.start_with(Marker, input, opts)` is checked without a turbofish.
 
-use durust::{
+use durare::{
     DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowDef, WorkflowOptions,
 };
 use std::sync::Arc;
 use std::time::Duration;
 
-#[durust::workflow]
+#[durare::workflow]
 async fn double(_ctx: DurableContext, n: i64) -> Result<i64> {
     Ok(n * 2)
 }
 
-#[durust::workflow]
+#[durare::workflow]
 async fn greet(_ctx: DurableContext, name: String) -> Result<String> {
     Ok(format!("hello, {name}"))
 }

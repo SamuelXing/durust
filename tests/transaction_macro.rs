@@ -1,14 +1,14 @@
-//! `#[durust::transaction]`: an async fn whose body runs as a transactional
+//! `#[durare::transaction]`: an async fn whose body runs as a transactional
 //! step — the SQL writes and the checkpoint commit together — with no
 //! `|tx| Box::pin(async move { ... })` wrapper. Requires a SQL backend;
 //! exercised here on SQLite.
 
-use durust::{params, DurableContext, DurableEngine, Result, SqliteProvider, Tx, WorkflowOptions};
+use durare::{params, DurableContext, DurableEngine, Result, SqliteProvider, Tx, WorkflowOptions};
 use std::sync::Arc;
 use std::time::Duration;
 
 // No caller arguments: just ctx + the injected tx.
-#[durust::transaction]
+#[durare::transaction]
 async fn setup(ctx: &DurableContext, tx: &mut Tx<'_>) -> Result<()> {
     tx.execute(
         "CREATE TABLE IF NOT EXISTS acct (id INTEGER PRIMARY KEY, bal INTEGER)",
@@ -24,7 +24,7 @@ async fn setup(ctx: &DurableContext, tx: &mut Tx<'_>) -> Result<()> {
 }
 
 // Caller arguments after the injected tx; the tx is not passed at the call site.
-#[durust::transaction]
+#[durare::transaction]
 async fn debit(ctx: &DurableContext, tx: &mut Tx<'_>, amount: i64, id: i64) -> Result<i64> {
     tx.execute(
         "UPDATE acct SET bal = bal - ? WHERE id = ?",
@@ -37,7 +37,7 @@ async fn debit(ctx: &DurableContext, tx: &mut Tx<'_>, amount: i64, id: i64) -> R
     Ok(row.get::<i64>("bal"))
 }
 
-#[durust::workflow]
+#[durare::workflow]
 async fn account(ctx: DurableContext, _: ()) -> Result<i64> {
     setup(&ctx).await?;
     debit(&ctx, 10_i64, 1_i64).await
@@ -47,7 +47,7 @@ async fn account(ctx: DurableContext, _: ()) -> Result<i64> {
 /// seed 100, debit 10 → 90.
 #[tokio::test]
 async fn transaction_macro_runs_a_transactional_step() -> Result<()> {
-    let path = std::env::temp_dir().join(format!("durust-txn-macro-{}.db", uuid::Uuid::new_v4()));
+    let path = std::env::temp_dir().join(format!("durare-txn-macro-{}.db", uuid::Uuid::new_v4()));
     let url = format!("sqlite://{}", path.display());
 
     let engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;

@@ -2,7 +2,7 @@
 //! transactional step is rejected there — the feature requires the SQLite or
 //! Postgres backend (exercised in `tests/sqlite.rs` and `tests/postgres.rs`).
 
-use durust::{
+use durare::{
     params, DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions,
 };
 use std::sync::Arc;

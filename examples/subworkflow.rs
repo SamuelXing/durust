@@ -14,26 +14,26 @@
 //! cargo run --example subworkflow
 //! ```
 
-use durust::{
+use durare::{
     DurableContext, DurableEngine, InMemoryProvider, ListFilter, Result, WorkflowOptions,
 };
 use std::sync::Arc;
 use std::time::Duration;
 
-#[durust::step]
+#[durare::step]
 async fn sum_step(ctx: &DurableContext, nums: Vec<i64>) -> Result<i64> {
     tokio::time::sleep(Duration::from_millis(60)).await; // pretend the chunk is real work
     Ok(nums.iter().sum())
 }
 
 // The child: sums one chunk. An ordinary workflow — nothing marks it as a child.
-#[durust::workflow]
+#[durare::workflow]
 async fn sum_chunk(ctx: DurableContext, nums: Vec<i64>) -> Result<i64> {
     sum_step(&ctx, nums).await
 }
 
 // The parent: fan out one child per chunk, then reduce their partial sums.
-#[durust::workflow]
+#[durare::workflow]
 async fn map_reduce(ctx: DurableContext, data: Vec<i64>) -> Result<i64> {
     // Map: start a child per chunk, non-blocking, so they run concurrently.
     let mut children = Vec::new();

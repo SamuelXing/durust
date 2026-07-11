@@ -2,7 +2,7 @@
 //! `application_versions`; the engine can list them, read the latest, and
 //! promote one to latest.
 
-use durust::{DurableEngine, InMemoryProvider, Result};
+use durare::{DurableEngine, InMemoryProvider, Result};
 use std::sync::Arc;
 use std::time::Duration;
 

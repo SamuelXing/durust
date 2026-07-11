@@ -2,7 +2,7 @@
 //! correctly by a provider configured for another (dispatch-on-read), which is
 //! the basis for cross-language interop via `portable_json`.
 
-use durust::{
+use durare::{
     DurableContext, DurableEngine, Error, PortableWorkflowError, Result, Serializer,
     SqliteProvider, WorkflowOptions,
 };
@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 fn temp_db_url(tag: &str) -> (String, std::path::PathBuf) {
     let mut p = std::env::temp_dir();
-    p.push(format!("durust-ser-{tag}-{}.db", uuid::Uuid::new_v4()));
+    p.push(format!("durare-ser-{tag}-{}.db", uuid::Uuid::new_v4()));
     (format!("sqlite://{}", p.display()), p)
 }
 

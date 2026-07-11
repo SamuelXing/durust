@@ -2,7 +2,7 @@
 //! workflow, awaits its result, and the child is linked back to its parent and
 //! inherits the parent's identity.
 
-use durust::{
+use durare::{
     DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions, STATUS_SUCCESS,
 };
 use std::sync::Arc;
@@ -115,7 +115,7 @@ async fn workflow_steps_introspection_in_memory() -> Result<()> {
 /// dispatcher runs it, while the parent awaits the result by polling.
 #[tokio::test]
 async fn child_workflow_can_be_queued() -> Result<()> {
-    use durust::WorkflowQueue;
+    use durare::WorkflowQueue;
     use std::time::Duration;
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;

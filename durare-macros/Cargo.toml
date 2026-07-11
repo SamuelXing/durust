@@ -1,8 +1,8 @@
 [package]
-name = "durust-macros"
+name = "durare-macros"
 version = "0.1.0"
 edition = "2021"
-description = "Procedural macros for durust: #[workflow] auto-registration."
+description = "Procedural macros for durare: #[workflow] auto-registration."
 license = "MIT OR Apache-2.0"
 
 [lib]

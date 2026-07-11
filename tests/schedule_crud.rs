@@ -2,7 +2,7 @@
 //! `#[workflow(schedule = …)]` workflow, so the only schedules are the ones
 //! these tests create — keeping firing counts isolated.
 
-use durust::{
+use durare::{
     DurableContext, DurableEngine, InMemoryProvider, Result, ScheduleFilter, ScheduleOptions,
     ScheduleStatus, ScheduledInput,
 };
@@ -27,7 +27,7 @@ async fn create_schedule_fires_and_pauses() -> Result<()> {
         |_ctx: DurableContext, tick: ScheduledInput| async move {
             CREATED_RUNS.fetch_add(1, Ordering::SeqCst);
             *SEEN_CONTEXT.lock().unwrap() = tick.context_as::<String>().unwrap();
-            Ok::<_, durust::Error>(())
+            Ok::<_, durare::Error>(())
         },
     );
 
@@ -116,11 +116,11 @@ async fn list_schedules_filters() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
     engine.register(
         "wf_a",
-        |_ctx: DurableContext, _: ScheduledInput| async move { Ok::<_, durust::Error>(()) },
+        |_ctx: DurableContext, _: ScheduledInput| async move { Ok::<_, durare::Error>(()) },
     );
     engine.register(
         "wf_b",
-        |_ctx: DurableContext, _: ScheduledInput| async move { Ok::<_, durust::Error>(()) },
+        |_ctx: DurableContext, _: ScheduledInput| async move { Ok::<_, durare::Error>(()) },
     );
 
     engine
@@ -163,7 +163,7 @@ async fn resume_reactivates_and_unknown_name_is_a_noop() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
     engine.register(
         "wf",
-        |_ctx: DurableContext, _at: ScheduledInput| async move { Ok::<_, durust::Error>(()) },
+        |_ctx: DurableContext, _at: ScheduledInput| async move { Ok::<_, durare::Error>(()) },
     );
     engine
         .create_schedule("s", "wf", "0 0 12 * * *", ScheduleOptions::new())

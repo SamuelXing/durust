@@ -6,7 +6,7 @@
 //! takes `SERIAL` for its whole body. The `schedule_tick_*` failpoints live in
 //! the schedule fire loop and are no-ops unless armed here.
 
-use durust::{
+use durare::{
     DurableContext, DurableEngine, Error, ListFilter, Result, ScheduleOptions, ScheduledInput,
     SqliteProvider, StateProvider, STATUS_PENDING, STATUS_SUCCESS,
 };
@@ -22,11 +22,11 @@ static SERIAL: Mutex<()> = Mutex::const_new(());
 
 fn temp_db_url(tag: &str) -> (String, std::path::PathBuf) {
     let mut p = std::env::temp_dir();
-    p.push(format!("durust-{tag}-{}.db", uuid::Uuid::new_v4()));
+    p.push(format!("durare-{tag}-{}.db", uuid::Uuid::new_v4()));
     (format!("sqlite://{}", p.display()), p)
 }
 
-async fn sched_rows(provider: &SqliteProvider) -> Result<Vec<durust::WorkflowStatus>> {
+async fn sched_rows(provider: &SqliteProvider) -> Result<Vec<durare::WorkflowStatus>> {
     provider
         .list_workflows(&ListFilter {
             workflow_id_prefix: vec!["sched-".to_string()],

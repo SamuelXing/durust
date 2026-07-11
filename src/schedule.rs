@@ -16,7 +16,7 @@ use serde_json::Value;
 /// portable across them. A scheduled workflow declares this as its input type:
 ///
 /// ```ignore
-/// #[durust::workflow(schedule = "0 0 * * * *")]
+/// #[durare::workflow(schedule = "0 0 * * * *")]
 /// async fn hourly(_ctx: DurableContext, tick: ScheduledInput) -> Result<()> {
 ///     println!("fired for {}", tick.scheduled_time);
 ///     Ok(())

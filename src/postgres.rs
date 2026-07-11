@@ -137,7 +137,7 @@ pub struct PostgresProvider {
 
 impl PostgresProvider {
     /// Connect to Postgres using a standard connection URL, e.g.
-    /// `postgres://user:pass@localhost:5432/durust`.
+    /// `postgres://user:pass@localhost:5432/durare`.
     ///
     /// System tables live in the `dbos` schema — the same one every DBOS SDK
     /// defaults to, so a database shared with Go/Python workers just works. Use

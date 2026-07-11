@@ -1,7 +1,7 @@
 //! Admin HTTP server: end-to-end over a real socket. A tiny raw-HTTP/1.1 client
 //! (Connection: close) keeps the test dependency-free.
 
-use durust::{
+use durare::{
     AdminServer, DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions,
 };
 use std::sync::Arc;

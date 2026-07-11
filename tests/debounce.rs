@@ -1,7 +1,7 @@
 //! Workflow debouncing: rapid repeated triggers grouped by a key coalesce into
 //! a single delayed run with the latest input.
 
-use durust::{
+use durare::{
     Client, DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowHandle,
     WorkflowOptions,
 };

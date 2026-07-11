@@ -1,7 +1,7 @@
 //! SQLite backend tests: durable state and crash-recovery across "restarts"
 //! (separate engine + provider instances over the same database file).
 
-use durust::{
+use durare::{
     DurableContext, DurableEngine, Error, ListFilter, Result, ScheduledInput, SqliteProvider,
     TransactionOptions, WorkflowOptions, WorkflowQueue, STATUS_CANCELLED, STATUS_SUCCESS,
 };
@@ -14,7 +14,7 @@ use std::time::Duration;
 /// A unique temp file path for an isolated SQLite database per test.
 fn temp_db_url(tag: &str) -> (String, std::path::PathBuf) {
     let mut p = std::env::temp_dir();
-    let unique = format!("durust-{tag}-{}.db", uuid::Uuid::new_v4());
+    let unique = format!("durare-{tag}-{}.db", uuid::Uuid::new_v4());
     p.push(unique);
     (format!("sqlite://{}", p.display()), p)
 }
@@ -466,7 +466,7 @@ async fn sqlite_queue_dispatch_and_dedup() -> Result<()> {
         Ok(_) => panic!("dedup id reuse on the same queue must be rejected"),
         Err(e) => e,
     };
-    assert_eq!(err.code(), durust::ErrorCode::QueueDeduplicated);
+    assert_eq!(err.code(), durare::ErrorCode::QueueDeduplicated);
 
     // Now launch the dispatcher and let wf-q-1 run to completion.
     engine.launch().await?;
@@ -477,7 +477,7 @@ async fn sqlite_queue_dispatch_and_dedup() -> Result<()> {
         .send("ghost", 1_i64, "topic")
         .await
         .expect_err("send to nonexistent workflow must fail");
-    assert_eq!(err.code(), durust::ErrorCode::NonExistentWorkflow);
+    assert_eq!(err.code(), durare::ErrorCode::NonExistentWorkflow);
 
     engine.shutdown(Duration::from_secs(1)).await?;
     let _ = std::fs::remove_file(path);
@@ -745,7 +745,7 @@ async fn sqlite_workflow_steps_introspection() -> Result<()> {
 /// transaction is addressed by replay exactly like any other step.
 #[tokio::test]
 async fn sqlite_interleaved_step_and_transaction_share_seq() -> Result<()> {
-    use durust::params;
+    use durare::params;
     let (url, path) = temp_db_url("interleave");
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
     engine.register("mix", |ctx: DurableContext, _: ()| async move {
@@ -857,7 +857,7 @@ async fn sqlite_management() -> Result<()> {
     assert_eq!(done.result().await?, 15);
 
     // A genuinely cancellable workflow.
-    use durust::{StateProvider, WorkflowStatus, STATUS_PENDING};
+    use durare::{StateProvider, WorkflowStatus, STATUS_PENDING};
     let provider = SqliteProvider::connect(&url).await?;
     provider
         .insert_workflow_status(WorkflowStatus::new(
@@ -891,7 +891,7 @@ async fn sqlite_management() -> Result<()> {
 /// the `RETURNING` resume, and the recursive-CTE child delete (with FK cascade).
 #[tokio::test]
 async fn sqlite_bulk_ops() -> Result<()> {
-    use durust::{StateProvider, WorkflowStatus, STATUS_PENDING};
+    use durare::{StateProvider, WorkflowStatus, STATUS_PENDING};
     let (url, path) = temp_db_url("bulk");
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
@@ -966,7 +966,7 @@ async fn sqlite_bulk_ops() -> Result<()> {
 /// no-op.
 #[tokio::test]
 async fn sqlite_set_workflow_delay() -> Result<()> {
-    use durust::STATUS_DELAYED;
+    use durare::STATUS_DELAYED;
     let (url, path) = temp_db_url("set-delay");
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
@@ -1167,7 +1167,7 @@ async fn sqlite_list_filters_extended() -> Result<()> {
 /// created_at time bucket.
 #[tokio::test]
 async fn sqlite_workflow_aggregates() -> Result<()> {
-    use durust::WorkflowAggregateQuery;
+    use durare::WorkflowAggregateQuery;
     let (url, path) = temp_db_url("aggregates");
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
@@ -1227,7 +1227,7 @@ async fn sqlite_workflow_aggregates() -> Result<()> {
     let now = chrono::Utc::now().timestamp_millis();
     let hour = 3_600_000;
     let sum =
-        |rows: Vec<durust::WorkflowAggregate>| -> i64 { rows.iter().filter_map(|r| r.count).sum() };
+        |rows: Vec<durare::WorkflowAggregate>| -> i64 { rows.iter().filter_map(|r| r.count).sum() };
     let recent = engine
         .get_workflow_aggregates(&WorkflowAggregateQuery {
             by_status: true,
@@ -1296,7 +1296,7 @@ async fn sqlite_step_timing_is_recorded() -> Result<()> {
 /// with the derived status filter.
 #[tokio::test]
 async fn sqlite_step_aggregates() -> Result<()> {
-    use durust::StepAggregateQuery;
+    use durare::StepAggregateQuery;
     let (url, path) = temp_db_url("step-aggregates");
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
@@ -1356,7 +1356,7 @@ async fn sqlite_step_aggregates() -> Result<()> {
 /// and a delete removes it.
 #[tokio::test]
 async fn sqlite_schedule_persists_across_restart() -> Result<()> {
-    use durust::{ScheduleFilter, ScheduleOptions, ScheduleStatus};
+    use durare::{ScheduleFilter, ScheduleOptions, ScheduleStatus};
     let (url, path) = temp_db_url("schedule-crud");
 
     // Engine A creates the schedule.
@@ -1422,7 +1422,7 @@ async fn sqlite_schedule_persists_across_restart() -> Result<()> {
 #[tokio::test]
 async fn sqlite_backfill_persists_each_tick_once() -> Result<()> {
     use chrono::{TimeZone, Utc};
-    use durust::{ScheduleOptions, StateProvider};
+    use durare::{ScheduleOptions, StateProvider};
     let (url, path) = temp_db_url("schedule-backfill");
 
     let provider = Arc::new(SqliteProvider::connect(&url).await?);
@@ -1541,7 +1541,7 @@ async fn sqlite_application_versions_persist() -> Result<()> {
 /// engine runs it, the client observes the result.
 #[tokio::test]
 async fn sqlite_client_enqueues_work_an_engine_runs() -> Result<()> {
-    use durust::{Client, WorkflowQueue};
+    use durare::{Client, WorkflowQueue};
     let (url, path) = temp_db_url("client");
 
     let provider = Arc::new(SqliteProvider::connect(&url).await?);
@@ -1574,7 +1574,7 @@ async fn sqlite_client_enqueues_work_an_engine_runs() -> Result<()> {
 #[tokio::test]
 async fn sqlite_client_backfills_a_schedule() -> Result<()> {
     use chrono::{TimeZone, Utc};
-    use durust::{Client, ScheduleOptions, StateProvider};
+    use durare::{Client, ScheduleOptions, StateProvider};
     let (url, path) = temp_db_url("client-backfill");
     let provider = Arc::new(SqliteProvider::connect(&url).await?);
     // A client runs no engine, so initialize the schema directly (the engine's
@@ -1616,7 +1616,7 @@ async fn sqlite_client_backfills_a_schedule() -> Result<()> {
 /// on SQLite, and reads it back unwrapped to the bare input.
 #[tokio::test]
 async fn sqlite_portable_input_envelope() -> Result<()> {
-    use durust::Serializer;
+    use durare::Serializer;
     let (url, path) = temp_db_url("portable-input");
     let provider = SqliteProvider::connect(&url)
         .await?
@@ -1663,7 +1663,7 @@ async fn sqlite_portable_input_envelope() -> Result<()> {
 /// and result round-trip through it on SQLite.
 #[tokio::test]
 async fn sqlite_custom_serializer_roundtrips() -> Result<()> {
-    use durust::{Serializer, SerializerCodec};
+    use durare::{Serializer, SerializerCodec};
     use std::sync::Arc;
 
     /// Stores values as `hex:<lowercase-hex-of-the-JSON-bytes>` — deliberately
@@ -1767,7 +1767,7 @@ async fn sqlite_custom_serializer_roundtrips() -> Result<()> {
 /// already holding the slot, while the default rejects the collision.
 #[tokio::test]
 async fn sqlite_enqueue_dedup_return_existing() -> Result<()> {
-    use durust::{Client, DeduplicationPolicy, StateProvider, WorkflowHandle};
+    use durare::{Client, DeduplicationPolicy, StateProvider, WorkflowHandle};
     let (url, path) = temp_db_url("dedup");
     let provider = Arc::new(SqliteProvider::connect(&url).await?);
     provider.init().await?;
@@ -1814,7 +1814,7 @@ async fn sqlite_enqueue_dedup_return_existing() -> Result<()> {
 /// the same id can be enqueued again afterward.
 #[tokio::test]
 async fn sqlite_dedup_slot_frees_on_completion() -> Result<()> {
-    use durust::{Client, StateProvider, WorkflowHandle};
+    use durare::{Client, StateProvider, WorkflowHandle};
     let (url, path) = temp_db_url("dedupfree");
     let provider = Arc::new(SqliteProvider::connect(&url).await?);
     provider.init().await?;
@@ -1864,7 +1864,7 @@ async fn sqlite_dedup_slot_frees_on_completion() -> Result<()> {
 /// SUCCESS/ERROR completion is rejected and does not overwrite the status.
 #[tokio::test]
 async fn sqlite_completion_cannot_overwrite_cancelled() -> Result<()> {
-    use durust::{Client, StateProvider, WorkflowHandle};
+    use durare::{Client, StateProvider, WorkflowHandle};
     let (url, path) = temp_db_url("cancelguard");
     let provider = Arc::new(SqliteProvider::connect(&url).await?);
     provider.init().await?;
@@ -1896,7 +1896,7 @@ async fn sqlite_completion_cannot_overwrite_cancelled() -> Result<()> {
 /// leaving any schedule it would have replaced at its original value.
 #[tokio::test]
 async fn sqlite_apply_schedules_is_atomic() -> Result<()> {
-    use durust::{ScheduleFilter, ScheduleStatus, StateProvider, WorkflowSchedule};
+    use durare::{ScheduleFilter, ScheduleStatus, StateProvider, WorkflowSchedule};
     let (url, path) = temp_db_url("applytx");
     let provider = SqliteProvider::connect(&url).await?;
     provider.init().await?;
@@ -1947,7 +1947,7 @@ async fn sqlite_apply_schedules_is_atomic() -> Result<()> {
 /// reapplied (exactly-once).
 #[tokio::test]
 async fn sqlite_transaction_step_exactly_once() -> Result<()> {
-    use durust::params;
+    use durare::params;
     let (url, path) = temp_db_url("txn");
 
     fn register(engine: &mut DurableEngine) {
@@ -2023,7 +2023,7 @@ async fn sqlite_transaction_step_exactly_once() -> Result<()> {
 /// otherwise open a second connection and block forever). The workflow fails fast.
 #[tokio::test]
 async fn sqlite_nested_transaction_is_rejected() -> Result<()> {
-    use durust::params;
+    use durare::params;
     use std::time::Duration;
     let (url, path) = temp_db_url("txnnest");
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
@@ -2076,7 +2076,7 @@ async fn sqlite_nested_transaction_is_rejected() -> Result<()> {
 /// later step reads the original value, proving the failed write did not commit.
 #[tokio::test]
 async fn sqlite_transaction_step_rolls_back_on_error() -> Result<()> {
-    use durust::params;
+    use durare::params;
     let (url, path) = temp_db_url("txnrb");
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
     engine.register("rb", |ctx: DurableContext, _: ()| async move {
@@ -2201,7 +2201,7 @@ async fn sqlite_checkpoints_a_caught_transaction_failure() -> Result<()> {
 /// the one that's checkpointed, so nothing is recorded as failed.
 #[tokio::test]
 async fn sqlite_transaction_retries_body_error() -> Result<()> {
-    use durust::params;
+    use durare::params;
     static TX_RUNS: AtomicUsize = AtomicUsize::new(0);
     let (url, path) = temp_db_url("txn-retry");
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
@@ -2252,7 +2252,7 @@ async fn sqlite_transaction_retries_body_error() -> Result<()> {
 /// surfaced (and checkpointed) without burning the budget.
 #[tokio::test]
 async fn sqlite_transaction_retry_predicate_fails_fast() -> Result<()> {
-    use durust::params;
+    use durare::params;
     static TX_RUNS: AtomicUsize = AtomicUsize::new(0);
     let (url, path) = temp_db_url("txn-nofast");
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
@@ -2291,12 +2291,12 @@ async fn sqlite_transaction_retry_predicate_fails_fast() -> Result<()> {
 /// A transaction body that fails with a *retryable* DB error (here a closed pool,
 /// standing in for a transient connection blip) is retried on a fresh transaction
 /// until it clears — matching Go/Python, which retry the transient set, not just
-/// serialization/deadlock conflicts. Before this, durust retried only
+/// serialization/deadlock conflicts. Before this, durare retried only
 /// `is_tx_conflict` errors, so a connection-class error fell straight through to
 /// the (default: no-op) user-retry policy and failed immediately.
 #[tokio::test]
 async fn sqlite_transaction_retries_transient_db_error() -> Result<()> {
-    use durust::{params, TransactionOptions};
+    use durare::{params, TransactionOptions};
     use std::sync::atomic::{AtomicUsize, Ordering};
     static RUNS: AtomicUsize = AtomicUsize::new(0);
     RUNS.store(0, Ordering::SeqCst);
@@ -2310,7 +2310,7 @@ async fn sqlite_transaction_retries_transient_db_error() -> Result<()> {
                     // Fail with a retryable (connection-class) error three times,
                     // then succeed. The old conflict loop would not retry this at all.
                     if RUNS.fetch_add(1, Ordering::SeqCst) < 3 {
-                        Err(durust::Error::Db(sqlx::Error::PoolClosed))
+                        Err(durare::Error::Db(sqlx::Error::PoolClosed))
                     } else {
                         Ok(7_i64)
                     }
@@ -2342,7 +2342,7 @@ async fn sqlite_transaction_retries_transient_db_error() -> Result<()> {
 /// 10-cap) and the cancellation-awareness.
 #[tokio::test]
 async fn sqlite_transaction_conflict_retry_is_unbounded_but_cancellable() -> Result<()> {
-    use durust::{params, TransactionOptions};
+    use durare::{params, TransactionOptions};
     use std::sync::atomic::{AtomicUsize, Ordering};
     static SPINS: AtomicUsize = AtomicUsize::new(0);
     SPINS.store(0, Ordering::SeqCst);
@@ -2353,7 +2353,7 @@ async fn sqlite_transaction_conflict_retry_is_unbounded_but_cancellable() -> Res
             Box::pin(async move {
                 tx.execute("SELECT 1", &params![]).await?;
                 SPINS.fetch_add(1, Ordering::SeqCst);
-                Err::<i64, _>(durust::Error::Db(sqlx::Error::PoolClosed))
+                Err::<i64, _>(durare::Error::Db(sqlx::Error::PoolClosed))
             })
         })
         .await?;
@@ -2408,7 +2408,7 @@ async fn sqlite_transaction_conflict_retry_is_unbounded_but_cancellable() -> Res
 /// seconds; the replay is asserted near-instant, with the body never re-run.
 #[tokio::test]
 async fn sqlite_recorded_transaction_failure_replays_immediately() -> Result<()> {
-    use durust::{params, StateProvider, TxBody};
+    use durare::{params, StateProvider, TxBody};
     static REC_RUNS: AtomicUsize = AtomicUsize::new(0);
     static REPLAY_BODY_RUNS: AtomicUsize = AtomicUsize::new(0);
     let (url, path) = temp_db_url("txn-replay");
@@ -2688,7 +2688,7 @@ async fn sqlite_was_forked_from_reconstructed_when_payload_omits_it() -> Result<
 /// read back through real SQLite storage, must suppress its side effect.
 #[tokio::test]
 async fn sqlite_recovery_replays_checkpointed_step_without_rerunning() -> Result<()> {
-    use durust::{StateProvider, STATUS_PENDING};
+    use durare::{StateProvider, STATUS_PENDING};
 
     static BODY_RUNS: AtomicUsize = AtomicUsize::new(0);
     static STEP_RUNS: AtomicUsize = AtomicUsize::new(0);
@@ -2767,7 +2767,7 @@ async fn sqlite_recovery_replays_checkpointed_step_without_rerunning() -> Result
 /// this executor counts as latest).
 #[tokio::test]
 async fn sqlite_dequeue_gates_by_version_and_latest() -> Result<()> {
-    use durust::{DequeueRequest, StateProvider, WorkflowStatus};
+    use durare::{DequeueRequest, StateProvider, WorkflowStatus};
     let (url, path) = temp_db_url("vgate");
     let provider = SqliteProvider::connect(&url).await?;
     provider.init().await?;
@@ -2777,7 +2777,7 @@ async fn sqlite_dequeue_gates_by_version_and_latest() -> Result<()> {
             id,
             "wf",
             serde_json::Value::Null,
-            durust::STATUS_ENQUEUED,
+            durare::STATUS_ENQUEUED,
             "",
             ver,
         );
@@ -2831,7 +2831,7 @@ async fn sqlite_dequeue_gates_by_version_and_latest() -> Result<()> {
 
     // The mismatched-version row was never claimable by anyone here.
     let other = provider.get_workflow_status("r-other").await?.expect("row");
-    assert_eq!(other.status, durust::STATUS_ENQUEUED);
+    assert_eq!(other.status, durare::STATUS_ENQUEUED);
 
     let _ = std::fs::remove_file(path);
     Ok(())
@@ -2843,7 +2843,7 @@ async fn sqlite_dequeue_gates_by_version_and_latest() -> Result<()> {
 /// pick it up.
 #[tokio::test]
 async fn sqlite_unhandled_claim_is_released_not_stranded() -> Result<()> {
-    use durust::{StateProvider, WorkflowStatus};
+    use durare::{StateProvider, WorkflowStatus};
     let (url, path) = temp_db_url("release");
     let provider = Arc::new(SqliteProvider::connect(&url).await?);
 
@@ -2858,7 +2858,7 @@ async fn sqlite_unhandled_claim_is_released_not_stranded() -> Result<()> {
         "wf-ghost",
         "ghost",
         serde_json::Value::Null,
-        durust::STATUS_ENQUEUED,
+        durare::STATUS_ENQUEUED,
         "",
         x.app_version(),
     );
@@ -2878,7 +2878,7 @@ async fn sqlite_unhandled_claim_is_released_not_stranded() -> Result<()> {
             .get_workflow_status("wf-ghost")
             .await?
             .expect("row");
-        if row.status == durust::STATUS_ENQUEUED {
+        if row.status == durare::STATUS_ENQUEUED {
             break; // released (or between claims) — never observed once stranded
         }
         assert!(
@@ -2915,7 +2915,7 @@ async fn sqlite_unhandled_claim_is_released_not_stranded() -> Result<()> {
 /// original's application version unless the caller overrides it.
 #[tokio::test]
 async fn sqlite_fork_lands_on_queue_and_copies_columns() -> Result<()> {
-    use durust::{ForkParams, StateProvider, WorkflowStatus, STATUS_ENQUEUED};
+    use durare::{ForkParams, StateProvider, WorkflowStatus, STATUS_ENQUEUED};
     let (url, path) = temp_db_url("fork-cols");
     let provider = SqliteProvider::connect(&url).await?;
     provider.init().await?;
@@ -2977,7 +2977,7 @@ async fn sqlite_fork_lands_on_queue_and_copies_columns() -> Result<()> {
 /// outcome would be the wrong step's result. The body is never run.
 #[tokio::test]
 async fn sqlite_renamed_transaction_fails_as_unexpected_step() -> Result<()> {
-    use durust::{params, ErrorCode, StateProvider, TxBody};
+    use durare::{params, ErrorCode, StateProvider, TxBody};
     static BODY_RUNS: AtomicUsize = AtomicUsize::new(0);
     let (url, path) = temp_db_url("txn-rename");
 
@@ -3036,7 +3036,7 @@ async fn sqlite_renamed_transaction_fails_as_unexpected_step() -> Result<()> {
 /// exactly-once guarantee for a transaction's writes across a process crash.
 #[tokio::test]
 async fn sqlite_transaction_replays_on_recovery_without_rerunning_body() -> Result<()> {
-    use durust::{params, StateProvider, TxBody, WorkflowStatus, STATUS_PENDING};
+    use durare::{params, StateProvider, TxBody, WorkflowStatus, STATUS_PENDING};
     static TX_RUNS: AtomicUsize = AtomicUsize::new(0);
     let (url, path) = temp_db_url("txn-recover");
 
@@ -3109,7 +3109,7 @@ async fn sqlite_transaction_replays_on_recovery_without_rerunning_body() -> Resu
 /// data loss, no re-applied migrations).
 #[tokio::test]
 async fn sqlite_schema_migrations_and_pragmas() -> Result<()> {
-    use durust::{params, StateProvider, TxBody, WorkflowStatus, STATUS_PENDING};
+    use durare::{params, StateProvider, TxBody, WorkflowStatus, STATUS_PENDING};
     let (url, path) = temp_db_url("schema");
 
     let provider = SqliteProvider::connect(&url).await?;
@@ -3179,7 +3179,7 @@ async fn sqlite_schema_migrations_and_pragmas() -> Result<()> {
             "wf-pragma",
             0,
             chrono::Utc::now().timestamp_millis(),
-            &durust::TransactionOptions::new("pragma-probe"),
+            &durare::TransactionOptions::new("pragma-probe"),
             body,
         )
         .await?;

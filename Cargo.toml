@@ -1,8 +1,8 @@
 [package]
-name = "durust"
+name = "durare"
 version = "0.1.0"
 edition = "2021"
-description = "A DBOS-style durable execution library for Rust: write normal async code, checkpoint every step to a database, resume exactly where you left off after a crash."
+description = "An independent, DBOS-compatible durable execution library for Rust: write normal async code, checkpoint every step to Postgres or SQLite, and resume exactly where you left off after a crash."
 license = "MIT OR Apache-2.0"
 
 [dependencies]
@@ -33,7 +33,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 # CancellationToken for structured, level-triggered shutdown of the conductor
 # connection loop (and the sub-tasks later parts will spawn).
 tokio-util = { version = "0.7", default-features = false }
-durust-macros = { path = "durust-macros", version = "0.1" }
+durare-macros = { path = "durare-macros", version = "0.1" }
 # Postgres backend. If your sqlx version complains about features, see README.
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "json", "chrono", "migrate"] }
 # Crash-injection hooks (e.g. in the schedule fire loop). Without the

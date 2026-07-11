@@ -1,24 +1,24 @@
-//! `#[durust::step]`: an async fn whose body becomes a durable checkpoint,
+//! `#[durare::step]`: an async fn whose body becomes a durable checkpoint,
 //! callable like any async fn — no closure, no `Box::pin`, no `Ok::<_, Error>`.
 
-use durust::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
+use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
 use std::sync::Arc;
 use std::time::Duration;
 
 // A leaf step: the body is plain async, and `Ok(..)` needs no error annotation
 // because the fn's `-> Result<i64>` fixes it.
-#[durust::step]
+#[durare::step]
 async fn add_one(ctx: &DurableContext, n: i64) -> Result<i64> {
     Ok(n + 1)
 }
 
 // The registered step name can be overridden independently of the fn name.
-#[durust::step(name = "shout")]
+#[durare::step(name = "shout")]
 async fn to_upper(ctx: &DurableContext, s: String) -> Result<String> {
     Ok(s.to_uppercase())
 }
 
-#[durust::workflow]
+#[durare::workflow]
 async fn pipeline(ctx: DurableContext, start: i64) -> Result<String> {
     let a = add_one(&ctx, start).await?;
     let b = add_one(&ctx, a).await?;

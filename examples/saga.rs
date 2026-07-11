@@ -1,7 +1,7 @@
 //! Saga with compensation: book flight → hotel → car. If a later booking fails,
 //! the bookings already made are rolled back with compensating steps.
 //!
-//! Every booking *and* every cancellation is a durable `#[durust::step]`, so a
+//! Every booking *and* every cancellation is a durable `#[durare::step]`, so a
 //! crash mid-saga resumes exactly where it left off and compensations also run
 //! at most once. This uses the in-memory backend for a self-contained demo; a
 //! real deployment would use Postgres or SQLite so the saga survives a restart.
@@ -10,7 +10,7 @@
 //! cargo run --example saga
 //! ```
 
-use durust::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
+use durare::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -28,19 +28,19 @@ struct Booking {
     car: String,
 }
 
-#[durust::step]
+#[durare::step]
 async fn book_flight(ctx: &DurableContext, traveler: String) -> Result<String> {
     println!("  >> booking flight for {traveler}");
     Ok(format!("FL-{traveler}"))
 }
 
-#[durust::step]
+#[durare::step]
 async fn book_hotel(ctx: &DurableContext, traveler: String) -> Result<String> {
     println!("  >> booking hotel for {traveler}");
     Ok(format!("HT-{traveler}"))
 }
 
-#[durust::step]
+#[durare::step]
 async fn book_car(ctx: &DurableContext, traveler: String, available: bool) -> Result<String> {
     if !available {
         println!("  !! car unavailable for {traveler} — booking fails");
@@ -50,19 +50,19 @@ async fn book_car(ctx: &DurableContext, traveler: String, available: bool) -> Re
     Ok(format!("CR-{traveler}"))
 }
 
-#[durust::step]
+#[durare::step]
 async fn cancel_hotel(ctx: &DurableContext, hotel_id: String) -> Result<()> {
     println!("  << compensating: cancel hotel {hotel_id}");
     Ok(())
 }
 
-#[durust::step]
+#[durare::step]
 async fn cancel_flight(ctx: &DurableContext, flight_id: String) -> Result<()> {
     println!("  << compensating: cancel flight {flight_id}");
     Ok(())
 }
 
-#[durust::workflow]
+#[durare::workflow]
 async fn book_trip(ctx: DurableContext, trip: Trip) -> Result<Booking> {
     let flight = book_flight(&ctx, trip.traveler.clone()).await?;
     let hotel = book_hotel(&ctx, trip.traveler.clone()).await?;

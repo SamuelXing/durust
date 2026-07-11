@@ -2,7 +2,7 @@
 //! workflow name, disambiguated by config name, are routed to correctly on both
 //! direct runs and queue dispatch, and the names persist on the row.
 
-use durust::{
+use durare::{
     DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowHandle,
     WorkflowOptions, WorkflowQueue,
 };

@@ -1,9 +1,9 @@
 //! Postgres backend tests. Skipped unless `DATABASE_URL` points at a reachable
 //! Postgres instance (ideally an empty database — `init` runs the migrations).
 //!
-//!   createdb durust_test && DATABASE_URL=postgres://localhost/durust_test cargo test --test postgres
+//!   createdb durare_test && DATABASE_URL=postgres://localhost/durare_test cargo test --test postgres
 
-use durust::{
+use durare::{
     DurableContext, DurableEngine, Error, ErrorCode, ListFilter, PortableWorkflowError,
     PostgresProvider, Result, ScheduledInput, Serializer, StateProvider, TransactionOptions,
     WorkflowOptions, WorkflowQueue, WorkflowStatus, STATUS_PENDING,
@@ -587,7 +587,7 @@ async fn pg_global_concurrency_caps_running() -> Result<()> {
 /// FK cascade).
 #[tokio::test]
 async fn pg_bulk_ops() -> Result<()> {
-    use durust::{STATUS_CANCELLED, STATUS_SUCCESS};
+    use durare::{STATUS_CANCELLED, STATUS_SUCCESS};
     let Some(url) = database_url() else {
         eprintln!("skipping pg_bulk_ops: DATABASE_URL unset");
         return Ok(());
@@ -734,7 +734,7 @@ async fn pg_partitioned_queue_dispatch() -> Result<()> {
 /// non-DELAYED row is a no-op.
 #[tokio::test]
 async fn pg_set_workflow_delay() -> Result<()> {
-    use durust::STATUS_DELAYED;
+    use durare::STATUS_DELAYED;
     let Some(url) = database_url() else {
         eprintln!("skipping pg_set_workflow_delay: DATABASE_URL unset");
         return Ok(());
@@ -837,7 +837,7 @@ async fn pg_list_filters_extended() -> Result<()> {
 /// bucket).
 #[tokio::test]
 async fn pg_workflow_aggregates() -> Result<()> {
-    use durust::{WorkflowAggregateQuery, STATUS_SUCCESS};
+    use durare::{WorkflowAggregateQuery, STATUS_SUCCESS};
     let Some(url) = database_url() else {
         eprintln!("skipping pg_workflow_aggregates: DATABASE_URL unset");
         return Ok(());
@@ -903,7 +903,7 @@ async fn pg_workflow_aggregates() -> Result<()> {
 /// name, scoped to this run via the id prefix.
 #[tokio::test]
 async fn pg_step_aggregates() -> Result<()> {
-    use durust::StepAggregateQuery;
+    use durare::StepAggregateQuery;
     let Some(url) = database_url() else {
         eprintln!("skipping pg_step_aggregates: DATABASE_URL unset");
         return Ok(());
@@ -958,7 +958,7 @@ async fn pg_step_aggregates() -> Result<()> {
 /// name keeps it isolated from other tests sharing the database.
 #[tokio::test]
 async fn pg_schedule_crud() -> Result<()> {
-    use durust::{ScheduleFilter, ScheduleOptions, ScheduleStatus};
+    use durare::{ScheduleFilter, ScheduleOptions, ScheduleStatus};
     let Some(url) = database_url() else {
         eprintln!("skipping pg_schedule_crud: DATABASE_URL unset");
         return Ok(());
@@ -1026,7 +1026,7 @@ async fn pg_schedule_crud() -> Result<()> {
 #[tokio::test]
 async fn pg_schedule_backfill_apply_trigger() -> Result<()> {
     use chrono::{TimeZone, Utc};
-    use durust::{ApplySchedule, ScheduleOptions, WorkflowHandle};
+    use durare::{ApplySchedule, ScheduleOptions, WorkflowHandle};
     let Some(url) = database_url() else {
         eprintln!("skipping pg_schedule_backfill_apply_trigger: DATABASE_URL unset");
         return Ok(());
@@ -1178,7 +1178,7 @@ async fn pg_application_versions() -> Result<()> {
 /// queue and workflow names are uuid-suffixed so parallel tests don't cross-claim.
 #[tokio::test]
 async fn pg_client_enqueues_work_an_engine_runs() -> Result<()> {
-    use durust::{Client, WorkflowHandle, WorkflowQueue};
+    use durare::{Client, WorkflowHandle, WorkflowQueue};
     let Some(url) = database_url() else {
         eprintln!("skipping pg_client_enqueues_work_an_engine_runs: DATABASE_URL unset");
         return Ok(());
@@ -1218,7 +1218,7 @@ async fn pg_client_enqueues_work_an_engine_runs() -> Result<()> {
 /// latest input, all handles pointing at the same run.
 #[tokio::test]
 async fn pg_client_debounces() -> Result<()> {
-    use durust::{Client, WorkflowHandle};
+    use durare::{Client, WorkflowHandle};
     let Some(url) = database_url() else {
         eprintln!("skipping pg_client_debounces: DATABASE_URL unset");
         return Ok(());
@@ -1290,7 +1290,7 @@ async fn pg_client_debounces() -> Result<()> {
 /// is mutated.
 #[tokio::test]
 async fn pg_dequeue_gates_by_version() -> Result<()> {
-    use durust::DequeueRequest;
+    use durare::DequeueRequest;
     let Some(url) = database_url() else {
         eprintln!("skipping pg_dequeue_gates_by_version: DATABASE_URL unset");
         return Ok(());
@@ -1314,7 +1314,7 @@ async fn pg_dequeue_gates_by_version() -> Result<()> {
             id,
             "wf",
             serde_json::Value::Null,
-            durust::STATUS_ENQUEUED,
+            durare::STATUS_ENQUEUED,
             "",
             ver,
         );
@@ -1372,7 +1372,7 @@ async fn pg_dequeue_gates_by_version() -> Result<()> {
 /// `class_name`/`config_name` round-trip on the row.
 #[tokio::test]
 async fn pg_config_name_routes_on_queue_dispatch() -> Result<()> {
-    use durust::WorkflowQueue;
+    use durare::WorkflowQueue;
     let Some(url) = database_url() else {
         eprintln!("skipping pg_config_name_routes_on_queue_dispatch: DATABASE_URL unset");
         return Ok(());
@@ -1433,7 +1433,7 @@ async fn pg_config_name_routes_on_queue_dispatch() -> Result<()> {
 /// runs it, and cancel + delete another. Names are uuid-scoped for isolation.
 #[tokio::test]
 async fn pg_client_manages_workflows() -> Result<()> {
-    use durust::WorkflowQueue;
+    use durare::WorkflowQueue;
     let Some(url) = database_url() else {
         eprintln!("skipping pg_client_manages_workflows: DATABASE_URL unset");
         return Ok(());
@@ -1450,7 +1450,7 @@ async fn pg_client_manages_workflows() -> Result<()> {
     });
     engine.register_queue(WorkflowQueue::new(&queue));
     engine.launch().await?;
-    let client = durust::Client::new(provider.clone());
+    let client = durare::Client::new(provider.clone());
 
     // Enqueue far in the future, then pull it in: the engine runs it.
     let run = client
@@ -1514,7 +1514,7 @@ async fn pg_client_manages_workflows() -> Result<()> {
 /// delete. A uuid-suffixed name isolates it; no engine runs, so nothing fires.
 #[tokio::test]
 async fn pg_client_manages_schedules() -> Result<()> {
-    use durust::{ApplySchedule, Client, ScheduleFilter, ScheduleOptions, ScheduleStatus};
+    use durare::{ApplySchedule, Client, ScheduleFilter, ScheduleOptions, ScheduleStatus};
     let Some(url) = database_url() else {
         eprintln!("skipping pg_client_manages_schedules: DATABASE_URL unset");
         return Ok(());
@@ -1579,7 +1579,7 @@ async fn pg_client_manages_schedules() -> Result<()> {
 #[tokio::test]
 async fn pg_client_backfills_and_triggers_a_schedule() -> Result<()> {
     use chrono::{TimeZone, Utc};
-    use durust::{Client, ScheduleOptions};
+    use durare::{Client, ScheduleOptions};
     let Some(url) = database_url() else {
         eprintln!("skipping pg_client_backfills_and_triggers_a_schedule: DATABASE_URL unset");
         return Ok(());
@@ -1614,7 +1614,7 @@ async fn pg_client_backfills_and_triggers_a_schedule() -> Result<()> {
     assert_eq!(client.backfill_schedule(&name, start, end).await?, ids);
 
     // Trigger enqueues one more run under a distinct `-trigger-` id.
-    let h: durust::WorkflowHandle<()> = client.trigger_schedule(&name).await?;
+    let h: durare::WorkflowHandle<()> = client.trigger_schedule(&name).await?;
     assert!(h.id().starts_with(&format!("sched-{name}-trigger-")));
     let trig = client
         .list_workflows(&ListFilter {
@@ -1680,7 +1680,7 @@ async fn pg_portable_input_envelope() -> Result<()> {
 /// the `ReturnExisting` dedup policy (a colliding dedup id returns the holder).
 #[tokio::test]
 async fn pg_enqueue_dedup_and_app_version() -> Result<()> {
-    use durust::{Client, DeduplicationPolicy, WorkflowHandle};
+    use durare::{Client, DeduplicationPolicy, WorkflowHandle};
     let Some(url) = database_url() else {
         eprintln!("skipping pg_enqueue_dedup_and_app_version: DATABASE_URL unset");
         return Ok(());
@@ -1748,7 +1748,7 @@ async fn pg_enqueue_dedup_and_app_version() -> Result<()> {
 /// the same id can be enqueued again afterward.
 #[tokio::test]
 async fn pg_dedup_slot_frees_on_completion() -> Result<()> {
-    use durust::{Client, WorkflowHandle, STATUS_SUCCESS};
+    use durare::{Client, WorkflowHandle, STATUS_SUCCESS};
     let Some(url) = database_url() else {
         eprintln!("skipping pg_dedup_slot_frees_on_completion: DATABASE_URL unset");
         return Ok(());
@@ -1803,7 +1803,7 @@ async fn pg_dedup_slot_frees_on_completion() -> Result<()> {
 /// SUCCESS/ERROR completion is rejected and does not overwrite the status.
 #[tokio::test]
 async fn pg_completion_cannot_overwrite_cancelled() -> Result<()> {
-    use durust::{Client, WorkflowHandle, STATUS_CANCELLED, STATUS_SUCCESS};
+    use durare::{Client, WorkflowHandle, STATUS_CANCELLED, STATUS_SUCCESS};
     let Some(url) = database_url() else {
         eprintln!("skipping pg_completion_cannot_overwrite_cancelled: DATABASE_URL unset");
         return Ok(());
@@ -1842,7 +1842,7 @@ async fn pg_completion_cannot_overwrite_cancelled() -> Result<()> {
 /// whole batch back, leaving any schedule it would have replaced untouched.
 #[tokio::test]
 async fn pg_apply_schedules_is_atomic() -> Result<()> {
-    use durust::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
+    use durare::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
     let Some(url) = database_url() else {
         eprintln!("skipping pg_apply_schedules_is_atomic: DATABASE_URL unset");
         return Ok(());
@@ -1906,7 +1906,7 @@ async fn pg_apply_schedules_is_atomic() -> Result<()> {
 /// its checkpoint instead of reapplying it (exactly-once).
 #[tokio::test]
 async fn pg_transaction_step() -> Result<()> {
-    use durust::params;
+    use durare::params;
     let Some(url) = database_url() else {
         eprintln!("skipping pg_transaction_step: DATABASE_URL unset");
         return Ok(());
@@ -2009,7 +2009,7 @@ async fn pg_transaction_step() -> Result<()> {
 /// aborts cleanly and nothing it wrote persists.
 #[tokio::test]
 async fn pg_transaction_step_rolls_back_on_error() -> Result<()> {
-    use durust::params;
+    use durare::params;
     let Some(url) = database_url() else {
         eprintln!("skipping pg_transaction_step_rolls_back_on_error: DATABASE_URL unset");
         return Ok(());
@@ -2110,7 +2110,7 @@ async fn pg_transaction_step_rolls_back_on_error() -> Result<()> {
 /// neither increment is lost (the counter ends at 2, results are {1, 2}).
 #[tokio::test]
 async fn pg_transaction_serializable_retries_on_conflict() -> Result<()> {
-    use durust::{params, IsolationLevel, TransactionOptions};
+    use durare::{params, IsolationLevel, TransactionOptions};
     let Some(url) = database_url() else {
         eprintln!("skipping pg_transaction_serializable_retries_on_conflict: DATABASE_URL unset");
         return Ok(());
@@ -2303,7 +2303,7 @@ async fn pg_checkpoints_a_caught_transaction_failure() -> Result<()> {
 /// fast without burning the budget. Both run against a real Postgres transaction.
 #[tokio::test]
 async fn pg_transaction_body_user_retry() -> Result<()> {
-    use durust::params;
+    use durare::params;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static RETRY_RUNS: AtomicUsize = AtomicUsize::new(0);
     static FAST_RUNS: AtomicUsize = AtomicUsize::new(0);
@@ -2460,7 +2460,7 @@ async fn pg_custom_schema_isolates_tenants() -> Result<()> {
 /// (status, steps, events, streams) through Postgres after deletion.
 #[tokio::test]
 async fn pg_export_import_round_trip() -> Result<()> {
-    use durust::STATUS_SUCCESS;
+    use durare::STATUS_SUCCESS;
     let Some(url) = database_url() else {
         eprintln!("skipping pg_export_import_round_trip: DATABASE_URL unset");
         return Ok(());
@@ -2882,7 +2882,7 @@ async fn pg_was_forked_from_survives_import() -> Result<()> {
 /// stamping '' — so the fleet that could run the original can run the fork.
 #[tokio::test]
 async fn pg_fork_routes_to_named_queue() -> Result<()> {
-    use durust::{Client, WorkflowHandle, WorkflowQueue};
+    use durare::{Client, WorkflowHandle, WorkflowQueue};
     let Some(url) = database_url() else {
         eprintln!("skipping pg_fork_routes_to_named_queue: DATABASE_URL unset");
         return Ok(());
@@ -2947,7 +2947,7 @@ async fn pg_fork_routes_to_named_queue() -> Result<()> {
 /// instead of silently returning the wrong step's checkpoint.
 #[tokio::test]
 async fn pg_renamed_step_fails_as_unexpected_step() -> Result<()> {
-    use durust::{StateProvider, WorkflowStatus, STATUS_PENDING};
+    use durare::{StateProvider, WorkflowStatus, STATUS_PENDING};
     let Some(url) = database_url() else {
         eprintln!("skipping pg_renamed_step_fails_as_unexpected_step: DATABASE_URL unset");
         return Ok(());
@@ -2994,7 +2994,7 @@ async fn pg_renamed_step_fails_as_unexpected_step() -> Result<()> {
 /// that queue's dispatcher and the row records the queue.
 #[tokio::test]
 async fn pg_resume_routes_to_named_queue() -> Result<()> {
-    use durust::{StateProvider, WorkflowQueue, WorkflowStatus, STATUS_PENDING};
+    use durare::{StateProvider, WorkflowQueue, WorkflowStatus, STATUS_PENDING};
     let Some(url) = database_url() else {
         eprintln!("skipping pg_resume_routes_to_named_queue: DATABASE_URL unset");
         return Ok(());

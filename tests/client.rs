@@ -2,7 +2,7 @@
 //! registry. A `Client` and a `DurableEngine` share one provider — the client
 //! produces, the engine consumes.
 
-use durust::{
+use durare::{
     Client, DurableContext, DurableEngine, Error, InMemoryProvider, ListFilter, Result,
     ScheduledInput, WorkflowOptions, WorkflowQueue,
 };
@@ -46,7 +46,7 @@ async fn client_enqueues_work_an_engine_runs() -> Result<()> {
     assert!(steps.iter().any(|s| s.name == "mul"));
 
     // retrieve_workflow returns a handle; an unknown id errors.
-    let again: durust::WorkflowHandle<i64> = client.retrieve_workflow("job-1").await?;
+    let again: durare::WorkflowHandle<i64> = client.retrieve_workflow("job-1").await?;
     assert_eq!(again.result().await?, 42);
     assert!(client.retrieve_workflow::<i64>("nope").await.is_err());
 
@@ -295,7 +295,7 @@ async fn client_reads_version_registry() -> Result<()> {
 /// pause/resume, apply (create-or-replace), delete, with validation.
 #[tokio::test]
 async fn client_manages_schedules() -> Result<()> {
-    use durust::{ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus};
+    use durare::{ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus};
     let client = Client::new(Arc::new(InMemoryProvider::new()));
 
     client
@@ -358,7 +358,7 @@ async fn client_manages_schedules() -> Result<()> {
 /// reconciler discovers it — the cross-process scheduling path.
 #[tokio::test]
 async fn client_created_schedule_fires_on_engine() -> Result<()> {
-    use durust::ScheduleOptions;
+    use durare::ScheduleOptions;
     static FIRED: AtomicUsize = AtomicUsize::new(0);
     let provider = Arc::new(InMemoryProvider::new());
 
@@ -399,7 +399,7 @@ async fn client_created_schedule_fires_on_engine() -> Result<()> {
 /// queue and a live engine's dispatcher re-runs it from its checkpoints.
 #[tokio::test]
 async fn client_resumes_a_cancelled_workflow() -> Result<()> {
-    use durust::{StateProvider, WorkflowHandle, WorkflowStatus, STATUS_PENDING};
+    use durare::{StateProvider, WorkflowHandle, WorkflowStatus, STATUS_PENDING};
     static S1: AtomicUsize = AtomicUsize::new(0);
     let provider = Arc::new(InMemoryProvider::new());
 
@@ -457,7 +457,7 @@ async fn client_resumes_a_cancelled_workflow() -> Result<()> {
 /// resume, because the internal queue is always dispatched.
 #[tokio::test]
 async fn client_resume_runs_via_internal_queue_not_own_queue() -> Result<()> {
-    use durust::WorkflowHandle;
+    use durare::WorkflowHandle;
     static RAN: AtomicUsize = AtomicUsize::new(0);
     let provider = Arc::new(InMemoryProvider::new());
 
@@ -510,7 +510,7 @@ async fn client_resume_runs_via_internal_queue_not_own_queue() -> Result<()> {
 /// runs it, reusing checkpoints before the fork point.
 #[tokio::test]
 async fn client_forks_a_workflow() -> Result<()> {
-    use durust::WorkflowHandle;
+    use durare::WorkflowHandle;
     static SECOND: AtomicUsize = AtomicUsize::new(0);
     let provider = Arc::new(InMemoryProvider::new());
 
@@ -554,7 +554,7 @@ async fn client_forks_a_workflow() -> Result<()> {
 /// live engine's always-on internal dispatcher executes it.
 #[tokio::test]
 async fn client_triggers_a_schedule_run_on_an_engine() -> Result<()> {
-    use durust::{ScheduleOptions, WorkflowHandle};
+    use durare::{ScheduleOptions, WorkflowHandle};
     static FIRED: AtomicUsize = AtomicUsize::new(0);
     let provider = Arc::new(InMemoryProvider::new());
 
@@ -605,7 +605,7 @@ async fn client_triggers_a_schedule_run_on_an_engine() -> Result<()> {
 #[tokio::test]
 async fn client_backfills_a_schedule_onto_the_internal_queue() -> Result<()> {
     use chrono::{TimeZone, Utc};
-    use durust::ScheduleOptions;
+    use durare::ScheduleOptions;
     let provider = Arc::new(InMemoryProvider::new());
     let client = Client::new(provider.clone());
 
@@ -645,7 +645,7 @@ async fn client_backfills_a_schedule_onto_the_internal_queue() -> Result<()> {
 /// default) or returns the existing workflow (ReturnExisting).
 #[tokio::test]
 async fn client_enqueue_dedup_and_app_version() -> Result<()> {
-    use durust::{DeduplicationPolicy, WorkflowHandle};
+    use durare::{DeduplicationPolicy, WorkflowHandle};
     let provider = Arc::new(InMemoryProvider::new());
     let client = Client::new(provider.clone()).with_app_version("v1");
 
@@ -738,7 +738,7 @@ async fn client_enqueue_dedup_and_app_version() -> Result<()> {
 /// the same id can be enqueued again afterward.
 #[tokio::test]
 async fn client_dedup_slot_frees_on_completion() -> Result<()> {
-    use durust::{StateProvider, WorkflowHandle, STATUS_SUCCESS};
+    use durare::{StateProvider, WorkflowHandle, STATUS_SUCCESS};
     let provider = Arc::new(InMemoryProvider::new());
     let client = Client::new(provider.clone());
 
@@ -784,7 +784,7 @@ async fn client_dedup_slot_frees_on_completion() -> Result<()> {
 /// SUCCESS/ERROR completion is rejected and does not overwrite the status.
 #[tokio::test]
 async fn client_completion_cannot_overwrite_cancelled() -> Result<()> {
-    use durust::{StateProvider, WorkflowHandle, STATUS_CANCELLED, STATUS_SUCCESS};
+    use durare::{StateProvider, WorkflowHandle, STATUS_CANCELLED, STATUS_SUCCESS};
     let provider = Arc::new(InMemoryProvider::new());
     let client = Client::new(provider.clone());
 
@@ -810,7 +810,7 @@ async fn client_completion_cannot_overwrite_cancelled() -> Result<()> {
 /// completed workflow is a no-op whose handle reads the recorded outcome.
 #[tokio::test]
 async fn client_resume_missing_and_completed() -> Result<()> {
-    use durust::ErrorCode;
+    use durare::ErrorCode;
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
     engine.register("one", |_ctx: DurableContext, _: ()| async move {
@@ -841,7 +841,7 @@ async fn client_resume_missing_and_completed() -> Result<()> {
 /// — and a timed workflow can be cancelled while it waits.
 #[tokio::test]
 async fn client_enqueue_persists_delay_timeout_and_auth() -> Result<()> {
-    use durust::StateProvider;
+    use durare::StateProvider;
     let provider = Arc::new(InMemoryProvider::new());
     let client = Client::new(provider.clone());
 

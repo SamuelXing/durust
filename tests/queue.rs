@@ -2,7 +2,7 @@
 //! basic enqueue→dispatch, worker concurrency, priority ordering, delayed
 //! enqueue, deduplication, and rate limiting.
 
-use durust::{
+use durare::{
     DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, ListFilter, RateLimiter,
     Result, WorkflowOptions, WorkflowQueue, STATUS_DELAYED, STATUS_ENQUEUED,
 };
@@ -250,7 +250,7 @@ async fn dedup_id_rejects_duplicates() -> Result<()> {
 /// without a dedup id is rejected.
 #[tokio::test]
 async fn dedup_return_existing_returns_the_holder() -> Result<()> {
-    use durust::DeduplicationPolicy;
+    use durare::DeduplicationPolicy;
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
     engine.register("noop", |_ctx: DurableContext, _: ()| async move {
         Ok::<_, Error>(())
@@ -520,7 +520,7 @@ async fn partitioned_queue_ignores_keyless_enqueue() -> Result<()> {
     Ok(())
 }
 
-async fn futures_count_enqueued(handles: &mut [durust::WorkflowHandle<()>]) -> Result<usize> {
+async fn futures_count_enqueued(handles: &mut [durare::WorkflowHandle<()>]) -> Result<usize> {
     let mut n = 0;
     for h in handles {
         if h.get_status().await?.status == STATUS_ENQUEUED {

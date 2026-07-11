@@ -1,6 +1,6 @@
 //! Scheduled (cron) workflow: run a workflow automatically on a recurring tick.
 //!
-//! Annotating a workflow with `#[durust::workflow(schedule = "...")]` makes the
+//! Annotating a workflow with `#[durare::workflow(schedule = "...")]` makes the
 //! engine fire it on a cron schedule once [`DurableEngine::launch`] is running.
 //! The schedule is a 6-field cron expression — `sec min hour dom mon dow` — so
 //! sub-minute cadences are expressible; this one runs every second.
@@ -13,7 +13,7 @@
 //! cargo run --example scheduled
 //! ```
 
-use durust::{DurableContext, DurableEngine, InMemoryProvider, Result, ScheduledInput};
+use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, ScheduledInput};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,7 +22,7 @@ static TICKS: AtomicUsize = AtomicUsize::new(0);
 
 // Runs every second. The `ScheduledInput` carries the cron instant this run
 // fires for (and any context value attached to the schedule).
-#[durust::workflow(schedule = "* * * * * *")]
+#[durare::workflow(schedule = "* * * * * *")]
 async fn collect_metrics(_ctx: DurableContext, tick: ScheduledInput) -> Result<()> {
     let n = TICKS.fetch_add(1, Ordering::SeqCst) + 1;
     println!(
@@ -36,7 +36,7 @@ async fn collect_metrics(_ctx: DurableContext, tick: ScheduledInput) -> Result<(
 async fn main() -> Result<()> {
     let engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
 
-    // No manual registration: `#[durust::workflow(schedule = ...)]` auto-registers
+    // No manual registration: `#[durare::workflow(schedule = ...)]` auto-registers
     // collect_metrics and its schedule. launch() starts the cron loop.
     println!("[start] scheduler running — watching for ~4 seconds");
     engine.launch().await?;

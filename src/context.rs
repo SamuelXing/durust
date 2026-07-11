@@ -424,7 +424,7 @@ impl DurableContext {
     /// via [`params!`](crate::params):
     ///
     /// ```no_run
-    /// # use durust::{DurableContext, Result, params};
+    /// # use durare::{DurableContext, Result, params};
     /// # async fn ex(ctx: DurableContext) -> Result<()> {
     /// let bal: i64 = ctx
     ///     .transaction("debit", |tx| Box::pin(async move {
@@ -458,7 +458,7 @@ impl DurableContext {
     /// clone other captures inside the closure.
     ///
     /// ```no_run
-    /// # use durust::{DurableContext, IsolationLevel, Result, TransactionOptions, params};
+    /// # use durare::{DurableContext, IsolationLevel, Result, TransactionOptions, params};
     /// # async fn ex(ctx: DurableContext) -> Result<()> {
     /// let opts = TransactionOptions::new("transfer").isolation(IsolationLevel::Serializable);
     /// ctx.transaction_with::<(), _>(opts, |tx| Box::pin(async move {
@@ -1035,7 +1035,7 @@ impl DurableContext {
     /// [`StreamExt::next`](futures_util::StreamExt::next):
     ///
     /// ```ignore
-    /// use durust::StreamExt;
+    /// use durare::StreamExt;
     /// let mut values = ctx.read_stream_values::<String>(id, "events");
     /// while let Some(v) = values.next().await {
     ///     println!("{}", v?);

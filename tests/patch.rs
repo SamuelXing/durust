@@ -1,7 +1,7 @@
 //! Code-patching tests on the in-memory provider: `patch` routes new workflows
 //! to new code and pre-patch workflows to old code, recording a marker step.
 
-use durust::{
+use durare::{
     DurableContext, DurableEngine, InMemoryProvider, Result, StateProvider, WorkflowOptions,
 };
 use serde_json::Value;

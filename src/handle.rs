@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 /// Await it directly for the typed output, or share it:
 ///
 /// ```no_run
-/// # use durust::{DurableEngine, WorkflowHandle, Result};
+/// # use durare::{DurableEngine, WorkflowHandle, Result};
 /// # async fn f(engine: &DurableEngine) -> Result<()> {
 /// let handle: WorkflowHandle<i64> = engine.start("add", 1_i64, Default::default()).await?;
 /// let observer = handle.clone();          // hand a copy to another task

@@ -16,7 +16,7 @@
 //! cargo run --example timer
 //! ```
 
-use durust::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
+use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,14 +24,14 @@ use std::time::{Duration, Instant};
 // Counts real charges so we can prove the second run repeats none.
 static CHARGES: AtomicUsize = AtomicUsize::new(0);
 
-#[durust::step]
+#[durare::step]
 async fn charge(ctx: &DurableContext, month: u32, cents: i64) -> Result<i64> {
     CHARGES.fetch_add(1, Ordering::SeqCst);
     println!("  >> charging {cents} cents for month {month}");
     Ok(cents)
 }
 
-#[durust::workflow]
+#[durare::workflow]
 async fn subscription(ctx: DurableContext, months: u32) -> Result<i64> {
     let mut total = 0;
     for m in 1..=months {

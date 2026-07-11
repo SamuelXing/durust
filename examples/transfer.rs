@@ -1,6 +1,6 @@
 //! Transactional steps: SQL writes and the durable checkpoint commit together.
 //!
-//! A `#[durust::transaction]` runs its body inside one database transaction and
+//! A `#[durare::transaction]` runs its body inside one database transaction and
 //! records the step's completion in that *same* transaction. So either both the
 //! SQL and the checkpoint land, or neither does — a crash can never leave the
 //! step "done" in the log but not applied to your tables, nor applied twice.
@@ -16,7 +16,7 @@
 //! cargo run --example transfer
 //! ```
 
-use durust::{params, DurableContext, DurableEngine, Result, SqliteProvider, Tx, WorkflowOptions};
+use durare::{params, DurableContext, DurableEngine, Result, SqliteProvider, Tx, WorkflowOptions};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,7 +30,7 @@ struct Transfer {
 
 // Create the table and seed two accounts. `ON CONFLICT DO NOTHING` keeps a
 // re-run from reseeding.
-#[durust::transaction]
+#[durare::transaction]
 async fn setup(ctx: &DurableContext, tx: &mut Tx<'_>) -> Result<()> {
     tx.execute(
         "CREATE TABLE IF NOT EXISTS account (name TEXT PRIMARY KEY, cents INTEGER)",
@@ -48,7 +48,7 @@ async fn setup(ctx: &DurableContext, tx: &mut Tx<'_>) -> Result<()> {
 }
 
 // Debit and credit in one transaction — atomic with the checkpoint.
-#[durust::transaction]
+#[durare::transaction]
 async fn transfer(
     ctx: &DurableContext,
     tx: &mut Tx<'_>,
@@ -70,7 +70,7 @@ async fn transfer(
     Ok(())
 }
 
-#[durust::transaction]
+#[durare::transaction]
 async fn balance(ctx: &DurableContext, tx: &mut Tx<'_>, name: String) -> Result<i64> {
     let row = tx
         .query_one("SELECT cents FROM account WHERE name = ?", &params![name])
@@ -78,7 +78,7 @@ async fn balance(ctx: &DurableContext, tx: &mut Tx<'_>, name: String) -> Result<
     Ok(row.get::<i64>("cents"))
 }
 
-#[durust::workflow]
+#[durare::workflow]
 async fn run_transfer(ctx: DurableContext, req: Transfer) -> Result<(i64, i64)> {
     setup(&ctx).await?;
     transfer(&ctx, req.from.clone(), req.to.clone(), req.cents).await?;
@@ -87,7 +87,7 @@ async fn run_transfer(ctx: DurableContext, req: Transfer) -> Result<(i64, i64)> 
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let path = std::env::temp_dir().join(format!("durust-transfer-{}.db", uuid::Uuid::new_v4()));
+    let path = std::env::temp_dir().join(format!("durare-transfer-{}.db", uuid::Uuid::new_v4()));
     let url = format!("sqlite://{}", path.display());
 
     let engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;

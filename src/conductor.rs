@@ -23,10 +23,10 @@
 //!
 //! Opt-in, like the admin server:
 //! ```no_run
-//! # use durust::{DurableEngine, InMemoryProvider, Conductor, ConductorConfig};
+//! # use durare::{DurableEngine, InMemoryProvider, Conductor, ConductorConfig};
 //! # use std::sync::Arc;
 //! # use std::time::Duration;
-//! # async fn run() -> durust::Result<()> {
+//! # async fn run() -> durare::Result<()> {
 //! let engine = Arc::new(DurableEngine::new(Arc::new(InMemoryProvider::new())).await?);
 //! engine.launch().await?;
 //! let conductor = Conductor::start(engine.clone(), ConductorConfig {

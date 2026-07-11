@@ -17,7 +17,7 @@
 //! cargo run --example approval
 //! ```
 
-use durust::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
+use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +28,7 @@ struct Expense {
     cents: i64,
 }
 
-#[durust::workflow]
+#[durare::workflow]
 async fn expense_approval(ctx: DurableContext, exp: Expense) -> Result<String> {
     println!("  >> {} filed an expense for {} cents", exp.who, exp.cents);
 

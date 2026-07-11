@@ -31,7 +31,7 @@ const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, e
 ///
 /// Gives durable, crash-recoverable state without running a database server —
 /// the embedded counterpart to [`crate::PostgresProvider`], using the same
-/// canonical DBOS schema. A file URL (`sqlite://durust.db`) survives process
+/// canonical DBOS schema. A file URL (`sqlite://durare.db`) survives process
 /// restarts; `sqlite::memory:` is handy for tests within a single process.
 pub struct SqliteProvider {
     pool: SqlitePool,
@@ -41,7 +41,7 @@ pub struct SqliteProvider {
 }
 
 impl SqliteProvider {
-    /// Connect using a sqlx SQLite URL, e.g. `sqlite://durust.db` (created if
+    /// Connect using a sqlx SQLite URL, e.g. `sqlite://durare.db` (created if
     /// missing) or `sqlite::memory:`. Every connection is configured for
     /// write-heavy concurrent use: foreign keys on (the schema's `ON DELETE
     /// CASCADE` relationships require them), WAL journaling (concurrent reads

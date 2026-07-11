@@ -2,7 +2,7 @@
 //! handlers. A local websocket server stands in for the cloud conductor: it
 //! pushes requests and asserts on the client's responses.
 
-use durust::{
+use durare::{
     AlertHandler, Conductor, ConductorConfig, DurableContext, DurableEngine, Error,
     InMemoryProvider, Result, ScheduleOptions, WorkflowOptions, WorkflowQueue,
 };
@@ -252,7 +252,7 @@ async fn conductor_handles_workflow_management() -> Result<()> {
 /// the queue option reached the row through the conductor path.
 #[tokio::test]
 async fn conductor_resume_routes_to_named_queue() -> Result<()> {
-    use durust::{StateProvider, WorkflowStatus, STATUS_PENDING};
+    use durare::{StateProvider, WorkflowStatus, STATUS_PENDING};
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
 
@@ -875,14 +875,14 @@ async fn conductor_exports_and_imports_workflow() -> Result<()> {
 
     // The re-imported workflow's durable state is intact.
     let rows = engine
-        .list_workflows(&durust::ListFilter {
+        .list_workflows(&durare::ListFilter {
             workflow_ids: vec!["p-1".to_string()],
             load_output: true,
             ..Default::default()
         })
         .await?;
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].status, durust::STATUS_SUCCESS);
+    assert_eq!(rows[0].status, durare::STATUS_SUCCESS);
     assert_eq!(rows[0].output, Some(json!(42)));
 
     let steps = engine.get_workflow_steps("p-1").await?;

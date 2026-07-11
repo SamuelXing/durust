@@ -12,11 +12,11 @@
 //! cargo run --example stream
 //! ```
 
-use durust::{DurableContext, DurableEngine, InMemoryProvider, Result, StreamExt, WorkflowOptions};
+use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, StreamExt, WorkflowOptions};
 use std::sync::Arc;
 use std::time::Duration;
 
-#[durust::workflow]
+#[durare::workflow]
 async fn crunch(ctx: DurableContext, items: i64) -> Result<i64> {
     for i in 1..=items {
         // Publish progress into the durable stream as we go.

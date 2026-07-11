@@ -64,7 +64,7 @@ pub(crate) fn registry_key(name: &str, config_name: Option<&str>) -> String {
 /// JSON-in / JSON-out [`WorkflowFn`] the engine stores.
 ///
 /// This is the single place input/output (de)serialization happens. Both
-/// [`DurableEngine::register`] and the `#[durust::workflow]` macro funnel through
+/// [`DurableEngine::register`] and the `#[durare::workflow]` macro funnel through
 /// it, so the manual and auto-registered paths behave identically.
 pub fn erase<I, O, F, Fut>(f: F) -> WorkflowFn
 where
@@ -84,7 +84,7 @@ where
     })
 }
 
-/// A compile-time workflow registration emitted by `#[durust::workflow]`.
+/// A compile-time workflow registration emitted by `#[durare::workflow]`.
 ///
 /// Collected via the `inventory` crate: every annotated workflow in the binary
 /// submits one of these, and [`DurableEngine::new`] iterates them so no manual
@@ -92,7 +92,7 @@ where
 pub struct WorkflowRegistration {
     /// The name the workflow is registered (and persisted) under.
     pub name: &'static str,
-    /// Builds the type-erased handler. Typically `|| durust::erase(my_fn)`.
+    /// Builds the type-erased handler. Typically `|| durare::erase(my_fn)`.
     pub builder: fn() -> WorkflowFn,
     /// A cron spec (6-field, second precision) if this is a scheduled workflow;
     /// emitted by `#[workflow(schedule = "...")]`. `None` otherwise.
@@ -103,7 +103,7 @@ inventory::collect!(WorkflowRegistration);
 
 /// A compile-time, typed reference to a registered workflow.
 ///
-/// `#[durust::workflow]` emits one of these for every annotated function: a
+/// `#[durare::workflow]` emits one of these for every annotated function: a
 /// zero-sized marker named by the function in `UpperCamelCase` (so
 /// `process_order` yields a `ProcessOrder` marker). Passing the marker to
 /// [`DurableEngine::start_with`] fixes the input and output types from the
@@ -111,7 +111,7 @@ inventory::collect!(WorkflowRegistration);
 /// wrong input type is a compile error:
 ///
 /// ```ignore
-/// #[durust::workflow]
+/// #[durare::workflow]
 /// async fn process_order(ctx: DurableContext, order: Order) -> Result<Receipt> { /* … */ }
 ///
 /// let handle = engine.start_with(ProcessOrder, order, opts).await?; // input: Order, checked
@@ -127,7 +127,7 @@ pub trait WorkflowDef {
 }
 
 /// Projects the `Ok` type out of a `Result` at the type level. Lets the
-/// `#[durust::workflow]` macro name a workflow's output as
+/// `#[durare::workflow]` macro name a workflow's output as
 /// `<ReturnType as WorkflowResult>::Ok` instead of parsing the return type's
 /// tokens — the compiler does the extraction, through any `Result` alias.
 /// Macro plumbing, not public API.
@@ -504,7 +504,7 @@ impl DurableEngineBuilder {
     }
 
     /// Initialize the backend and build the engine, collecting every
-    /// `#[durust::workflow]` in the binary plus the explicit registrations into
+    /// `#[durare::workflow]` in the binary plus the explicit registrations into
     /// one registry. Errors with [`Error::ConflictingRegistration`] if any name
     /// (or configured-instance key) is registered twice.
     pub async fn build(self) -> Result<DurableEngine> {
@@ -521,7 +521,7 @@ impl DurableEngineBuilder {
             crate::debounce::DEBOUNCER_WF.to_string(),
             erase(crate::debounce::internal_debouncer),
         );
-        // Auto-registered `#[durust::workflow]`s.
+        // Auto-registered `#[durare::workflow]`s.
         for reg in inventory::iter::<WorkflowRegistration> {
             if workflows
                 .insert(reg.name.to_string(), (reg.builder)())
@@ -574,7 +574,7 @@ impl DurableEngineBuilder {
 impl DurableEngine {
     /// Create an engine with a generated executor id and a default app version.
     ///
-    /// Every workflow annotated with `#[durust::workflow]` anywhere in the binary
+    /// Every workflow annotated with `#[durare::workflow]` anywhere in the binary
     /// is auto-registered here (via `inventory`).
     ///
     /// The application version and executor id resolve as
@@ -652,12 +652,12 @@ impl DurableEngine {
     /// [`Error::ConflictingRegistration`] — so an ambiguous name→function
     /// registry (which recovery cannot dispatch correctly) is a build-time error
     /// rather than a silent last-writer-wins overwrite. Every
-    /// `#[durust::workflow]` in the binary is collected automatically, as with
+    /// `#[durare::workflow]` in the binary is collected automatically, as with
     /// [`new`](Self::new).
     ///
     /// ```no_run
-    /// # use durust::{DurableEngine, PostgresProvider};
-    /// # async fn f() -> durust::Result<()> {
+    /// # use durare::{DurableEngine, PostgresProvider};
+    /// # async fn f() -> durare::Result<()> {
     /// # let provider = std::sync::Arc::new(PostgresProvider::connect("postgres://localhost/db").await?);
     /// let mut b = DurableEngine::builder(provider);
     /// b.app_version("1.2.0");
@@ -685,8 +685,8 @@ impl DurableEngine {
     /// use [`builder`](Self::builder).
     ///
     /// ```no_run
-    /// # use durust::DurableEngine;
-    /// # async fn f() -> durust::Result<()> {
+    /// # use durare::DurableEngine;
+    /// # async fn f() -> durare::Result<()> {
     /// let engine = DurableEngine::connect("postgres://localhost/db").await?.build().await?;
     /// # Ok(()) }
     /// ```
@@ -816,7 +816,7 @@ impl DurableEngine {
         queues
     }
 
-    /// All workflows registered on this engine — both `#[durust::workflow]`
+    /// All workflows registered on this engine — both `#[durare::workflow]`
     /// auto-registrations and manual [`register`](Self::register) calls — sorted
     /// by name. Each entry carries its cron schedule if it is a scheduled
     /// workflow.
@@ -1266,7 +1266,7 @@ impl DurableEngine {
     }
 
     /// Start a workflow from its typed [`WorkflowDef`] reference — the marker
-    /// `#[durust::workflow]` emits — returning a [`WorkflowHandle`] immediately.
+    /// `#[durare::workflow]` emits — returning a [`WorkflowHandle`] immediately.
     ///
     /// The reference fixes the input and output types from the workflow's own
     /// signature, so neither needs a turbofish and a wrong input type is a

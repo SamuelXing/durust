@@ -10,20 +10,20 @@
 //! cargo run --example client
 //! ```
 
-use durust::{
+use durare::{
     Client, DurableContext, DurableEngine, InMemoryProvider, ListFilter, Result, WorkflowOptions,
     WorkflowQueue,
 };
 use std::sync::Arc;
 use std::time::Duration;
 
-#[durust::step]
+#[durare::step]
 async fn render(ctx: &DurableContext, month: String) -> Result<String> {
     tokio::time::sleep(Duration::from_millis(50)).await;
     Ok(format!("report for {month}: 42 pages"))
 }
 
-#[durust::workflow]
+#[durare::workflow]
 async fn monthly_report(ctx: DurableContext, month: String) -> Result<String> {
     render(&ctx, month).await
 }

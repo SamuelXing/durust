@@ -51,7 +51,7 @@ jobs:
           # connection path exercises URL-escaping — the DATABASE_URL below carries
           # the percent-encoded form.
           POSTGRES_PASSWORD: 'a!b@c$d()e*_,/:;=?@ff[]22'
-          POSTGRES_DB: durust_test
+          POSTGRES_DB: durare_test
         ports:
           - 5432:5432
         # Wait until the server accepts connections before the steps run.
@@ -64,7 +64,7 @@ jobs:
       # Drives the Postgres backend tests (schema is applied by the providers'
       # sqlx migrations on connect). Without this they skip; here they run. The
       # password is the percent-encoded form of POSTGRES_PASSWORD above.
-      DATABASE_URL: postgres://postgres:a%21b%40c%24d%28%29e%2A_%2C%2F%3A%3B%3D%3F%40ff%5B%5D22@localhost:5432/durust_test
+      DATABASE_URL: postgres://postgres:a%21b%40c%24d%28%29e%2A_%2C%2F%3A%3B%3D%3F%40ff%5B%5D22@localhost:5432/durare_test
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
