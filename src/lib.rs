@@ -109,9 +109,24 @@
 //! - **Backends** — [`PostgresProvider`], [`SqliteProvider`], and
 //!   [`InMemoryProvider`], all behind the [`StateProvider`] seam.
 //!
-//! Ten runnable, end-to-end examples live in
-//! [`examples/`](https://github.com/SamuelXing/durare/tree/main/examples).
+//! # Guides
+//!
+//! Four module-level guides explain the concepts in depth, `std`-style, each
+//! with tested examples: start with [`durability`] (checkpoints, replay, and
+//! the determinism contract — read this first), then [`queues`],
+//! [`messaging`], and [`transactions`]. Ten runnable, end-to-end examples live
+//! in [`examples/`](https://github.com/SamuelXing/durare/tree/main/examples).
 #![warn(missing_docs)]
+
+// Concept guides — std-style module pages (think `std::pin`) that each explain
+// one subsystem, with tested examples. Implementation lives in the private
+// modules below; the guides re-export the relevant types with
+// `#[doc(no_inline)]` so every item's canonical documentation stays at the
+// crate root.
+pub mod durability;
+pub mod messaging;
+pub mod queues;
+pub mod transactions;
 
 mod admin;
 mod client;

@@ -22,6 +22,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "signal", "delay", "timer") for docs.rs search.
 - Added crates.io and docs.rs badges, an MSRV policy section, and a
   `CONTRIBUTING.md`.
+- Added four `std`-style concept guides as public modules — `durability`
+  (checkpoints, replay, and the determinism contract), `queues`, `messaging`,
+  and `transactions` — each a module-level essay with tested, mostly runnable
+  examples.
 
 ## [0.1.0] - 2026-07-10
 
