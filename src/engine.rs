@@ -865,9 +865,14 @@ impl DurableEngine {
 
     /// Create a durable cron schedule that fires `workflow_name` on each tick of
     /// `cron` (a 6-field, second-precision spec). The reconciler started by
-    /// [`launch`](Self::launch) installs it on its next pass. Errors if the cron
-    /// spec is invalid, the workflow is not registered here, or a schedule with
-    /// this name already exists.
+    /// [`launch`](Self::launch) installs it on its next pass.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the cron spec or `ScheduleOptions` timezone is invalid, the
+    /// workflow is not registered here, or a schedule with this name already
+    /// exists.
+    #[doc(alias = "cron")]
     pub async fn create_schedule(
         &self,
         schedule_name: &str,
@@ -1207,6 +1212,36 @@ impl DurableEngine {
     /// any executor claims and runs it. If the id already exists in a terminal
     /// state, a polling handle over the stored result is returned instead of
     /// re-running.
+    ///
+    /// ```
+    /// # use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
+    /// # use std::sync::Arc;
+    /// # #[durare::workflow]
+    /// # async fn greet(ctx: DurableContext, name: String) -> Result<String> {
+    /// #     Ok(format!("hello, {name}"))
+    /// # }
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<()> {
+    /// # let engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    /// // Start by registered name; the id is the idempotency key.
+    /// let handle = engine
+    ///     .start::<_, String>("greet", "world".to_string(), WorkflowOptions::with_id("greet-1"))
+    ///     .await?;
+    /// assert_eq!(handle.await?, "hello, world");
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// For compile-time input/output checking without the turbofish, use
+    /// [`start_with`](Self::start_with).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnknownWorkflow`] if `name` is not registered;
+    /// [`Error::QueueDeduplicated`] if `opts.dedup_id` collides with an active
+    /// workflow on the queue (under the default `Reject` policy); an
+    /// application error if a deduplication policy is set without a
+    /// deduplication id.
     pub async fn start<I, O>(
         &self,
         name: &str,
@@ -1328,6 +1363,11 @@ impl DurableEngine {
     /// handler nudging a waiting workflow). Not durable — there is no calling
     /// workflow to checkpoint into; from workflow code use
     /// [`DurableContext::send`] instead.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NonExistentWorkflow`] if the destination workflow does not
+    /// exist.
     pub async fn send<T: Serialize>(
         &self,
         destination_id: &str,

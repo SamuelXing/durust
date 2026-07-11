@@ -15,6 +15,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   map linking every major API.
 - Converted all `ignore`d doc examples to compiled (most of them runnable)
   doctests, so every example in the docs is checked by `cargo test`.
+- Added examples and `# Errors` sections to the hot-path APIs — `step`,
+  `step_with`, `sleep`, `send`/`recv`, `set_event`/`get_event`,
+  `write_stream`, `start_workflow`, `DurableEngine::start`,
+  `WorkflowHandle::result`, and `Client` — plus `#[doc(alias)]`es ("cron",
+  "signal", "delay", "timer") for docs.rs search.
 - Added crates.io and docs.rs badges, an MSRV policy section, and a
   `CONTRIBUTING.md`.
 

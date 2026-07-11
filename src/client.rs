@@ -31,6 +31,24 @@ use std::time::Duration;
 /// executors to claim, [`send`](Self::send)s messages, reads events, and queries
 /// workflow state. It is the producer/observer half of the split between
 /// enqueueing work and executing it.
+///
+/// ```no_run
+/// use durare::{Client, PostgresProvider, WorkflowOptions};
+/// use std::sync::Arc;
+///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> durare::Result<()> {
+/// let provider = Arc::new(PostgresProvider::connect("postgres://localhost/app").await?);
+/// let client = Client::new(provider);
+///
+/// // Enqueue for an executor fleet elsewhere to run; observe from here.
+/// let handle = client
+///     .enqueue::<_, String>("orders", "process_order", "1001".to_string(), WorkflowOptions::default())
+///     .await?;
+/// println!("state: {}", handle.get_status().await?.status);
+/// # Ok(())
+/// # }
+/// ```
 pub struct Client {
     provider: Arc<dyn StateProvider>,
     app_version: String,
@@ -77,6 +95,14 @@ impl Client {
     ///
     /// The row is persisted `ENQUEUED` (or `DELAYED` when `opts.delay` is set);
     /// `opts.queue` is ignored — the queue is the first argument.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::QueueDeduplicated`] if `opts.dedup_id` collides with an active
+    /// workflow on the queue (under the default `Reject` policy); an
+    /// application error for an empty queue or workflow name, a partition key
+    /// combined with a deduplication id, or a deduplication policy without a
+    /// deduplication id.
     pub async fn enqueue<I, O>(
         &self,
         queue_name: &str,
