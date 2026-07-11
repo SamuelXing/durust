@@ -300,7 +300,7 @@ pub struct PortableWorkflowError {
 pub fn encode_error(serializer: &Serializer, err: &Error) -> String {
     if matches!(serializer, Serializer::Portable) {
         let env = match err {
-            Error::Portable(pe) => pe.clone(),
+            Error::Portable(pe) => (**pe).clone(),
             other => PortableWorkflowError {
                 name: PORTABLE_ERROR_NAME.to_string(),
                 message: other.to_string(),
@@ -486,12 +486,12 @@ mod tests {
     fn portable_error_keeps_typed_name_and_code() {
         // A structured Error::Portable is written with its own name/code/data —
         // and read back intact, the bytes any SDK can parse.
-        let err = Error::Portable(PortableWorkflowError {
+        let err = Error::Portable(Box::new(PortableWorkflowError {
             name: "ValidationError".to_string(),
             message: "invalid input".to_string(),
             code: Some(json!(400)),
             data: Some(json!({"field": "email"})),
-        });
+        }));
         let enc = encode_error(&Serializer::Portable, &err);
         let (msg, info) = decode_error(Some(PORTABLE), &enc);
         assert_eq!(msg, "invalid input");

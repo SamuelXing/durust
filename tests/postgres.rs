@@ -119,12 +119,12 @@ async fn pg_portable_error_envelope_round_trip() -> Result<()> {
             .with_serializer(Serializer::Portable);
         let mut engine = DurableEngine::new(Arc::new(provider)).await?;
         engine.register("validate", |_ctx: DurableContext, _: ()| async move {
-            Err::<(), _>(Error::Portable(PortableWorkflowError {
+            Err::<(), _>(Error::Portable(Box::new(PortableWorkflowError {
                 name: "ValidationError".to_string(),
                 message: "bad email".to_string(),
                 code: Some(serde_json::json!(400)),
                 data: None,
-            }))
+            })))
         });
         let _ = engine
             .start::<_, ()>("validate", (), WorkflowOptions::with_id(&typed_id))

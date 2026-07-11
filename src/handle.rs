@@ -172,7 +172,7 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
             // error; reconstruct it so an observer reads the same name/code/data
             // any SDK wrote. Otherwise the bare message.
             STATUS_ERROR => Err(match status.error_info {
-                Some(info) => Error::Portable(info),
+                Some(info) => Error::Portable(Box::new(info)),
                 None => Error::app(
                     status
                         .error
