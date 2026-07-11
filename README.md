@@ -1,6 +1,6 @@
 # durare
 
-[![CI](https://github.com/SamuelXing/durust/actions/workflows/ci.yml/badge.svg)](https://github.com/SamuelXing/durust/actions/workflows/ci.yml)
+[![CI](https://github.com/SamuelXing/durare/actions/workflows/ci.yml/badge.svg)](https://github.com/SamuelXing/durare/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 `durare` (Latin *durāre*, "to last") is a durable-execution library for Rust.
@@ -91,7 +91,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 Until 0.1 reaches crates.io, use a git dependency:
-`durare = { git = "https://github.com/SamuelXing/durust" }`.
+`durare = { git = "https://github.com/SamuelXing/durare" }`.
 
 The repository ships ten self-contained examples, one per primitive:
 

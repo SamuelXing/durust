@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "A DBOS-compatible durable execution SDK for Rust: write ordinary async code, checkpoint every step to Postgres or SQLite, and resume exactly where you left off after a crash."
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/SamuelXing/durare"
+homepage = "https://github.com/SamuelXing/durare"
+documentation = "https://docs.rs/durare"
+readme = "README.md"
+keywords = ["durable-execution", "workflow", "dbos", "orchestration", "postgres"]
+categories = ["asynchronous", "database"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Procedural macros for durare: #[workflow] auto-registration."
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/SamuelXing/durare"
 
 [lib]
 proc-macro = true
