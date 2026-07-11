@@ -17,6 +17,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   would), and durare's engine claims the `ENQUEUED` workflow, runs it (portable
   input → event → stream → consuming a portable message), and writes
   byte-identical output/event/stream.
+- Conformance test that durare reads a workflow another SDK ran and *failed*:
+  the portable error envelope surfaces as structured `error_info` and
+  `result()` reconstructs the typed `Error::Portable`.
 
 ### Changed
 

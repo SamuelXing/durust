@@ -14,7 +14,7 @@
 //! (durare reads only the first positional arg of a portable input envelope).
 
 use durare::{
-    DurableContext, DurableEngine, PostgresProvider, Result, Serializer, SqliteProvider,
+    DurableContext, DurableEngine, Error, PostgresProvider, Result, Serializer, SqliteProvider,
     WorkflowQueue,
 };
 use serde::{Deserialize, Serialize};
@@ -273,5 +273,71 @@ async fn durare_runs_a_foreign_written_portable_workflow_pg() -> Result<()> {
     assert_eq!(stream, GOLDEN_STREAM_JSON);
 
     engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// durare reads a workflow another SDK ran and *failed*: the portable error
+/// envelope another SDK wrote in the `error` column surfaces as structured
+/// `error_info`, and `result()` reconstructs the typed [`Error::Portable`] a
+/// caller can match on. (Errors are part of the cross-SDK portable contract —
+/// unlike the `DBOS.sleep` wake-instant checkpoint, whose format the SDKs do not
+/// agree on: Go and durare store an RFC3339 timestamp, Python an epoch-seconds
+/// float, so mid-sleep recovery is not a cross-SDK operation.)
+#[tokio::test]
+async fn durare_reads_a_foreign_failed_workflow() -> Result<()> {
+    let mut path = std::env::temp_dir();
+    path.push(format!("durare-interop-err-{}.db", uuid::Uuid::new_v4()));
+    let url = format!("sqlite://{}", path.display());
+    let wf_id = uuid::Uuid::new_v4().to_string();
+
+    let provider = SqliteProvider::connect(&url)
+        .await?
+        .with_serializer(Serializer::Portable);
+    let engine = DurableEngine::new(Arc::new(provider)).await?;
+
+    // A foreign SDK's failed workflow: terminal ERROR with a portable error
+    // envelope in the `error` column. No engine run — durare just reads it.
+    let foreign = sqlx::sqlite::SqlitePool::connect(&url).await.unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    let envelope = r#"{"name":"InsufficientFunds","message":"balance too low","code":402,"data":{"available":10}}"#;
+    sqlx::query(
+        "INSERT INTO workflow_status
+            (workflow_uuid, name, inputs, status, error, executor_id, application_version,
+             serialization, created_at, updated_at)
+         VALUES (?, ?, ?, 'ERROR', ?, '', '', 'portable_json', ?, ?)",
+    )
+    .bind(&wf_id)
+    .bind("chargeCard")
+    .bind(r#"{"positionalArgs":[]}"#)
+    .bind(envelope)
+    .bind(now)
+    .bind(now)
+    .execute(&foreign)
+    .await
+    .unwrap();
+
+    // The structured error the foreign SDK wrote surfaces intact.
+    let status = engine
+        .retrieve_workflow::<()>(&wf_id)
+        .await?
+        .get_status()
+        .await?;
+    assert_eq!(status.status, "ERROR");
+    assert_eq!(status.error.as_deref(), Some("balance too low"));
+    let info = status.error_info.expect("structured portable error");
+    assert_eq!(info.name, "InsufficientFunds");
+    assert_eq!(info.code, Some(json!(402)));
+    assert_eq!(info.data, Some(json!({"available": 10})));
+
+    // And `result()` reconstructs the typed error.
+    match engine.retrieve_workflow::<()>(&wf_id).await?.result().await {
+        Err(Error::Portable(pe)) => {
+            assert_eq!(pe.name, "InsufficientFunds");
+            assert_eq!(pe.code, Some(json!(402)));
+        }
+        other => panic!("expected Error::Portable, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_file(&path);
     Ok(())
 }
