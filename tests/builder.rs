@@ -4,7 +4,8 @@
 //! `DurableEngine::connect` scheme-dispatches a provider from a URL.
 
 use durust::{
-    DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, Result, WorkflowQueue,
+    DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, Result, WorkflowOptions,
+    WorkflowQueue,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +24,11 @@ async fn builder_builds_a_runnable_engine() -> Result<()> {
     assert_eq!(engine.app_version(), "9.9.9");
     engine.launch().await?;
 
-    let out: i64 = engine.start_typed("add", "wf-b1", 41_i64).await?;
+    let out: i64 = engine
+        .start("add", 41_i64, WorkflowOptions::with_id("wf-b1"))
+        .await?
+        .result()
+        .await?;
     assert_eq!(out, 42);
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
@@ -140,7 +145,11 @@ async fn connect_dispatches_by_scheme() -> Result<()> {
     });
     let engine = b.build().await?;
     engine.launch().await?;
-    let () = engine.start_typed("noop", "wf-c1", ()).await?;
+    let () = engine
+        .start("noop", (), WorkflowOptions::with_id("wf-c1"))
+        .await?
+        .result()
+        .await?;
     engine.shutdown(Duration::from_secs(1)).await?;
 
     assert!(

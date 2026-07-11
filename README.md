@@ -40,10 +40,10 @@ engine.recover().await?;           // resume anything a prior crash left incompl
 engine.launch().await?;            // start queue dispatchers + cron schedulers
 
 // Non-blocking: returns a handle immediately.
-let mut handle = engine
-    .run_workflow::<_, Receipt>("process_order", order, WorkflowOptions::default())
+let handle = engine
+    .start::<_, Receipt>("process_order", order, WorkflowOptions::default())
     .await?;
-let receipt: Receipt = handle.get_result().await?;
+let receipt: Receipt = handle.result().await?;
 # Ok(()) }
 ```
 
@@ -66,9 +66,11 @@ or register them manually with `engine.register(name, f)`.
   step so it doesn't drift across crashes.
 
 ### Workflow handles
-`run_workflow` returns a `WorkflowHandle<O>` **without blocking**:
-`handle.get_result().await`, `handle.get_status().await`, `handle.id()`.
-`start` / `start_typed` are blocking convenience wrappers.
+`start` (string name) and `start_with` (a typed `#[durust::workflow]` marker)
+return a `WorkflowHandle<O>` **without blocking**. Resolve it with
+`handle.result().await` (or `handle.await` — the handle is `IntoFuture`); also
+`handle.get_status().await` and `handle.id()`. The handle is `Clone` and resolves
+through `&self`, so several tasks can observe the same workflow.
 
 ### Durable queues
 ```rust
@@ -82,7 +84,7 @@ engine.register_queue(
         .priority_enabled()                                       // lower priority runs first
         .rate_limiter(RateLimiter { limit: 50, period: Duration::from_secs(60) }),
 );
-let handle = engine.enqueue::<_, ()>("emails", "send_email", msg, opts).await?;
+let handle = engine.start::<_, ()>("send_email", msg, opts.queue("emails")).await?;
 ```
 A per-queue dispatcher (started by `launch()`) claims work respecting worker /
 global concurrency, rate limits, priority, per-tick **delay**, and queue-scoped

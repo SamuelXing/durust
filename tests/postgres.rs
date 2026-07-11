@@ -42,7 +42,7 @@ async fn pg_serialization_cross_format() -> Result<()> {
     {
         let engine = engine_with(&url, Serializer::Portable).await?;
         let out: String = engine
-            .run_workflow::<_, String>("greet", "ada".to_string(), WorkflowOptions::with_id(&id))
+            .start::<_, String>("greet", "ada".to_string(), WorkflowOptions::with_id(&id))
             .await?
             .result()
             .await?;
@@ -78,7 +78,7 @@ async fn pg_portable_error_envelope_round_trip() -> Result<()> {
                 Err::<(), _>(Error::app("kaboom"))
             });
             let outcome = engine
-                .run_workflow::<_, ()>("boom", (), WorkflowOptions::with_id(&id))
+                .start::<_, ()>("boom", (), WorkflowOptions::with_id(&id))
                 .await?
                 .result()
                 .await;
@@ -127,7 +127,7 @@ async fn pg_portable_error_envelope_round_trip() -> Result<()> {
             }))
         });
         let _ = engine
-            .run_workflow::<_, ()>("validate", (), WorkflowOptions::with_id(&typed_id))
+            .start::<_, ()>("validate", (), WorkflowOptions::with_id(&typed_id))
             .await?
             .result()
             .await;
@@ -186,7 +186,11 @@ async fn pg_checkpoints_a_caught_step_failure() -> Result<()> {
         let mut engine =
             DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
         register(&mut engine);
-        let out: String = engine.start_typed("flaky_caught", &id, ()).await?;
+        let out: String = engine
+            .start("flaky_caught", (), WorkflowOptions::with_id(&id))
+            .await?
+            .result()
+            .await?;
         assert_eq!(out, "caught-error");
         let steps = engine.get_workflow_steps(&id).await?;
         let maybe = steps
@@ -199,7 +203,11 @@ async fn pg_checkpoints_a_caught_step_failure() -> Result<()> {
         let mut engine =
             DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
         register(&mut engine);
-        let out: String = engine.start_typed("flaky_caught", &id, ()).await?;
+        let out: String = engine
+            .start("flaky_caught", (), WorkflowOptions::with_id(&id))
+            .await?
+            .result()
+            .await?;
         assert_eq!(out, "caught-error", "replay observes the recorded error");
     }
     assert_eq!(
@@ -236,7 +244,7 @@ async fn pg_auth_context_round_trip() -> Result<()> {
         .authenticated_user("alice")
         .assumed_role("admin")
         .authenticated_roles(["admin", "user"]);
-    let handle = engine.run_workflow::<_, String>("whoami", (), opts).await?;
+    let handle = engine.start::<_, String>("whoami", (), opts).await?;
     assert_eq!(handle.result().await?, "alice/admin/admin,user");
 
     let status = handle.get_status().await?;
@@ -280,9 +288,7 @@ async fn pg_child_workflow() -> Result<()> {
 
     let parent_id = format!("parent-{tag}");
     let opts = WorkflowOptions::with_id(&parent_id).authenticated_user("alice");
-    let handle = engine
-        .run_workflow::<_, String>("parent", 5_i64, opts)
-        .await?;
+    let handle = engine.start::<_, String>("parent", 5_i64, opts).await?;
     assert_eq!(handle.result().await?, "5:alice");
 
     let child = engine
@@ -325,7 +331,7 @@ async fn pg_workflow_steps() -> Result<()> {
 
     let id = format!("steps-{tag}");
     let _: i64 = engine
-        .run_workflow::<_, i64>("worker", (), WorkflowOptions::with_id(&id))
+        .start::<_, i64>("worker", (), WorkflowOptions::with_id(&id))
         .await?
         .result()
         .await?;
@@ -363,7 +369,7 @@ async fn pg_patch() -> Result<()> {
     // A brand-new workflow takes the new path and records the marker.
     let fresh = format!("patch-new-{tag}");
     let patched: bool = engine
-        .run_workflow::<_, bool>("wf", (), WorkflowOptions::with_id(&fresh))
+        .start::<_, bool>("wf", (), WorkflowOptions::with_id(&fresh))
         .await?
         .result()
         .await?;
@@ -388,7 +394,7 @@ async fn pg_patch() -> Result<()> {
         .record_step_result(&old, 0, "legacy_step", serde_json::json!(1), None, None)
         .await?;
     let patched: bool = engine
-        .run_workflow::<_, bool>("wf", (), WorkflowOptions::with_id(&old))
+        .start::<_, bool>("wf", (), WorkflowOptions::with_id(&old))
         .await?
         .result()
         .await?;
@@ -422,7 +428,7 @@ async fn pg_select() -> Result<()> {
 
     let id = format!("select-{tag}");
     let (index, value): (usize, i64) = engine
-        .run_workflow::<_, (usize, i64)>("racer", (), WorkflowOptions::with_id(&id))
+        .start::<_, (usize, i64)>("racer", (), WorkflowOptions::with_id(&id))
         .await?
         .result()
         .await?;
@@ -458,7 +464,7 @@ async fn pg_stream_round_trip() -> Result<()> {
     });
 
     engine
-        .run_workflow::<_, ()>("producer", (), WorkflowOptions::with_id(&id))
+        .start::<_, ()>("producer", (), WorkflowOptions::with_id(&id))
         .await?
         .result()
         .await?;
@@ -496,13 +502,13 @@ async fn pg_typed_db_errors() -> Result<()> {
     let mut opts = WorkflowOptions::with_id(format!("wf-a-{tag}"));
     opts.dedup_id = Some(dedup.clone());
     engine
-        .enqueue::<_, ()>(&format!("q-{tag}"), "noop", (), opts)
+        .start::<_, ()>("noop", (), opts.queue(format!("q-{tag}")))
         .await?;
 
     let mut opts = WorkflowOptions::with_id(format!("wf-b-{tag}"));
     opts.dedup_id = Some(dedup);
     let err = match engine
-        .enqueue::<_, ()>(&format!("q-{tag}"), "noop", (), opts)
+        .start::<_, ()>("noop", (), opts.queue(format!("q-{tag}")))
         .await
     {
         Ok(_) => panic!("dedup reuse must be rejected"),
@@ -555,11 +561,10 @@ async fn pg_global_concurrency_caps_running() -> Result<()> {
     for i in 0..4 {
         handles.push(
             engine
-                .enqueue::<_, ()>(
-                    "gc",
+                .start::<_, ()>(
                     "track",
                     (),
-                    WorkflowOptions::with_id(format!("gc-{tag}-{i}")),
+                    WorkflowOptions::with_id(format!("gc-{tag}-{i}")).queue("gc"),
                 )
                 .await?,
         );
@@ -696,19 +701,21 @@ async fn pg_partitioned_queue_dispatch() -> Result<()> {
     let east = format!("east-{tag}");
     let west = format!("west-{tag}");
     let a = engine
-        .enqueue::<_, i64>(
-            "pq",
+        .start::<_, i64>(
             "echo",
             1_i64,
-            WorkflowOptions::with_id(&east).partition_key("east"),
+            WorkflowOptions::with_id(&east)
+                .partition_key("east")
+                .queue("pq"),
         )
         .await?;
     let b = engine
-        .enqueue::<_, i64>(
-            "pq",
+        .start::<_, i64>(
             "echo",
             2_i64,
-            WorkflowOptions::with_id(&west).partition_key("west"),
+            WorkflowOptions::with_id(&west)
+                .partition_key("west")
+                .queue("pq"),
         )
         .await?;
     assert_eq!(a.result().await?, 1);
@@ -746,7 +753,9 @@ async fn pg_set_workflow_delay() -> Result<()> {
 
     let mut opts = WorkflowOptions::with_id(&wid);
     opts.delay = Some(Duration::from_secs(60));
-    let handle = engine.enqueue::<_, i64>("dq", "echo", 8_i64, opts).await?;
+    let handle = engine
+        .start::<_, i64>("echo", 8_i64, opts.queue("dq"))
+        .await?;
     assert_eq!(handle.get_status().await?.status, STATUS_DELAYED);
 
     let started = std::time::Instant::now();
@@ -790,7 +799,11 @@ async fn pg_list_filters_extended() -> Result<()> {
         h.result().await
     });
     let pid = format!("parent-{tag}");
-    let out: i64 = engine.start_typed("parent", &pid, ()).await?;
+    let out: i64 = engine
+        .start("parent", (), WorkflowOptions::with_id(&pid))
+        .await?
+        .result()
+        .await?;
     assert_eq!(out, 50);
 
     let child_id = format!("{pid}-0");
@@ -839,7 +852,13 @@ async fn pg_workflow_aggregates() -> Result<()> {
     let prefix = format!("agg-{tag}-");
     for i in 0..3 {
         engine
-            .start_typed::<_, ()>("agg_ok", &format!("{prefix}{i}"), ())
+            .start::<_, ()>(
+                "agg_ok",
+                (),
+                WorkflowOptions::with_id(format!("{prefix}{i}")),
+            )
+            .await?
+            .result()
             .await?;
     }
 
@@ -903,7 +922,11 @@ async fn pg_step_aggregates() -> Result<()> {
         ctx.step("a", || async { Ok::<_, Error>(3_i64) }).await?;
         Ok::<_, Error>(())
     });
-    engine.start_typed::<_, ()>("work", &id, ()).await?;
+    engine
+        .start::<_, ()>("work", (), WorkflowOptions::with_id(&id))
+        .await?
+        .result()
+        .await?;
 
     let by_fn = engine
         .get_step_aggregates(&StepAggregateQuery {
@@ -1373,21 +1396,22 @@ async fn pg_config_name_routes_on_queue_dispatch() -> Result<()> {
     engine.launch().await?;
 
     let fr = engine
-        .enqueue::<_, String>(
-            &queue,
+        .start::<_, String>(
             &wf,
             "Sam".to_string(),
             WorkflowOptions::with_id(&id_fr)
                 .config_name("fr")
-                .class_name("Greeter"),
+                .class_name("Greeter")
+                .queue(&queue),
         )
         .await?;
     let en = engine
-        .enqueue::<_, String>(
-            &queue,
+        .start::<_, String>(
             &wf,
             "Sam".to_string(),
-            WorkflowOptions::with_id(&id_en).config_name("en"),
+            WorkflowOptions::with_id(&id_en)
+                .config_name("en")
+                .queue(&queue),
         )
         .await?;
     assert_eq!(fr.result().await?, "Bonjour, Sam");
@@ -1618,7 +1642,7 @@ async fn pg_portable_input_envelope() -> Result<()> {
 
     let engine = engine_with(&url, Serializer::Portable).await?;
     let out: String = engine
-        .run_workflow::<_, String>("greet", "ada".to_string(), WorkflowOptions::with_id(&id))
+        .start::<_, String>("greet", "ada".to_string(), WorkflowOptions::with_id(&id))
         .await?
         .result()
         .await?;
@@ -1952,15 +1976,27 @@ async fn pg_transaction_step() -> Result<()> {
         Ok::<_, Error>(())
     });
 
-    let bal1: i64 = engine.start_typed("acct", &wf, table.clone()).await?;
+    let bal1: i64 = engine
+        .start("acct", table.clone(), WorkflowOptions::with_id(&wf))
+        .await?
+        .result()
+        .await?;
     assert_eq!(bal1, 90);
     // Re-run the same id: the debit replays from its checkpoint, not reapplied.
-    let bal2: i64 = engine.start_typed("acct", &wf, table.clone()).await?;
+    let bal2: i64 = engine
+        .start("acct", table.clone(), WorkflowOptions::with_id(&wf))
+        .await?
+        .result()
+        .await?;
     assert_eq!(bal2, 90, "exactly-once: re-running does not debit again");
 
     // Clean up the user table and the workflow rows.
     let drop_wf = format!("wf-drop-{tag}");
-    let _: () = engine.start_typed("drop", &drop_wf, table.clone()).await?;
+    let _: () = engine
+        .start("drop", table.clone(), WorkflowOptions::with_id(&drop_wf))
+        .await?
+        .result()
+        .await?;
     provider.delete_workflows(&[wf, drop_wf], false).await?;
     Ok(())
 }
@@ -2048,7 +2084,11 @@ async fn pg_transaction_step_rolls_back_on_error() -> Result<()> {
         Ok::<_, Error>(())
     });
 
-    let (failed, v): (bool, i64) = engine.start_typed("rb", &wf, table.clone()).await?;
+    let (failed, v): (bool, i64) = engine
+        .start("rb", table.clone(), WorkflowOptions::with_id(&wf))
+        .await?
+        .result()
+        .await?;
     assert!(failed, "the failing transaction returned its error");
     assert_eq!(
         v, 0,
@@ -2056,7 +2096,11 @@ async fn pg_transaction_step_rolls_back_on_error() -> Result<()> {
     );
 
     let drop_wf = format!("wf-drop-{tag}");
-    let _: () = engine.start_typed("drop", &drop_wf, table.clone()).await?;
+    let _: () = engine
+        .start("drop", table.clone(), WorkflowOptions::with_id(&drop_wf))
+        .await?
+        .result()
+        .await?;
     provider.delete_workflows(&[wf, drop_wf], false).await?;
     Ok(())
 }
@@ -2139,13 +2183,22 @@ async fn pg_transaction_serializable_retries_on_conflict() -> Result<()> {
     });
 
     let _: () = engine
-        .start_typed("seed", &format!("seed-{tag}"), table.clone())
+        .start(
+            "seed",
+            table.clone(),
+            WorkflowOptions::with_id(format!("seed-{tag}")),
+        )
+        .await?
+        .result()
         .await?;
     let (id_a, id_b) = (format!("a-{tag}"), format!("b-{tag}"));
-    let (a, b) = tokio::join!(
-        engine.start_typed::<_, i64>("incr", &id_a, table.clone()),
-        engine.start_typed::<_, i64>("incr", &id_b, table.clone()),
-    );
+    let ha = engine
+        .start::<_, i64>("incr", table.clone(), WorkflowOptions::with_id(&id_a))
+        .await?;
+    let hb = engine
+        .start::<_, i64>("incr", table.clone(), WorkflowOptions::with_id(&id_b))
+        .await?;
+    let (a, b) = tokio::join!(ha.result(), hb.result());
     let mut results = [a?, b?];
     results.sort();
     assert_eq!(
@@ -2155,7 +2208,13 @@ async fn pg_transaction_serializable_retries_on_conflict() -> Result<()> {
     );
 
     let _: () = engine
-        .start_typed("drop", &format!("drop-{tag}"), table.clone())
+        .start(
+            "drop",
+            table.clone(),
+            WorkflowOptions::with_id(format!("drop-{tag}")),
+        )
+        .await?
+        .result()
         .await?;
     provider
         .delete_workflows(
@@ -2207,7 +2266,11 @@ async fn pg_checkpoints_a_caught_transaction_failure() -> Result<()> {
         let mut engine =
             DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
         register(&mut engine);
-        let out: String = engine.start_typed("txn_flaky", &id, ()).await?;
+        let out: String = engine
+            .start("txn_flaky", (), WorkflowOptions::with_id(&id))
+            .await?
+            .result()
+            .await?;
         assert_eq!(out, "caught-error");
         let steps = engine.get_workflow_steps(&id).await?;
         let maybe = steps
@@ -2220,7 +2283,11 @@ async fn pg_checkpoints_a_caught_transaction_failure() -> Result<()> {
         let mut engine =
             DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
         register(&mut engine);
-        let out: String = engine.start_typed("txn_flaky", &id, ()).await?;
+        let out: String = engine
+            .start("txn_flaky", (), WorkflowOptions::with_id(&id))
+            .await?
+            .result()
+            .await?;
         assert_eq!(out, "caught-error", "replay observes the recorded error");
     }
     assert_eq!(
@@ -2288,11 +2355,13 @@ async fn pg_transaction_body_user_retry() -> Result<()> {
     });
 
     let out: i64 = engine
-        .start_typed(
+        .start(
             "retry",
-            &format!("wf-txn-retry-{}", uuid::Uuid::new_v4()),
             (),
+            WorkflowOptions::with_id(format!("wf-txn-retry-{}", uuid::Uuid::new_v4())),
         )
+        .await?
+        .result()
         .await?;
     assert_eq!(out, 42, "the body eventually succeeds");
     assert_eq!(
@@ -2302,11 +2371,13 @@ async fn pg_transaction_body_user_retry() -> Result<()> {
     );
 
     let failed: bool = engine
-        .start_typed(
+        .start(
             "nofast",
-            &format!("wf-txn-nofast-{}", uuid::Uuid::new_v4()),
             (),
+            WorkflowOptions::with_id(format!("wf-txn-nofast-{}", uuid::Uuid::new_v4())),
         )
+        .await?
+        .result()
         .await?;
     assert!(failed, "the error is surfaced to the caller");
     assert_eq!(
@@ -2339,7 +2410,7 @@ async fn pg_custom_schema_isolates_tenants() -> Result<()> {
         Ok::<_, Error>(n * 2)
     });
     let out: i64 = engine_a
-        .run_workflow::<_, i64>("hello", 21_i64, WorkflowOptions::with_id(&id))
+        .start::<_, i64>("hello", 21_i64, WorkflowOptions::with_id(&id))
         .await?
         .result()
         .await?;
@@ -2410,7 +2481,7 @@ async fn pg_export_import_round_trip() -> Result<()> {
     });
 
     let out: i64 = engine
-        .run_workflow::<_, i64>("expo", 21_i64, WorkflowOptions::with_id(&id))
+        .start::<_, i64>("expo", 21_i64, WorkflowOptions::with_id(&id))
         .await?
         .result()
         .await?;
@@ -2486,7 +2557,7 @@ async fn pg_recv_wakes_via_listen_notify() -> Result<()> {
     });
 
     let handle = engine
-        .run_workflow::<_, String>("waiter", (), WorkflowOptions::with_id(&id))
+        .start::<_, String>("waiter", (), WorkflowOptions::with_id(&id))
         .await?;
     // Let the workflow reach recv and subscribe to the channel.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2525,7 +2596,7 @@ async fn pg_send_with_idempotency_key_delivers_once() -> Result<()> {
     });
     // A completed destination that can still receive messages.
     engine
-        .run_workflow::<_, ()>("sink", (), WorkflowOptions::with_id(&id))
+        .start::<_, ()>("sink", (), WorkflowOptions::with_id(&id))
         .await?
         .result()
         .await?;
@@ -2580,7 +2651,7 @@ async fn pg_get_event_wakes_via_listen_notify() -> Result<()> {
     });
 
     let reader = engine
-        .run_workflow::<_, String>(
+        .start::<_, String>(
             "reader",
             setter_id.clone(),
             WorkflowOptions::with_id(&reader_id),
@@ -2591,7 +2662,7 @@ async fn pg_get_event_wakes_via_listen_notify() -> Result<()> {
 
     let started = std::time::Instant::now();
     engine
-        .run_workflow::<_, String>("setter", (), WorkflowOptions::with_id(&setter_id))
+        .start::<_, String>("setter", (), WorkflowOptions::with_id(&setter_id))
         .await?
         .result()
         .await?;
@@ -2634,7 +2705,7 @@ async fn pg_list_filters_multi_value() -> Result<()> {
     let b_id = format!("mvf-b-{tag}");
     let c_id = format!("mvf-c-{tag}");
     engine
-        .run_workflow::<_, i64>(
+        .start::<_, i64>(
             "mvf_a",
             1i64,
             WorkflowOptions::with_id(&a_id).authenticated_user("alice"),
@@ -2643,7 +2714,7 @@ async fn pg_list_filters_multi_value() -> Result<()> {
         .result()
         .await?;
     engine
-        .run_workflow::<_, i64>(
+        .start::<_, i64>(
             "mvf_b",
             2i64,
             WorkflowOptions::with_id(&b_id).authenticated_user("bob"),
@@ -2652,7 +2723,7 @@ async fn pg_list_filters_multi_value() -> Result<()> {
         .result()
         .await?;
     engine
-        .run_workflow::<_, i64>(
+        .start::<_, i64>(
             "mvf_c",
             3i64,
             WorkflowOptions::with_id(&c_id).authenticated_user("carol"),
@@ -2755,7 +2826,7 @@ async fn pg_was_forked_from_survives_import() -> Result<()> {
     engine.launch().await?;
 
     engine
-        .run_workflow::<_, i64>("wff", 1i64, WorkflowOptions::with_id(&src))
+        .start::<_, i64>("wff", 1i64, WorkflowOptions::with_id(&src))
         .await?
         .result()
         .await?;
@@ -2831,7 +2902,11 @@ async fn pg_fork_routes_to_named_queue() -> Result<()> {
     engine.launch().await?;
 
     let orig_id = format!("fork-orig-{tag}");
-    let orig: i64 = engine.start_typed(&wf, &orig_id, 21_i64).await?;
+    let orig: i64 = engine
+        .start(&wf, 21_i64, WorkflowOptions::with_id(&orig_id))
+        .await?
+        .result()
+        .await?;
     assert_eq!(orig, 42);
 
     // Engine fork onto the named queue: its dispatcher completes it, and the

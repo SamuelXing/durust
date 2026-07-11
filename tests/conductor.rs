@@ -195,7 +195,7 @@ async fn conductor_handles_workflow_management() -> Result<()> {
     let engine = Arc::new(engine);
     engine.launch().await?;
     let h = engine
-        .run_workflow::<_, String>("work", "hi".to_string(), WorkflowOptions::with_id("wf-1"))
+        .start::<_, String>("work", "hi".to_string(), WorkflowOptions::with_id("wf-1"))
         .await?;
     assert_eq!(h.result().await?, "hi!");
 
@@ -504,7 +504,7 @@ async fn conductor_handles_registry_and_aggregates() -> Result<()> {
     let engine = Arc::new(engine);
     engine.launch().await?; // registers application version 2.0.0
     let h = engine
-        .run_workflow::<_, String>("work", "hi".to_string(), WorkflowOptions::with_id("wf-1"))
+        .start::<_, String>("work", "hi".to_string(), WorkflowOptions::with_id("wf-1"))
         .await?;
     h.result().await?;
 
@@ -622,7 +622,7 @@ async fn conductor_handles_events_and_streams() -> Result<()> {
     let engine = Arc::new(engine);
     engine.launch().await?;
     let h = engine
-        .run_workflow::<_, String>("producer", String::new(), WorkflowOptions::with_id("p-1"))
+        .start::<_, String>("producer", String::new(), WorkflowOptions::with_id("p-1"))
         .await?;
     h.result().await?;
     // A notification delivered to the workflow's mailbox.
@@ -716,12 +716,12 @@ async fn conductor_handles_metrics_and_retention() -> Result<()> {
 
     // One completed workflow (with a step) ...
     let h = engine
-        .run_workflow::<_, String>("work", "hi".to_string(), WorkflowOptions::with_id("wf-1"))
+        .start::<_, String>("work", "hi".to_string(), WorkflowOptions::with_id("wf-1"))
         .await?;
     h.result().await?;
     // ... and one long-delayed workflow that stays DELAYED (cancellable).
     let _delayed = engine
-        .run_workflow::<_, String>(
+        .start::<_, String>(
             "work",
             "later".to_string(),
             WorkflowOptions {
@@ -837,7 +837,7 @@ async fn conductor_exports_and_imports_workflow() -> Result<()> {
     let engine = Arc::new(engine);
     engine.launch().await?;
     engine
-        .run_workflow::<_, i64>("producer", 21_i64, WorkflowOptions::with_id("p-1"))
+        .start::<_, i64>("producer", 21_i64, WorkflowOptions::with_id("p-1"))
         .await?
         .result()
         .await?;

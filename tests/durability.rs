@@ -1,6 +1,6 @@
 //! Backend-free tests using the in-memory provider.
 
-use durust::{DurableContext, DurableEngine, Error, InMemoryProvider, Result};
+use durust::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,9 +25,17 @@ async fn step_runs_once_across_replays() -> Result<()> {
     });
 
     // First execution runs the step.
-    let a: i64 = engine.start_typed("charge", "wf-1", ()).await?;
+    let a: i64 = engine
+        .start("charge", (), WorkflowOptions::with_id("wf-1"))
+        .await?
+        .result()
+        .await?;
     // Re-executing the same workflow id replays from checkpoints.
-    let b: i64 = engine.start_typed("charge", "wf-1", ()).await?;
+    let b: i64 = engine
+        .start("charge", (), WorkflowOptions::with_id("wf-1"))
+        .await?
+        .result()
+        .await?;
 
     assert_eq!(a, 4999);
     assert_eq!(b, 4999);
@@ -64,11 +72,15 @@ async fn caught_step_failure_replays_without_rerunning() -> Result<()> {
     });
 
     let a: String = engine
-        .start_typed("flaky_caught", "wf-step-err", ())
+        .start("flaky_caught", (), WorkflowOptions::with_id("wf-step-err"))
+        .await?
+        .result()
         .await?;
     // Re-execute the same id: the recorded failure replays without re-running.
     let b: String = engine
-        .start_typed("flaky_caught", "wf-step-err", ())
+        .start("flaky_caught", (), WorkflowOptions::with_id("wf-step-err"))
+        .await?
+        .result()
         .await?;
 
     assert_eq!(a, "caught-error");
@@ -105,11 +117,19 @@ async fn multi_step_results_are_stable() -> Result<()> {
         Ok::<_, Error>(b)
     });
 
-    let out: i64 = engine.start_typed("pipeline", "wf-2", 10_i64).await?;
+    let out: i64 = engine
+        .start("pipeline", 10_i64, WorkflowOptions::with_id("wf-2"))
+        .await?
+        .result()
+        .await?;
     assert_eq!(out, 21);
 
     // Replay yields the identical answer.
-    let out2: i64 = engine.start_typed("pipeline", "wf-2", 10_i64).await?;
+    let out2: i64 = engine
+        .start("pipeline", 10_i64, WorkflowOptions::with_id("wf-2"))
+        .await?
+        .result()
+        .await?;
     assert_eq!(out2, 21);
     Ok(())
 }
@@ -144,7 +164,11 @@ async fn durable_sleep_is_not_repeated_on_replay() -> Result<()> {
 
     // First execution actually waits out the nap and records the wake instant.
     let t0 = Instant::now();
-    engine.start_typed::<_, ()>("napper", "wf-nap", ()).await?;
+    engine
+        .start::<_, ()>("napper", (), WorkflowOptions::with_id("wf-nap"))
+        .await?
+        .result()
+        .await?;
     let first = t0.elapsed();
     assert!(
         first >= Duration::from_millis(400),
@@ -154,7 +178,11 @@ async fn durable_sleep_is_not_repeated_on_replay() -> Result<()> {
     // Re-submitting the same id: the workflow is already terminal, so it returns
     // the stored output at once instead of re-running the body (and re-sleeping).
     let t1 = Instant::now();
-    engine.start_typed::<_, ()>("napper", "wf-nap", ()).await?;
+    engine
+        .start::<_, ()>("napper", (), WorkflowOptions::with_id("wf-nap"))
+        .await?
+        .result()
+        .await?;
     let resubmit = t1.elapsed();
     assert!(
         resubmit < Duration::from_millis(200),

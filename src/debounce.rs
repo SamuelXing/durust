@@ -180,11 +180,12 @@ impl DebounceBackend for DurableEngine {
         DurableEngine::provider(self)
     }
     async fn enqueue_debouncer(&self, input: DebouncerInput, key: &str) -> Result<()> {
-        self.enqueue::<_, ()>(
-            INTERNAL_QUEUE,
+        self.start::<_, ()>(
             DEBOUNCER_WF,
             input,
-            WorkflowOptions::default().dedup_id(key),
+            WorkflowOptions::default()
+                .dedup_id(key)
+                .queue(INTERNAL_QUEUE),
         )
         .await
         .map(|_| ())

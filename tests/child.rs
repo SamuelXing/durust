@@ -22,7 +22,11 @@ async fn child_workflow_runs_and_links_to_parent() -> Result<()> {
         Ok::<_, Error>(child.result().await? + 1)
     });
 
-    let out: i64 = engine.start_typed("parent", "p1", 7_i64).await?;
+    let out: i64 = engine
+        .start("parent", 7_i64, WorkflowOptions::with_id("p1"))
+        .await?
+        .result()
+        .await?;
     assert_eq!(out, 22); // (7 * 3) + 1
 
     // The child got the deterministic id `{parent}-{seq}` and points back home.
@@ -49,9 +53,7 @@ async fn child_workflow_inherits_identity() -> Result<()> {
     });
 
     let opts = WorkflowOptions::with_id("boss").authenticated_user("alice");
-    let handle = engine
-        .run_workflow::<_, String>("delegator", (), opts)
-        .await?;
+    let handle = engine.start::<_, String>("delegator", (), opts).await?;
     assert_eq!(handle.result().await?, "alice");
 
     // The identity is also persisted on the child row.
@@ -81,7 +83,11 @@ async fn workflow_steps_introspection_in_memory() -> Result<()> {
         child.result().await
     });
 
-    engine.start_typed::<_, i64>("worker", "w", ()).await?;
+    engine
+        .start::<_, i64>("worker", (), WorkflowOptions::with_id("w"))
+        .await?
+        .result()
+        .await?;
 
     let steps = engine.get_workflow_steps("w").await?;
     assert_eq!(steps.len(), 2);
@@ -129,7 +135,11 @@ async fn child_workflow_can_be_queued() -> Result<()> {
     );
     engine.launch().await?;
 
-    let out: i64 = engine.start_typed("fan_out", "fo1", 9_i64).await?;
+    let out: i64 = engine
+        .start("fan_out", 9_i64, WorkflowOptions::with_id("fo1"))
+        .await?
+        .result()
+        .await?;
     assert_eq!(out, 81);
 
     let child = engine.retrieve_workflow::<i64>("fo1-0").await?;
@@ -163,13 +173,17 @@ async fn empty_workflow_id_is_regenerated() -> Result<()> {
 
     // Top-level: an empty id regenerates a fresh, non-empty id.
     let handle = engine
-        .run_workflow::<_, i64>("noop", 5_i64, WorkflowOptions::with_id(""))
+        .start::<_, i64>("noop", 5_i64, WorkflowOptions::with_id(""))
         .await?;
     assert!(!handle.id().is_empty(), "top-level id must be regenerated");
     assert_eq!(handle.result().await?, 5);
 
     // Child: an empty id regenerates the deterministic `{parent}-{seq}`, linked home.
-    let out: i64 = engine.start_typed("parent", "p1", 7_i64).await?;
+    let out: i64 = engine
+        .start("parent", 7_i64, WorkflowOptions::with_id("p1"))
+        .await?
+        .result()
+        .await?;
     assert_eq!(out, 7);
     let child = engine.retrieve_workflow::<i64>("p1-0").await?;
     assert_eq!(

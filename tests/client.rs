@@ -531,7 +531,7 @@ async fn client_forks_a_workflow() -> Result<()> {
 
     // Original run via the engine.
     let _: i64 = engine
-        .run_workflow::<_, i64>("pipeline", (), WorkflowOptions::with_id("orig"))
+        .start::<_, i64>("pipeline", (), WorkflowOptions::with_id("orig"))
         .await?
         .result()
         .await?;
@@ -817,7 +817,11 @@ async fn client_resume_missing_and_completed() -> Result<()> {
         Ok::<_, Error>(1_i64)
     });
     engine.launch().await?;
-    let out: i64 = engine.start_typed("one", "wf-one", ()).await?;
+    let out: i64 = engine
+        .start("one", (), WorkflowOptions::with_id("wf-one"))
+        .await?
+        .result()
+        .await?;
     assert_eq!(out, 1);
 
     let client = Client::new(provider.clone());

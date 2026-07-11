@@ -21,7 +21,7 @@ async fn engine_with_quick() -> Result<DurableEngine> {
 async fn handle_awaits_directly() -> Result<()> {
     let engine = engine_with_quick().await?;
     let handle = engine
-        .run_workflow::<_, i64>("quick", 1_i64, WorkflowOptions::default())
+        .start::<_, i64>("quick", 1_i64, WorkflowOptions::default())
         .await?;
     let out: i64 = handle.await?;
     assert_eq!(out, 2);
@@ -36,7 +36,7 @@ async fn handle_awaits_directly() -> Result<()> {
 async fn result_takes_shared_ref_and_is_reusable() -> Result<()> {
     let engine = engine_with_quick().await?;
     let handle = engine
-        .run_workflow::<_, i64>("quick", 41_i64, WorkflowOptions::default())
+        .start::<_, i64>("quick", 41_i64, WorkflowOptions::default())
         .await?;
     let first: i64 = handle.result().await?;
     let second: i64 = handle.result().await?;
@@ -52,7 +52,7 @@ async fn result_takes_shared_ref_and_is_reusable() -> Result<()> {
 async fn handle_clones_and_is_send_across_spawn() -> Result<()> {
     let engine = engine_with_quick().await?;
     let handle = engine
-        .run_workflow::<_, i64>("quick", 10_i64, WorkflowOptions::default())
+        .start::<_, i64>("quick", 10_i64, WorkflowOptions::default())
         .await?;
     let observer = handle.clone();
     let spawned = tokio::spawn(async move { observer.await });

@@ -75,11 +75,10 @@ async fn main() -> Result<()> {
     for name in images {
         handles.push(
             engine
-                .enqueue::<_, u64>(
-                    "thumbnails",
+                .start::<_, u64>(
                     "make_thumbnail",
                     name.to_string(),
-                    WorkflowOptions::with_id(format!("thumb-{name}")),
+                    WorkflowOptions::with_id(format!("thumb-{name}")).queue("thumbnails"),
                 )
                 .await?,
         );

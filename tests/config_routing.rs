@@ -28,7 +28,7 @@ async fn config_name_routes_to_matching_instance() -> Result<()> {
 
     // Direct runs (the inline dispatch path).
     let en: String = engine
-        .run_workflow::<_, String>(
+        .start::<_, String>(
             "greet",
             "Sam".to_string(),
             WorkflowOptions::default().config_name("en"),
@@ -37,7 +37,7 @@ async fn config_name_routes_to_matching_instance() -> Result<()> {
         .result()
         .await?;
     let fr: String = engine
-        .run_workflow::<_, String>(
+        .start::<_, String>(
             "greet",
             "Sam".to_string(),
             WorkflowOptions::default().config_name("fr"),
@@ -50,21 +50,20 @@ async fn config_name_routes_to_matching_instance() -> Result<()> {
 
     // Queue dispatch (a claiming dispatcher must route by the persisted config).
     let qen: WorkflowHandle<String> = engine
-        .enqueue(
-            "q",
+        .start(
             "greet",
             "Q".to_string(),
             WorkflowOptions::default()
                 .config_name("en")
-                .class_name("Greeter"),
+                .class_name("Greeter")
+                .queue("q"),
         )
         .await?;
     let qfr: WorkflowHandle<String> = engine
-        .enqueue(
-            "q",
+        .start(
             "greet",
             "Q".to_string(),
-            WorkflowOptions::default().config_name("fr"),
+            WorkflowOptions::default().config_name("fr").queue("q"),
         )
         .await?;
     assert_eq!(qen.result().await?, "Hello, Q");
@@ -96,7 +95,7 @@ async fn unknown_config_name_is_an_error() -> Result<()> {
     engine.launch().await?;
 
     let res: Result<WorkflowHandle<String>> = engine
-        .run_workflow(
+        .start(
             "greet",
             "Sam".to_string(),
             WorkflowOptions::default().config_name("de"),
@@ -123,7 +122,7 @@ async fn plain_registration_unaffected_by_config_routing() -> Result<()> {
     engine.launch().await?;
 
     let out: i64 = engine
-        .run_workflow::<_, i64>("plain", 41_i64, WorkflowOptions::default())
+        .start::<_, i64>("plain", 41_i64, WorkflowOptions::default())
         .await?
         .result()
         .await?;
@@ -150,7 +149,7 @@ async fn fork_of_configured_run_routes_to_same_instance() -> Result<()> {
     engine.launch().await?;
 
     let fr: String = engine
-        .run_workflow::<_, String>(
+        .start::<_, String>(
             "greet",
             "Sam".to_string(),
             WorkflowOptions::with_id("wf-fr")

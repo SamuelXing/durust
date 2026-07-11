@@ -308,6 +308,14 @@ impl WorkflowOptions {
         }
     }
 
+    /// Enqueue onto the named queue instead of running in-process: the row is
+    /// persisted `ENQUEUED` and a dispatcher on any executor claims it. Pair with
+    /// [`start`](DurableEngine::start)/[`start_with`](DurableEngine::start_with).
+    pub fn queue(mut self, name: impl Into<String>) -> Self {
+        self.queue = Some(name.into());
+        self
+    }
+
     /// Set the user the workflow runs on behalf of.
     pub fn authenticated_user(mut self, user: impl Into<String>) -> Self {
         self.authenticated_user = Some(user.into());
@@ -989,7 +997,7 @@ impl DurableEngine {
             queue: schedule.queue_name.clone(),
             ..Default::default()
         };
-        self.run_workflow(&schedule.workflow_name, schedule.tick_input(now), opts)
+        self.start(&schedule.workflow_name, schedule.tick_input(now), opts)
             .await
     }
 
@@ -1182,7 +1190,7 @@ impl DurableEngine {
     /// any executor claims and runs it. If the id already exists in a terminal
     /// state, a polling handle over the stored result is returned instead of
     /// re-running.
-    pub async fn run_workflow<I, O>(
+    pub async fn start<I, O>(
         &self,
         name: &str,
         input: I,
@@ -1269,7 +1277,7 @@ impl DurableEngine {
     /// let receipt: Receipt = handle.await?;
     /// ```
     ///
-    /// This is sugar for [`run_workflow`](Self::run_workflow) with the name
+    /// This is sugar for [`start`](Self::start) with the name
     /// taken from `W::NAME`; set `opts.queue` to enqueue onto a queue instead of
     /// running in-process.
     pub async fn start_with<W>(
@@ -1282,26 +1290,8 @@ impl DurableEngine {
         W: WorkflowDef,
         W::Input: Serialize,
     {
-        self.run_workflow::<W::Input, W::Output>(W::NAME, input, opts)
+        self.start::<W::Input, W::Output>(W::NAME, input, opts)
             .await
-    }
-
-    /// Enqueue a workflow on a registered queue.
-    /// Sugar for [`run_workflow`](Self::run_workflow) with
-    /// `opts.queue` set; the returned handle observes the workflow by polling,
-    /// since any executor may claim and run it.
-    pub async fn enqueue<I, O>(
-        &self,
-        queue_name: &str,
-        workflow_name: &str,
-        input: I,
-        mut opts: WorkflowOptions,
-    ) -> Result<WorkflowHandle<O>>
-    where
-        I: Serialize,
-    {
-        opts.queue = Some(queue_name.to_string());
-        self.run_workflow(workflow_name, input, opts).await
     }
 
     /// Send a message to a workflow from **outside** any workflow (e.g. an API
@@ -1364,30 +1354,6 @@ impl DurableEngine {
             }
             tokio::time::sleep((deadline - now).min(Duration::from_millis(25))).await;
         }
-    }
-
-    /// Start a workflow under `id` and **block** until it returns its JSON
-    /// output. Back-compat shim over [`run_workflow`](Self::run_workflow).
-    pub async fn start<I>(&self, name: &str, id: &str, input: I) -> Result<Value>
-    where
-        I: Serialize,
-    {
-        let handle: WorkflowHandle<Value> = self
-            .run_workflow(name, input, WorkflowOptions::with_id(id))
-            .await?;
-        handle.result().await
-    }
-
-    /// Like [`start`](Self::start) but deserializes the output into `O`.
-    pub async fn start_typed<I, O>(&self, name: &str, id: &str, input: I) -> Result<O>
-    where
-        I: Serialize,
-        O: DeserializeOwned,
-    {
-        let handle: WorkflowHandle<O> = self
-            .run_workflow(name, input, WorkflowOptions::with_id(id))
-            .await?;
-        handle.result().await
     }
 
     /// Get a [`WorkflowHandle`] for an existing workflow. The handle observes the

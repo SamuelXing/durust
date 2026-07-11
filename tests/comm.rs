@@ -19,7 +19,7 @@ async fn send_unblocks_waiting_recv() -> Result<()> {
     });
 
     let handle = engine
-        .run_workflow::<_, String>("waiter", (), WorkflowOptions::with_id("wf-recv"))
+        .start::<_, String>("waiter", (), WorkflowOptions::with_id("wf-recv"))
         .await?;
     engine
         .send("wf-recv", "hello".to_string(), "greetings")
@@ -49,10 +49,10 @@ async fn recv_is_fifo() -> Result<()> {
     });
 
     let consumer = engine
-        .run_workflow::<_, String>("take_two", (), WorkflowOptions::with_id("wf-fifo"))
+        .start::<_, String>("take_two", (), WorkflowOptions::with_id("wf-fifo"))
         .await?;
     let producer = engine
-        .run_workflow::<_, ()>(
+        .start::<_, ()>(
             "producer",
             "wf-fifo".to_string(),
             WorkflowOptions::with_id("wf-producer"),
@@ -73,7 +73,11 @@ async fn recv_times_out_to_none() -> Result<()> {
     });
 
     let started = Instant::now();
-    let timed_out: bool = engine.start_typed("impatient", "wf-timeout", ()).await?;
+    let timed_out: bool = engine
+        .start("impatient", (), WorkflowOptions::with_id("wf-timeout"))
+        .await?
+        .result()
+        .await?;
     assert!(timed_out, "recv with no sender must return None");
     assert!(started.elapsed() >= Duration::from_millis(80));
     Ok(())
@@ -156,7 +160,9 @@ async fn set_event_and_get_event() -> Result<()> {
     );
 
     engine
-        .start_typed::<_, ()>("publisher", "wf-pub", ())
+        .start::<_, ()>("publisher", (), WorkflowOptions::with_id("wf-pub"))
+        .await?
+        .result()
         .await?;
 
     // External read.
@@ -167,7 +173,13 @@ async fn set_event_and_get_event() -> Result<()> {
 
     // Cross-workflow durable read.
     let got: String = engine
-        .start_typed("subscriber", "wf-sub", "wf-pub".to_string())
+        .start(
+            "subscriber",
+            "wf-pub".to_string(),
+            WorkflowOptions::with_id("wf-sub"),
+        )
+        .await?
+        .result()
         .await?;
     assert_eq!(got, "ready");
     Ok(())
@@ -188,7 +200,9 @@ async fn set_event_keys_are_independent_and_last_write_wins() -> Result<()> {
     });
 
     engine
-        .start_typed::<_, ()>("multi_event", "wf-ev", ())
+        .start::<_, ()>("multi_event", (), WorkflowOptions::with_id("wf-ev"))
+        .await?
+        .result()
         .await?;
 
     // The overwritten key reads back its latest value.
@@ -213,7 +227,11 @@ async fn get_event_times_out_to_none() -> Result<()> {
     engine.register("noop", |_ctx: DurableContext, _: ()| async move {
         Ok::<_, Error>(())
     });
-    engine.start_typed::<_, ()>("noop", "wf-empty", ()).await?;
+    engine
+        .start::<_, ()>("noop", (), WorkflowOptions::with_id("wf-empty"))
+        .await?
+        .result()
+        .await?;
 
     let v: Option<String> = engine
         .get_event("wf-empty", "missing", Duration::from_millis(80))

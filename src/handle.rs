@@ -11,16 +11,17 @@ use tokio::task::JoinHandle;
 
 /// A reference to a workflow execution.
 ///
-/// Returned by [`crate::DurableEngine::run_workflow`], `enqueue`, and
-/// `retrieve_workflow`. It lets the caller observe the workflow's result
-/// without blocking the call that started it.
+/// Returned by [`start`](crate::DurableEngine::start),
+/// [`start_with`](crate::DurableEngine::start_with), and `retrieve_workflow`. It
+/// lets the caller observe the workflow's result without blocking the call that
+/// started it.
 ///
 /// Await it directly for the typed output, or share it:
 ///
 /// ```no_run
 /// # use durust::{DurableEngine, WorkflowHandle, Result};
 /// # async fn f(engine: &DurableEngine) -> Result<()> {
-/// let handle: WorkflowHandle<i64> = engine.run_workflow("add", 1_i64, Default::default()).await?;
+/// let handle: WorkflowHandle<i64> = engine.start("add", 1_i64, Default::default()).await?;
 /// let observer = handle.clone();          // hand a copy to another task
 /// let total: i64 = handle.await?;         // or `handle.result().await?`
 /// # let _ = observer;

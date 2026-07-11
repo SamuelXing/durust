@@ -21,7 +21,11 @@ async fn concurrent_steps_via_try_join() -> Result<()> {
         Ok::<_, Error>(a + b)
     });
 
-    let out: i64 = engine.start_typed("fanout", "f", ()).await?;
+    let out: i64 = engine
+        .start("fanout", (), WorkflowOptions::with_id("f"))
+        .await?
+        .result()
+        .await?;
     assert_eq!(out, 42);
 
     // Both branches were recorded as steps, numbered by poll order.
@@ -48,7 +52,11 @@ async fn select_returns_first_to_complete() -> Result<()> {
         ctx.select(branches).await
     });
 
-    let (index, value): (usize, i64) = engine.start_typed("racer", "r", ()).await?;
+    let (index, value): (usize, i64) = engine
+        .start("racer", (), WorkflowOptions::with_id("r"))
+        .await?
+        .result()
+        .await?;
     assert_eq!((index, value), (1, 2), "the immediately-ready branch wins");
 
     let steps = engine.get_workflow_steps("r").await?;
@@ -77,7 +85,11 @@ async fn many_concurrent_workflows_stay_isolated() -> Result<()> {
     for i in 0..N {
         let e = engine.clone();
         handles.push(tokio::spawn(async move {
-            let out: i64 = e.start_typed("square", &format!("wf-{i}"), i).await?;
+            let out: i64 = e
+                .start("square", i, WorkflowOptions::with_id(format!("wf-{i}")))
+                .await?
+                .result()
+                .await?;
             Ok::<_, Error>((i, out))
         }));
     }
@@ -103,7 +115,7 @@ async fn select_with_no_branches_errors() -> Result<()> {
     });
 
     let res = engine
-        .run_workflow::<_, (usize, i64)>("empty", (), WorkflowOptions::with_id("e"))
+        .start::<_, (usize, i64)>("empty", (), WorkflowOptions::with_id("e"))
         .await?
         .result()
         .await;

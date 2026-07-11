@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// `run_workflow` returns a handle immediately while the workflow is still
+/// `start` returns a handle immediately while the workflow is still
 /// running; `result` then yields the eventual output.
 #[tokio::test]
-async fn run_workflow_is_non_blocking() -> Result<()> {
+async fn start_is_non_blocking() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
 
     engine.register("slow", |ctx: DurableContext, _: ()| async move {
@@ -26,7 +26,7 @@ async fn run_workflow_is_non_blocking() -> Result<()> {
     });
 
     let handle = engine
-        .run_workflow::<_, i64>("slow", (), WorkflowOptions::with_id("wf-slow"))
+        .start::<_, i64>("slow", (), WorkflowOptions::with_id("wf-slow"))
         .await?;
 
     // Returned before completion: status is still PENDING right now.
@@ -64,7 +64,11 @@ async fn step_retries_until_success() -> Result<()> {
         .await
     });
 
-    let out: String = engine.start_typed("flaky", "wf-flaky", ()).await?;
+    let out: String = engine
+        .start("flaky", (), WorkflowOptions::with_id("wf-flaky"))
+        .await?
+        .result()
+        .await?;
     assert_eq!(out, "ok");
     assert_eq!(
         ATTEMPTS.load(Ordering::SeqCst),
@@ -88,7 +92,11 @@ async fn step_retries_exhausted_propagates_error() -> Result<()> {
             .await
     });
 
-    let res: Result<()> = engine.start_typed("always_fails", "wf-fail", ()).await;
+    let res: Result<()> = engine
+        .start("always_fails", (), WorkflowOptions::with_id("wf-fail"))
+        .await?
+        .result()
+        .await;
     assert!(matches!(res, Err(Error::App { ref message, .. }) if message == "boom"));
     Ok(())
 }
@@ -129,7 +137,11 @@ async fn step_retry_predicate_stops_on_permanent_error() -> Result<()> {
         .await
     });
 
-    let permanent: Result<()> = engine.start_typed("permanent", "wf-perm", ()).await;
+    let permanent: Result<()> = engine
+        .start("permanent", (), WorkflowOptions::with_id("wf-perm"))
+        .await?
+        .result()
+        .await;
     assert!(permanent.is_err());
     assert_eq!(
         PERMANENT_ATTEMPTS.load(Ordering::SeqCst),
@@ -137,7 +149,11 @@ async fn step_retry_predicate_stops_on_permanent_error() -> Result<()> {
         "a rejected error must not be retried, despite max_retries(5)"
     );
 
-    let transient: Result<()> = engine.start_typed("transient", "wf-tran", ()).await;
+    let transient: Result<()> = engine
+        .start("transient", (), WorkflowOptions::with_id("wf-tran"))
+        .await?
+        .result()
+        .await;
     assert!(transient.is_err());
     assert_eq!(
         TRANSIENT_ATTEMPTS.load(Ordering::SeqCst),
@@ -157,7 +173,7 @@ async fn launch_and_shutdown_drain() -> Result<()> {
 
     engine.launch().await?;
     let handle = engine
-        .run_workflow::<_, i64>("quick", 1_i64, WorkflowOptions::default())
+        .start::<_, i64>("quick", 1_i64, WorkflowOptions::default())
         .await?;
     let out = handle.result().await?;
     assert_eq!(out, 2);
@@ -180,7 +196,7 @@ async fn workflow_timeout_cancels() -> Result<()> {
 
     let mut opts = WorkflowOptions::with_id("wf-timeout");
     opts.timeout = Some(Duration::from_millis(80));
-    let handle = engine.run_workflow::<_, i64>("slow", (), opts).await?;
+    let handle = engine.start::<_, i64>("slow", (), opts).await?;
 
     assert!(
         handle.result().await.is_err(),

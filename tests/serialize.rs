@@ -38,7 +38,7 @@ async fn cross_format(writer: Serializer, reader: Serializer, tag: &str) -> Resu
     {
         let engine = engine_with(&url, writer).await?;
         let out: String = engine
-            .run_workflow::<_, String>(
+            .start::<_, String>(
                 "greet",
                 "ada".to_string(),
                 WorkflowOptions::with_id("wf-ser"),
@@ -81,7 +81,7 @@ async fn portable_error_is_stored_as_envelope() -> Result<()> {
     });
 
     let outcome = engine
-        .run_workflow::<_, ()>("boom", (), WorkflowOptions::with_id("wf-err"))
+        .start::<_, ()>("boom", (), WorkflowOptions::with_id("wf-err"))
         .await?
         .result()
         .await;
@@ -125,7 +125,7 @@ async fn portable_typed_error_round_trips() -> Result<()> {
             }))
         });
         let outcome = engine
-            .run_workflow::<_, ()>("validate", (), WorkflowOptions::with_id("wf-typed"))
+            .start::<_, ()>("validate", (), WorkflowOptions::with_id("wf-typed"))
             .await?
             .result()
             .await;
@@ -177,7 +177,7 @@ async fn default_error_stays_bare() -> Result<()> {
     });
 
     let outcome = engine
-        .run_workflow::<_, ()>("boom", (), WorkflowOptions::with_id("wf-err"))
+        .start::<_, ()>("boom", (), WorkflowOptions::with_id("wf-err"))
         .await?
         .result()
         .await;
@@ -265,12 +265,20 @@ async fn nested_value_round_trips_through_step_checkpoint() -> Result<()> {
     });
 
     // First execution builds and checkpoints the nested value.
-    let a: Report = engine.start_typed("report", "wf-nested", ()).await?;
+    let a: Report = engine
+        .start("report", (), WorkflowOptions::with_id("wf-nested"))
+        .await?
+        .result()
+        .await?;
     assert_eq!(a, sample_report());
 
     // Re-submitting the same id returns the stored output, deserialized back to
     // the identical structure, without re-running the body.
-    let b: Report = engine.start_typed("report", "wf-nested", ()).await?;
+    let b: Report = engine
+        .start("report", (), WorkflowOptions::with_id("wf-nested"))
+        .await?
+        .result()
+        .await?;
     assert_eq!(b, sample_report());
     assert_eq!(
         BUILDS.load(Ordering::SeqCst),

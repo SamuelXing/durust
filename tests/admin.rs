@@ -42,7 +42,7 @@ async fn admin_server_endpoints() -> Result<()> {
 
     // Produce one finished workflow under a known id.
     let h = engine
-        .run_workflow::<_, String>("echo", "hi".to_string(), WorkflowOptions::with_id("wf-1"))
+        .start::<_, String>("echo", "hi".to_string(), WorkflowOptions::with_id("wf-1"))
         .await?;
     assert_eq!(h.result().await?, "hi");
 
@@ -151,7 +151,7 @@ async fn admin_fork_endpoint_returns_new_id() -> Result<()> {
     engine.launch().await?;
 
     let h = engine
-        .run_workflow::<_, String>("echo", "hi".to_string(), WorkflowOptions::with_id("orig"))
+        .start::<_, String>("echo", "hi".to_string(), WorkflowOptions::with_id("orig"))
         .await?;
     h.result().await?;
 

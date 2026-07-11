@@ -14,7 +14,7 @@
 //! later without changing the engine.
 //!
 //! ```no_run
-//! use durust::{DurableEngine, DurableContext, InMemoryProvider, Error, Result};
+//! use durust::{DurableEngine, DurableContext, InMemoryProvider, Error, Result, WorkflowOptions};
 //! use std::sync::Arc;
 //!
 //! async fn hello(ctx: DurableContext, name: String) -> Result<String> {
@@ -28,7 +28,9 @@
 //! let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
 //! engine.register("hello", hello);
 //! engine.recover().await?; // resume anything left incomplete by a prior crash
-//! let out: String = engine.start_typed("hello", "wf-1", "world".to_string()).await?;
+//! // `start` returns a handle immediately; await it (or `.result()`) for the output.
+//! let handle = engine.start("hello", "world".to_string(), WorkflowOptions::with_id("wf-1")).await?;
+//! let out: String = handle.result().await?;
 //! assert_eq!(out, "hello, world");
 //! # Ok(())
 //! # }

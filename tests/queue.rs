@@ -25,7 +25,7 @@ async fn enqueue_dispatches_and_completes() -> Result<()> {
     engine.launch().await?;
 
     let handle = engine
-        .enqueue::<_, i64>("q", "add_one", 41_i64, WorkflowOptions::default())
+        .start::<_, i64>("add_one", 41_i64, WorkflowOptions::default().queue("q"))
         .await?;
     assert_eq!(handle.result().await?, 42);
 
@@ -40,7 +40,7 @@ async fn enqueue_to_unregistered_queue_errors() -> Result<()> {
         Ok::<_, Error>(())
     });
     let res = engine
-        .enqueue::<_, ()>("nope", "noop", (), WorkflowOptions::default())
+        .start::<_, ()>("noop", (), WorkflowOptions::default().queue("nope"))
         .await;
     assert!(matches!(res, Err(Error::UnknownQueue(ref q)) if q == "nope"));
     Ok(())
@@ -68,11 +68,10 @@ async fn worker_concurrency_is_enforced() -> Result<()> {
     for i in 0..3 {
         handles.push(
             engine
-                .enqueue::<_, ()>(
-                    "serial",
+                .start::<_, ()>(
                     "tracked",
                     (),
-                    WorkflowOptions::with_id(format!("wf-conc-{i}")),
+                    WorkflowOptions::with_id(format!("wf-conc-{i}")).queue("serial"),
                 )
                 .await?,
         );
@@ -112,7 +111,7 @@ async fn priority_orders_execution() -> Result<()> {
         let mut opts = WorkflowOptions::with_id(format!("wf-prio-{i}"));
         opts.priority = prio;
         let _ = engine
-            .enqueue::<_, i64>("prio", "record", prio as i64, opts)
+            .start::<_, i64>("record", prio as i64, opts.queue("prio"))
             .await?;
     }
     engine.launch().await?;
@@ -143,7 +142,7 @@ async fn delayed_enqueue_waits_then_runs() -> Result<()> {
     let mut opts = WorkflowOptions::with_id("wf-delayed");
     opts.delay = Some(Duration::from_millis(150));
     let handle = engine
-        .enqueue::<_, i64>("later", "echo", 7_i64, opts)
+        .start::<_, i64>("echo", 7_i64, opts.queue("later"))
         .await?;
 
     assert_eq!(handle.get_status().await?.status, STATUS_DELAYED);
@@ -173,7 +172,7 @@ async fn set_workflow_delay_reschedules() -> Result<()> {
     let mut opts = WorkflowOptions::with_id("wf-resched");
     opts.delay = Some(Duration::from_secs(60));
     let handle = engine
-        .enqueue::<_, i64>("resched", "echo", 9_i64, opts)
+        .start::<_, i64>("echo", 9_i64, opts.queue("resched"))
         .await?;
     assert_eq!(handle.get_status().await?.status, STATUS_DELAYED);
 
@@ -215,7 +214,7 @@ async fn delay_requires_queue() -> Result<()> {
         delay: Some(Duration::from_millis(10)),
         ..Default::default()
     };
-    let res = engine.run_workflow::<_, ()>("noop", (), opts).await;
+    let res = engine.start::<_, ()>("noop", (), opts).await;
     assert!(res.is_err());
     Ok(())
 }
@@ -232,11 +231,13 @@ async fn dedup_id_rejects_duplicates() -> Result<()> {
 
     let mut opts = WorkflowOptions::with_id("wf-dedup-1");
     opts.dedup_id = Some("once".to_string());
-    let _first = engine.enqueue::<_, ()>("dedup", "noop", (), opts).await?;
+    let _first = engine
+        .start::<_, ()>("noop", (), opts.queue("dedup"))
+        .await?;
 
     let mut opts = WorkflowOptions::with_id("wf-dedup-2");
     opts.dedup_id = Some("once".to_string());
-    let err = match engine.enqueue::<_, ()>("dedup", "noop", (), opts).await {
+    let err = match engine.start::<_, ()>("noop", (), opts.queue("dedup")).await {
         Ok(_) => panic!("same dedup id on the same queue must be rejected"),
         Err(e) => e,
     };
@@ -257,22 +258,23 @@ async fn dedup_return_existing_returns_the_holder() -> Result<()> {
     engine.register_queue(test_queue("dedup"));
 
     let first = engine
-        .enqueue::<_, ()>(
-            "dedup",
+        .start::<_, ()>(
             "noop",
             (),
-            WorkflowOptions::with_id("wf-1").dedup_id("once"),
+            WorkflowOptions::with_id("wf-1")
+                .dedup_id("once")
+                .queue("dedup"),
         )
         .await?;
 
     let again = engine
-        .enqueue::<_, ()>(
-            "dedup",
+        .start::<_, ()>(
             "noop",
             (),
             WorkflowOptions::with_id("wf-2")
                 .dedup_id("once")
-                .dedup_policy(DeduplicationPolicy::ReturnExisting),
+                .dedup_policy(DeduplicationPolicy::ReturnExisting)
+                .queue("dedup"),
         )
         .await?;
     assert_eq!(again.id(), first.id(), "returned the slot holder");
@@ -280,11 +282,12 @@ async fn dedup_return_existing_returns_the_holder() -> Result<()> {
 
     assert!(
         engine
-            .enqueue::<_, ()>(
-                "dedup",
+            .start::<_, ()>(
                 "noop",
                 (),
-                WorkflowOptions::with_id("wf-3").dedup_policy(DeduplicationPolicy::ReturnExisting),
+                WorkflowOptions::with_id("wf-3")
+                    .dedup_policy(DeduplicationPolicy::ReturnExisting)
+                    .queue("dedup")
             )
             .await
             .is_err(),
@@ -325,11 +328,10 @@ async fn rate_limit_caps_starts() -> Result<()> {
     for i in 0..4 {
         handles.push(
             engine
-                .enqueue::<_, ()>(
-                    "limited",
+                .start::<_, ()>(
                     "counted",
                     (),
-                    WorkflowOptions::with_id(format!("wf-rate-{i}")),
+                    WorkflowOptions::with_id(format!("wf-rate-{i}")).queue("limited"),
                 )
                 .await?,
         );
@@ -382,13 +384,21 @@ async fn listen_queues_dispatches_only_listened() -> Result<()> {
 
     // The listened queue runs to completion.
     let run = engine
-        .enqueue::<_, i64>("listened", "add_one", 41_i64, WorkflowOptions::default())
+        .start::<_, i64>(
+            "add_one",
+            41_i64,
+            WorkflowOptions::default().queue("listened"),
+        )
         .await?;
     assert_eq!(run.result().await?, 42);
 
     // The ignored queue accepts the enqueue but never dispatches it here.
     let idle = engine
-        .enqueue::<_, i64>("ignored", "add_one", 1_i64, WorkflowOptions::default())
+        .start::<_, i64>(
+            "add_one",
+            1_i64,
+            WorkflowOptions::default().queue("ignored"),
+        )
         .await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
@@ -414,12 +424,12 @@ async fn queues_only_filters_to_queued_workflows() -> Result<()> {
 
     // One direct run, one enqueued.
     engine
-        .run_workflow::<_, ()>("noop", (), WorkflowOptions::with_id("direct"))
+        .start::<_, ()>("noop", (), WorkflowOptions::with_id("direct"))
         .await?
         .result()
         .await?;
     engine
-        .enqueue::<_, ()>("q", "noop", (), WorkflowOptions::with_id("queued"))
+        .start::<_, ()>("noop", (), WorkflowOptions::with_id("queued").queue("q"))
         .await?
         .result()
         .await?;
@@ -463,11 +473,10 @@ async fn partitioned_queue_concurrency_is_per_partition() -> Result<()> {
     for part in ["a", "a", "b", "b"] {
         handles.push(
             engine
-                .enqueue::<_, ()>(
-                    "pq",
+                .start::<_, ()>(
                     "work",
                     (),
-                    WorkflowOptions::default().partition_key(part),
+                    WorkflowOptions::default().partition_key(part).queue("pq"),
                 )
                 .await?,
         );
@@ -498,7 +507,7 @@ async fn partitioned_queue_ignores_keyless_enqueue() -> Result<()> {
     engine.launch().await?;
 
     let idle = engine
-        .enqueue::<_, ()>("pq", "noop", (), WorkflowOptions::default())
+        .start::<_, ()>("noop", (), WorkflowOptions::default().queue("pq"))
         .await?;
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert_eq!(

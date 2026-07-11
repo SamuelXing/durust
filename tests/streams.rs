@@ -20,7 +20,7 @@ async fn write_close_then_read_in_order() -> Result<()> {
     });
 
     engine
-        .run_workflow::<_, ()>("producer", (), WorkflowOptions::with_id("p"))
+        .start::<_, ()>("producer", (), WorkflowOptions::with_id("p"))
         .await?
         .result()
         .await?;
@@ -57,7 +57,7 @@ async fn read_stops_when_producer_finishes_without_close() -> Result<()> {
     });
 
     engine
-        .run_workflow::<_, ()>("producer", (), WorkflowOptions::with_id("p2"))
+        .start::<_, ()>("producer", (), WorkflowOptions::with_id("p2"))
         .await?
         .result()
         .await?;
@@ -81,7 +81,7 @@ async fn snapshot_reads_available_from_offset() -> Result<()> {
         Ok::<_, Error>(())
     });
     engine
-        .run_workflow::<_, ()>("producer", (), WorkflowOptions::with_id("p3"))
+        .start::<_, ()>("producer", (), WorkflowOptions::with_id("p3"))
         .await?
         .result()
         .await?;
@@ -107,7 +107,7 @@ async fn writing_to_closed_stream_errors() -> Result<()> {
     });
 
     let res = engine
-        .run_workflow::<_, ()>("bad", (), WorkflowOptions::with_id("p4"))
+        .start::<_, ()>("bad", (), WorkflowOptions::with_id("p4"))
         .await?
         .result()
         .await;
@@ -137,13 +137,13 @@ async fn workflow_reads_another_workflows_stream() -> Result<()> {
     );
 
     engine
-        .run_workflow::<_, ()>("producer", (), WorkflowOptions::with_id("prod"))
+        .start::<_, ()>("producer", (), WorkflowOptions::with_id("prod"))
         .await?
         .result()
         .await?;
 
     let values: Vec<i64> = engine
-        .run_workflow::<_, Vec<i64>>(
+        .start::<_, Vec<i64>>(
             "consumer",
             "prod".to_string(),
             WorkflowOptions::with_id("cons"),
@@ -177,7 +177,7 @@ async fn async_stream_yields_values_incrementally() -> Result<()> {
     });
 
     let producer = engine
-        .run_workflow::<_, ()>("slow_producer", (), WorkflowOptions::with_id("p6"))
+        .start::<_, ()>("slow_producer", (), WorkflowOptions::with_id("p6"))
         .await?;
 
     // Pull from the async stream as values are committed; it ends at close.
@@ -227,7 +227,7 @@ async fn async_stream_drains_when_producer_finishes_without_close() -> Result<()
     // The producer is already terminal before the reader starts, so the stream
     // ends via the inactive-producer path rather than a close sentinel.
     engine
-        .run_workflow::<_, ()>("p_noclose", (), WorkflowOptions::with_id("pnc"))
+        .start::<_, ()>("p_noclose", (), WorkflowOptions::with_id("pnc"))
         .await?
         .result()
         .await?;
@@ -260,7 +260,7 @@ async fn read_drains_while_producer_runs() -> Result<()> {
 
     // Start the producer in the background, then block draining its stream.
     let producer = engine
-        .run_workflow::<_, ()>("slow_producer", (), WorkflowOptions::with_id("p5"))
+        .start::<_, ()>("slow_producer", (), WorkflowOptions::with_id("p5"))
         .await?;
     let (values, closed): (Vec<i64>, bool) = engine.read_stream("p5", "s").await?;
     assert_eq!(values, vec![1, 2]);

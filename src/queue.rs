@@ -10,8 +10,9 @@ pub struct RateLimiter {
 
 /// A named durable queue.
 ///
-/// Workflows are enqueued with [`crate::DurableEngine::enqueue`] (or
-/// `run_workflow` with `WorkflowOptions.queue`) and claimed by a per-queue
+/// Workflows are enqueued with [`start`](crate::DurableEngine::start) or
+/// [`start_with`](crate::DurableEngine::start_with) plus `WorkflowOptions::queue`,
+/// and claimed by a per-queue
 /// dispatcher task started by [`crate::DurableEngine::launch`]. The dispatcher
 /// honors, in order: worker concurrency (this process), global concurrency
 /// (across all executors, via a DB count), and the rate limiter.

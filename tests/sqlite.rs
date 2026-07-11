@@ -29,7 +29,7 @@ async fn sqlite_persists_and_runs_workflow() -> Result<()> {
     });
 
     let handle = engine
-        .run_workflow::<_, i64>("add_one", 41_i64, WorkflowOptions::with_id("wf-sqlite-1"))
+        .start::<_, i64>("add_one", 41_i64, WorkflowOptions::with_id("wf-sqlite-1"))
         .await?;
     assert_eq!(handle.result().await?, 42);
     assert_eq!(handle.get_status().await?.status, STATUS_SUCCESS);
@@ -57,7 +57,11 @@ async fn sqlite_recovers_across_restart() -> Result<()> {
                 .await?;
             Ok::<_, Error>(amt)
         });
-        let out: i64 = engine.start_typed("charge", "wf-charge", ()).await?;
+        let out: i64 = engine
+            .start("charge", (), WorkflowOptions::with_id("wf-charge"))
+            .await?
+            .result()
+            .await?;
         assert_eq!(out, 4999);
     }
 
@@ -74,7 +78,11 @@ async fn sqlite_recovers_across_restart() -> Result<()> {
                 .await?;
             Ok::<_, Error>(amt)
         });
-        let out: i64 = engine.start_typed("charge", "wf-charge", ()).await?;
+        let out: i64 = engine
+            .start("charge", (), WorkflowOptions::with_id("wf-charge"))
+            .await?
+            .result()
+            .await?;
         assert_eq!(out, 4999);
     }
 
@@ -123,7 +131,9 @@ async fn sqlite_checkpoints_a_caught_step_failure() -> Result<()> {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         register(&mut engine);
         let out: String = engine
-            .start_typed("flaky_caught", "wf-step-err", ())
+            .start("flaky_caught", (), WorkflowOptions::with_id("wf-step-err"))
+            .await?
+            .result()
             .await?;
         assert_eq!(out, "caught-error");
 
@@ -143,7 +153,9 @@ async fn sqlite_checkpoints_a_caught_step_failure() -> Result<()> {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         register(&mut engine);
         let out: String = engine
-            .start_typed("flaky_caught", "wf-step-err", ())
+            .start("flaky_caught", (), WorkflowOptions::with_id("wf-step-err"))
+            .await?
+            .result()
             .await?;
         assert_eq!(
             out, "caught-error",
@@ -184,7 +196,11 @@ async fn sqlite_patch_is_durable_across_replay() -> Result<()> {
     for _ in 0..2 {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         register(&mut engine);
-        let (patched, v): (bool, i64) = engine.start_typed("wf", "w", ()).await?;
+        let (patched, v): (bool, i64) = engine
+            .start("wf", (), WorkflowOptions::with_id("w"))
+            .await?
+            .result()
+            .await?;
         assert!(
             patched,
             "the new path is taken on the first run and on replay"
@@ -223,7 +239,11 @@ async fn sqlite_deprecate_patch_keeps_alignment() -> Result<()> {
                 .await?;
             Ok::<_, Error>(v)
         });
-        let v: i64 = engine.start_typed("wf", "w", ()).await?;
+        let v: i64 = engine
+            .start("wf", (), WorkflowOptions::with_id("w"))
+            .await?
+            .result()
+            .await?;
         assert_eq!(v, 5);
     }
 
@@ -241,7 +261,11 @@ async fn sqlite_deprecate_patch_keeps_alignment() -> Result<()> {
                 .await?;
             Ok::<_, Error>(v)
         });
-        let v: i64 = engine.start_typed("wf", "w", ()).await?;
+        let v: i64 = engine
+            .start("wf", (), WorkflowOptions::with_id("w"))
+            .await?
+            .result()
+            .await?;
         assert_eq!(v, 5);
     }
 
@@ -282,7 +306,11 @@ async fn sqlite_concurrent_steps_are_durable() -> Result<()> {
     for _ in 0..2 {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         register(&mut engine);
-        let v: i64 = engine.start_typed("fanout", "f", ()).await?;
+        let v: i64 = engine
+            .start("fanout", (), WorkflowOptions::with_id("f"))
+            .await?
+            .result()
+            .await?;
         assert_eq!(v, 3);
     }
 
@@ -327,7 +355,11 @@ async fn sqlite_select_winner_is_durable() -> Result<()> {
     for _ in 0..2 {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         register(&mut engine);
-        let (index, value): (usize, i64) = engine.start_typed("racer", "r", ()).await?;
+        let (index, value): (usize, i64) = engine
+            .start("racer", (), WorkflowOptions::with_id("r"))
+            .await?
+            .result()
+            .await?;
         assert_eq!((index, value), (0, 2));
     }
 
@@ -361,7 +393,11 @@ async fn sqlite_stream_is_durable_across_replay() -> Result<()> {
     for _ in 0..2 {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         register(&mut engine);
-        engine.start_typed::<_, ()>("producer", "p", ()).await?;
+        engine
+            .start::<_, ()>("producer", (), WorkflowOptions::with_id("p"))
+            .await?
+            .result()
+            .await?;
 
         let (values, closed): (Vec<i64>, bool) = engine.read_stream("p", "nums").await?;
         assert_eq!(
@@ -388,7 +424,11 @@ async fn sqlite_write_to_closed_stream_errors() -> Result<()> {
         Ok::<_, Error>(())
     });
 
-    let res: Result<()> = engine.start_typed("bad", "p", ()).await;
+    let res: Result<()> = engine
+        .start("bad", (), WorkflowOptions::with_id("p"))
+        .await?
+        .result()
+        .await;
     assert!(res.is_err(), "writing after close must fail");
 
     let _ = std::fs::remove_file(path);
@@ -412,14 +452,17 @@ async fn sqlite_queue_dispatch_and_dedup() -> Result<()> {
     let mut opts = WorkflowOptions::with_id("wf-q-1");
     opts.dedup_id = Some("only-once".to_string());
     let handle = engine
-        .enqueue::<_, i64>("q", "double", 21_i64, opts)
+        .start::<_, i64>("double", 21_i64, opts.queue("q"))
         .await?;
 
     // Different workflow id, same dedup id on the same queue → unique index
     // violation from the INSERT while wf-q-1 is still active.
     let mut opts = WorkflowOptions::with_id("wf-q-2");
     opts.dedup_id = Some("only-once".to_string());
-    let err = match engine.enqueue::<_, i64>("q", "double", 1_i64, opts).await {
+    let err = match engine
+        .start::<_, i64>("double", 1_i64, opts.queue("q"))
+        .await
+    {
         Ok(_) => panic!("dedup id reuse on the same queue must be rejected"),
         Err(e) => e,
     };
@@ -460,21 +503,22 @@ async fn sqlite_config_name_routes_on_queue_dispatch() -> Result<()> {
     engine.launch().await?;
 
     let fr = engine
-        .enqueue::<_, String>(
-            "q",
+        .start::<_, String>(
             "greet",
             "Sam".to_string(),
             WorkflowOptions::with_id("wf-fr")
                 .config_name("fr")
-                .class_name("Greeter"),
+                .class_name("Greeter")
+                .queue("q"),
         )
         .await?;
     let en = engine
-        .enqueue::<_, String>(
-            "q",
+        .start::<_, String>(
             "greet",
             "Sam".to_string(),
-            WorkflowOptions::with_id("wf-en").config_name("en"),
+            WorkflowOptions::with_id("wf-en")
+                .config_name("en")
+                .queue("q"),
         )
         .await?;
     assert_eq!(fr.result().await?, "Bonjour, Sam");
@@ -512,7 +556,7 @@ async fn sqlite_messaging_and_events() -> Result<()> {
     });
 
     let handle = engine
-        .run_workflow::<_, String>("exchange", (), WorkflowOptions::with_id("wf-comm"))
+        .start::<_, String>("exchange", (), WorkflowOptions::with_id("wf-comm"))
         .await?;
 
     // The event is readable while the workflow is still waiting in recv.
@@ -555,7 +599,7 @@ async fn sqlite_auth_context_persists_and_propagates() -> Result<()> {
         .authenticated_user("alice")
         .assumed_role("admin")
         .authenticated_roles(["admin", "user"]);
-    let handle = engine.run_workflow::<_, String>("whoami", (), opts).await?;
+    let handle = engine.start::<_, String>("whoami", (), opts).await?;
     assert_eq!(handle.result().await?, "alice/admin/admin,user");
 
     // The identity is durable on the row.
@@ -575,7 +619,7 @@ async fn sqlite_auth_context_persists_and_propagates() -> Result<()> {
 
     // A workflow started without an identity carries empty auth.
     let bare = engine
-        .run_workflow::<_, String>("whoami", (), WorkflowOptions::with_id("wf-bare"))
+        .start::<_, String>("whoami", (), WorkflowOptions::with_id("wf-bare"))
         .await?;
     assert_eq!(bare.result().await?, "-/-/");
     let bstatus = bare.get_status().await?;
@@ -610,7 +654,11 @@ async fn sqlite_child_workflow_runs_once_across_restart() -> Result<()> {
     {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         register(&mut engine);
-        let out: i64 = engine.start_typed("parent", "wf-parent", 1_i64).await?;
+        let out: i64 = engine
+            .start("parent", 1_i64, WorkflowOptions::with_id("wf-parent"))
+            .await?
+            .result()
+            .await?;
         assert_eq!(out, 101);
     }
 
@@ -620,7 +668,11 @@ async fn sqlite_child_workflow_runs_once_across_restart() -> Result<()> {
     {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         register(&mut engine);
-        let out: i64 = engine.start_typed("parent", "wf-parent", 1_i64).await?;
+        let out: i64 = engine
+            .start("parent", 1_i64, WorkflowOptions::with_id("wf-parent"))
+            .await?
+            .result()
+            .await?;
         assert_eq!(out, 101);
     }
 
@@ -658,7 +710,11 @@ async fn sqlite_workflow_steps_introspection() -> Result<()> {
         Ok::<_, Error>(ctx.current_step_id() as i64)
     });
 
-    let next_seq: i64 = engine.start_typed("worker", "w1", ()).await?;
+    let next_seq: i64 = engine
+        .start("worker", (), WorkflowOptions::with_id("w1"))
+        .await?
+        .result()
+        .await?;
     assert_eq!(next_seq, 3);
 
     let steps = engine.get_workflow_steps("w1").await?;
@@ -714,7 +770,11 @@ async fn sqlite_interleaved_step_and_transaction_share_seq() -> Result<()> {
         Ok::<_, Error>(ctx.current_step_id() as i64)
     });
 
-    let next_seq: i64 = engine.start_typed("mix", "w-mix", ()).await?;
+    let next_seq: i64 = engine
+        .start("mix", (), WorkflowOptions::with_id("w-mix"))
+        .await?
+        .result()
+        .await?;
     assert_eq!(next_seq, 3, "step, transaction, step consumed seqs 0,1,2");
 
     let steps = engine.get_workflow_steps("w-mix").await?;
@@ -754,7 +814,11 @@ async fn sqlite_management() -> Result<()> {
     // Resume/fork re-queue work for a dispatcher, so the engine must be live.
     engine.launch().await?;
 
-    engine.start_typed::<_, i64>("pipeline", "wf-1", ()).await?;
+    engine
+        .start::<_, i64>("pipeline", (), WorkflowOptions::with_id("wf-1"))
+        .await?
+        .result()
+        .await?;
 
     // list filters via QueryBuilder.
     let listed = engine
@@ -782,7 +846,7 @@ async fn sqlite_management() -> Result<()> {
 
     // Cancel a fresh pending workflow, then resume re-runs it to completion.
     engine
-        .run_workflow::<_, i64>("pipeline", (), WorkflowOptions::with_id("wf-2"))
+        .start::<_, i64>("pipeline", (), WorkflowOptions::with_id("wf-2"))
         .await?
         .result()
         .await?;
@@ -914,7 +978,9 @@ async fn sqlite_set_workflow_delay() -> Result<()> {
 
     let mut opts = WorkflowOptions::with_id("wf-d");
     opts.delay = Some(Duration::from_secs(60));
-    let handle = engine.enqueue::<_, i64>("d", "echo", 5_i64, opts).await?;
+    let handle = engine
+        .start::<_, i64>("echo", 5_i64, opts.queue("d"))
+        .await?;
     assert_eq!(handle.get_status().await?.status, STATUS_DELAYED);
 
     let started = std::time::Instant::now();
@@ -950,9 +1016,13 @@ async fn sqlite_queues_only_filter() -> Result<()> {
     engine.register_queue(WorkflowQueue::new("q").base_polling_interval(Duration::from_millis(10)));
     engine.launch().await?;
 
-    engine.start_typed::<_, ()>("noop", "direct", ()).await?;
     engine
-        .enqueue::<_, ()>("q", "noop", (), WorkflowOptions::with_id("queued"))
+        .start::<_, ()>("noop", (), WorkflowOptions::with_id("direct"))
+        .await?
+        .result()
+        .await?;
+    engine
+        .start::<_, ()>("noop", (), WorkflowOptions::with_id("queued").queue("q"))
         .await?
         .result()
         .await?;
@@ -991,19 +1061,21 @@ async fn sqlite_partitioned_queue_dispatch() -> Result<()> {
     engine.launch().await?;
 
     let a = engine
-        .enqueue::<_, i64>(
-            "pq",
+        .start::<_, i64>(
             "echo",
             1_i64,
-            WorkflowOptions::with_id("a").partition_key("east"),
+            WorkflowOptions::with_id("a")
+                .partition_key("east")
+                .queue("pq"),
         )
         .await?;
     let b = engine
-        .enqueue::<_, i64>(
-            "pq",
+        .start::<_, i64>(
             "echo",
             2_i64,
-            WorkflowOptions::with_id("b").partition_key("west"),
+            WorkflowOptions::with_id("b")
+                .partition_key("west")
+                .queue("pq"),
         )
         .await?;
     assert_eq!(a.result().await?, 1);
@@ -1040,7 +1112,11 @@ async fn sqlite_list_filters_extended() -> Result<()> {
             .await?;
         h.result().await
     });
-    let out: i64 = engine.start_typed("parent", "p", ()).await?;
+    let out: i64 = engine
+        .start("parent", (), WorkflowOptions::with_id("p"))
+        .await?
+        .result()
+        .await?;
     assert_eq!(out, 50);
 
     // has_parent isolates the child.
@@ -1101,9 +1177,21 @@ async fn sqlite_workflow_aggregates() -> Result<()> {
     engine.register("boom", |_ctx: DurableContext, _: ()| async move {
         Err::<(), _>(Error::app("nope"))
     });
-    engine.start_typed::<_, ()>("ok", "a", ()).await?;
-    engine.start_typed::<_, ()>("ok", "b", ()).await?;
-    let _ = engine.start_typed::<_, ()>("boom", "c", ()).await;
+    engine
+        .start::<_, ()>("ok", (), WorkflowOptions::with_id("a"))
+        .await?
+        .result()
+        .await?;
+    engine
+        .start::<_, ()>("ok", (), WorkflowOptions::with_id("b"))
+        .await?
+        .result()
+        .await?;
+    let _ = engine
+        .start::<_, ()>("boom", (), WorkflowOptions::with_id("c"))
+        .await?
+        .result()
+        .await;
 
     // Group by status; also select the latency aggregates.
     let by_status = engine
@@ -1177,7 +1265,11 @@ async fn sqlite_step_timing_is_recorded() -> Result<()> {
         ctx.sleep(Duration::from_millis(1)).await?;
         Ok::<_, Error>(())
     });
-    engine.start_typed::<_, ()>("work", "w", ()).await?;
+    engine
+        .start::<_, ()>("work", (), WorkflowOptions::with_id("w"))
+        .await?
+        .result()
+        .await?;
 
     let steps = engine.get_workflow_steps("w").await?;
     let compute = steps
@@ -1218,7 +1310,11 @@ async fn sqlite_step_aggregates() -> Result<()> {
         ctx.step("a", || async { Ok::<_, Error>(3_i64) }).await?;
         Ok::<_, Error>(())
     });
-    engine.start_typed::<_, ()>("work", "w", ()).await?;
+    engine
+        .start::<_, ()>("work", (), WorkflowOptions::with_id("w"))
+        .await?
+        .result()
+        .await?;
 
     let by_fn = engine
         .get_step_aggregates(&StepAggregateQuery {
@@ -1530,7 +1626,7 @@ async fn sqlite_portable_input_envelope() -> Result<()> {
         Ok::<_, Error>(format!("echo:{name}"))
     });
     let out: String = engine
-        .run_workflow::<_, String>(
+        .start::<_, String>(
             "echo",
             "ada".to_string(),
             WorkflowOptions::with_id("wf-env"),
@@ -1619,7 +1715,7 @@ async fn sqlite_custom_serializer_roundtrips() -> Result<()> {
     });
 
     let out: String = engine
-        .run_workflow::<_, String>(
+        .start::<_, String>(
             "greet",
             "ada".to_string(),
             WorkflowOptions::with_id("wf-hex"),
@@ -1895,7 +1991,11 @@ async fn sqlite_transaction_step_exactly_once() -> Result<()> {
     {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         register(&mut engine);
-        let bal: i64 = engine.start_typed("acct", "wf-txn", ()).await?;
+        let bal: i64 = engine
+            .start("acct", (), WorkflowOptions::with_id("wf-txn"))
+            .await?
+            .result()
+            .await?;
         assert_eq!(bal, 90);
     }
     // Restart and re-run the same id: both transaction steps replay (the body is
@@ -1903,7 +2003,11 @@ async fn sqlite_transaction_step_exactly_once() -> Result<()> {
     {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         register(&mut engine);
-        let bal: i64 = engine.start_typed("acct", "wf-txn", ()).await?;
+        let bal: i64 = engine
+            .start("acct", (), WorkflowOptions::with_id("wf-txn"))
+            .await?
+            .result()
+            .await?;
         assert_eq!(
             bal, 90,
             "transactional step is exactly-once across a restart"
@@ -1951,8 +2055,10 @@ async fn sqlite_nested_transaction_is_rejected() -> Result<()> {
     });
 
     // Must complete (fail) promptly — a deadlock would hang until the timeout.
-    let run = engine.start_typed::<_, ()>("nest", "wf-nest", ());
-    let res = tokio::time::timeout(Duration::from_secs(5), run)
+    let handle = engine
+        .start::<_, ()>("nest", (), WorkflowOptions::with_id("wf-nest"))
+        .await?;
+    let res = tokio::time::timeout(Duration::from_secs(5), handle.result())
         .await
         .expect("nested transaction must be rejected, not deadlock");
     let err = res.expect_err("nesting a transaction is an error");
@@ -2013,7 +2119,11 @@ async fn sqlite_transaction_step_rolls_back_on_error() -> Result<()> {
             .await?;
         Ok::<_, Error>((failed, v))
     });
-    let (failed, v): (bool, i64) = engine.start_typed("rb", "wf-rb", ()).await?;
+    let (failed, v): (bool, i64) = engine
+        .start("rb", (), WorkflowOptions::with_id("wf-rb"))
+        .await?
+        .result()
+        .await?;
     assert!(failed, "the failing transaction returned its error");
     assert_eq!(v, 0, "the failed transaction's write rolled back");
     let _ = std::fs::remove_file(path);
@@ -2050,7 +2160,11 @@ async fn sqlite_checkpoints_a_caught_transaction_failure() -> Result<()> {
     {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         register(&mut engine);
-        let out: String = engine.start_typed("txn_flaky", "wf-txn-err", ()).await?;
+        let out: String = engine
+            .start("txn_flaky", (), WorkflowOptions::with_id("wf-txn-err"))
+            .await?
+            .result()
+            .await?;
         assert_eq!(out, "caught-error");
         let steps = engine.get_workflow_steps("wf-txn-err").await?;
         let maybe = steps
@@ -2062,7 +2176,11 @@ async fn sqlite_checkpoints_a_caught_transaction_failure() -> Result<()> {
     {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         register(&mut engine);
-        let out: String = engine.start_typed("txn_flaky", "wf-txn-err", ()).await?;
+        let out: String = engine
+            .start("txn_flaky", (), WorkflowOptions::with_id("wf-txn-err"))
+            .await?
+            .result()
+            .await?;
         assert_eq!(
             out, "caught-error",
             "replay observes the recorded transaction error"
@@ -2107,7 +2225,11 @@ async fn sqlite_transaction_retries_body_error() -> Result<()> {
             .await?;
         Ok::<_, Error>(n)
     });
-    let out: i64 = engine.start_typed("retry", "wf-txn-retry", ()).await?;
+    let out: i64 = engine
+        .start("retry", (), WorkflowOptions::with_id("wf-txn-retry"))
+        .await?
+        .result()
+        .await?;
     assert_eq!(
         out, 42,
         "the body eventually succeeds and returns its value"
@@ -2151,7 +2273,11 @@ async fn sqlite_transaction_retry_predicate_fails_fast() -> Result<()> {
             .await;
         Ok::<_, Error>(r.is_err())
     });
-    let failed: bool = engine.start_typed("nofast", "wf-txn-nofast", ()).await?;
+    let failed: bool = engine
+        .start("nofast", (), WorkflowOptions::with_id("wf-txn-nofast"))
+        .await?
+        .result()
+        .await?;
     assert!(failed, "the error is surfaced to the caller");
     assert_eq!(
         TX_RUNS.load(Ordering::SeqCst),
@@ -2193,7 +2319,11 @@ async fn sqlite_transaction_retries_transient_db_error() -> Result<()> {
             .await?;
         Ok::<_, Error>(n)
     });
-    let out: i64 = engine.start_typed("flaky", "wf-transient", ()).await?;
+    let out: i64 = engine
+        .start("flaky", (), WorkflowOptions::with_id("wf-transient"))
+        .await?
+        .result()
+        .await?;
     assert_eq!(out, 7, "the transaction eventually commits");
     assert_eq!(
         RUNS.load(Ordering::SeqCst),
@@ -2234,7 +2364,12 @@ async fn sqlite_transaction_conflict_retry_is_unbounded_but_cancellable() -> Res
 
     // Run it in the background; the conflict loop spins on the retryable error.
     let bg = engine.clone();
-    let run = tokio::spawn(async move { bg.start_typed::<_, ()>("spinner", "wf-spin", ()).await });
+    let run = tokio::spawn(async move {
+        bg.start::<_, ()>("spinner", (), WorkflowOptions::with_id("wf-spin"))
+            .await?
+            .result()
+            .await
+    });
 
     // Once it has spun past the old 10-attempt cap, cancel it. The loop must stop.
     for _ in 0..400 {
@@ -2298,7 +2433,11 @@ async fn sqlite_recorded_transaction_failure_replays_immediately() -> Result<()>
         Ok::<_, Error>(if r.is_err() { "caught" } else { "ok" }.to_string())
     });
     let id = "wf-txn-replay";
-    let out: String = engine.start_typed("rec", id, ()).await?;
+    let out: String = engine
+        .start("rec", (), WorkflowOptions::with_id(id))
+        .await?
+        .result()
+        .await?;
     assert_eq!(out, "caught");
     assert_eq!(
         REC_RUNS.load(Ordering::SeqCst),
@@ -2363,7 +2502,7 @@ async fn sqlite_export_import_round_trip() -> Result<()> {
 
     let id = "wf-export-1";
     let out: i64 = engine
-        .run_workflow::<_, i64>("expo", 21_i64, WorkflowOptions::with_id(id))
+        .start::<_, i64>("expo", 21_i64, WorkflowOptions::with_id(id))
         .await?
         .result()
         .await?;
@@ -2433,7 +2572,7 @@ async fn sqlite_was_forked_from_survives_import() -> Result<()> {
 
     // Source runs; a fork is taken from it (marks the source `was_forked_from`).
     engine
-        .run_workflow::<_, i64>("wff", 1i64, WorkflowOptions::with_id("src"))
+        .start::<_, i64>("wff", 1i64, WorkflowOptions::with_id("src"))
         .await?
         .result()
         .await?;
@@ -2500,7 +2639,7 @@ async fn sqlite_was_forked_from_reconstructed_when_payload_omits_it() -> Result<
     engine.launch().await?;
 
     engine
-        .run_workflow::<_, i64>("wff", 1i64, WorkflowOptions::with_id("src"))
+        .start::<_, i64>("wff", 1i64, WorkflowOptions::with_id("src"))
         .await?
         .result()
         .await?;
@@ -2577,7 +2716,11 @@ async fn sqlite_recovery_replays_checkpointed_step_without_rerunning() -> Result
     {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         register(&mut engine);
-        let out: i64 = engine.start_typed("replay_me", id, ()).await?;
+        let out: i64 = engine
+            .start("replay_me", (), WorkflowOptions::with_id(id))
+            .await?
+            .result()
+            .await?;
         assert_eq!(out, 42);
     }
     assert_eq!(BODY_RUNS.load(Ordering::SeqCst), 1);
@@ -2850,7 +2993,11 @@ async fn sqlite_renamed_transaction_fails_as_unexpected_step() -> Result<()> {
         .await
     });
     let id = "wf-txn-rename";
-    let out: i64 = engine.start_typed("tx-wf", id, ()).await?;
+    let out: i64 = engine
+        .start("tx-wf", (), WorkflowOptions::with_id(id))
+        .await?
+        .result()
+        .await?;
     assert_eq!(out, 7);
 
     // Re-drive the recorded step under a DIFFERENT transaction name.

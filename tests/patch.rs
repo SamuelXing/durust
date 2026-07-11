@@ -16,7 +16,11 @@ async fn patch_new_workflow_takes_new_path() -> Result<()> {
         ctx.patch("feature").await
     });
 
-    let patched: bool = engine.start_typed("wf", "fresh", ()).await?;
+    let patched: bool = engine
+        .start("wf", (), WorkflowOptions::with_id("fresh"))
+        .await?
+        .result()
+        .await?;
     assert!(patched, "a brand-new workflow uses the patched code");
 
     // The marker was recorded as the workflow's first operation.
@@ -43,7 +47,7 @@ async fn patch_pre_patch_workflow_takes_old_path() -> Result<()> {
     });
 
     let patched: bool = engine
-        .run_workflow::<_, bool>("wf", (), WorkflowOptions::with_id("old"))
+        .start::<_, bool>("wf", (), WorkflowOptions::with_id("old"))
         .await?
         .result()
         .await?;

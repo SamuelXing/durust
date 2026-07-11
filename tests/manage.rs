@@ -19,8 +19,16 @@ async fn retrieve_and_list() -> Result<()> {
         Ok::<_, Error>(n + 1)
     });
 
-    engine.start_typed::<_, i64>("add", "wf-a", 1_i64).await?;
-    engine.start_typed::<_, i64>("add", "wf-b", 2_i64).await?;
+    engine
+        .start::<_, i64>("add", 1_i64, WorkflowOptions::with_id("wf-a"))
+        .await?
+        .result()
+        .await?;
+    engine
+        .start::<_, i64>("add", 2_i64, WorkflowOptions::with_id("wf-b"))
+        .await?
+        .result()
+        .await?;
 
     let h = engine.retrieve_workflow::<i64>("wf-a").await?;
     assert_eq!(h.result().await?, 2);
@@ -67,7 +75,11 @@ async fn direct_run_started_at_equals_created_at() -> Result<()> {
     engine.register("noop", |_ctx: DurableContext, _: ()| async move {
         Ok::<_, Error>(())
     });
-    engine.start_typed::<_, ()>("noop", "d1", ()).await?;
+    engine
+        .start::<_, ()>("noop", (), WorkflowOptions::with_id("d1"))
+        .await?
+        .result()
+        .await?;
 
     let s = provider.get_workflow_status("d1").await?.unwrap();
     let started = s.started_at_ms.expect("a direct run records started_at");
@@ -171,7 +183,11 @@ async fn fork_reuses_checkpoints() -> Result<()> {
     engine.launch().await?;
 
     // Original run completes; both steps execute once.
-    let orig: i64 = engine.start_typed("pipeline", "wf-orig", ()).await?;
+    let orig: i64 = engine
+        .start("pipeline", (), WorkflowOptions::with_id("wf-orig"))
+        .await?
+        .result()
+        .await?;
     assert_eq!(orig, 15);
     assert_eq!(SECOND_RUNS.load(Ordering::SeqCst), 1);
 
@@ -227,9 +243,21 @@ async fn list_filters_or_match_and_was_forked_from() -> Result<()> {
     });
     engine.launch().await?;
 
-    engine.start_typed::<_, i64>("alpha", "a-1", 1).await?;
-    engine.start_typed::<_, i64>("beta", "b-1", 2).await?;
-    engine.start_typed::<_, i64>("gamma", "g-1", 3).await?;
+    engine
+        .start::<_, i64>("alpha", 1, WorkflowOptions::with_id("a-1"))
+        .await?
+        .result()
+        .await?;
+    engine
+        .start::<_, i64>("beta", 2, WorkflowOptions::with_id("b-1"))
+        .await?
+        .result()
+        .await?;
+    engine
+        .start::<_, i64>("gamma", 3, WorkflowOptions::with_id("g-1"))
+        .await?
+        .result()
+        .await?;
 
     // OR across names: alpha or beta, not gamma.
     let by_name = engine
@@ -391,7 +419,7 @@ async fn cancel_removes_from_queue() -> Result<()> {
 
     // Enqueue but cancel before launching the dispatcher.
     let handle = engine
-        .enqueue::<_, ()>("q", "noop", (), WorkflowOptions::with_id("wf-q"))
+        .start::<_, ()>("noop", (), WorkflowOptions::with_id("wf-q").queue("q"))
         .await?;
     engine.cancel_workflow("wf-q").await?;
     assert_eq!(handle.get_status().await?.status, STATUS_CANCELLED);
@@ -426,7 +454,11 @@ async fn bulk_cancel_and_resume() -> Result<()> {
             ))
             .await?;
     }
-    let () = engine.start_typed("noop", "wf-done", ()).await?;
+    let () = engine
+        .start("noop", (), WorkflowOptions::with_id("wf-done"))
+        .await?
+        .result()
+        .await?;
 
     // Cancel a subset plus a missing id and the completed one (both skipped).
     engine
@@ -523,7 +555,11 @@ async fn list_filters_parentage_and_load_flags() -> Result<()> {
             .await?;
         h.result().await
     });
-    let out: i64 = engine.start_typed("parent", "p", ()).await?;
+    let out: i64 = engine
+        .start("parent", (), WorkflowOptions::with_id("p"))
+        .await?
+        .result()
+        .await?;
     assert_eq!(out, 50);
 
     // has_parent = true keeps only the child; false only the root.
@@ -577,7 +613,11 @@ async fn list_filters_completed_and_dequeued_time() -> Result<()> {
     engine.register("noop", |_ctx: DurableContext, _: ()| async move {
         Ok::<_, Error>(())
     });
-    engine.start_typed::<_, ()>("noop", "w", ()).await?;
+    engine
+        .start::<_, ()>("noop", (), WorkflowOptions::with_id("w"))
+        .await?
+        .result()
+        .await?;
     let now = chrono::Utc::now().timestamp_millis();
     let hour = 3_600_000;
 
@@ -625,9 +665,21 @@ async fn workflow_aggregates_group_and_filter() -> Result<()> {
     });
 
     // Two successes, one failure.
-    engine.start_typed::<_, ()>("ok", "a", ()).await?;
-    engine.start_typed::<_, ()>("ok", "b", ()).await?;
-    let _ = engine.start_typed::<_, ()>("boom", "c", ()).await;
+    engine
+        .start::<_, ()>("ok", (), WorkflowOptions::with_id("a"))
+        .await?
+        .result()
+        .await?;
+    engine
+        .start::<_, ()>("ok", (), WorkflowOptions::with_id("b"))
+        .await?
+        .result()
+        .await?;
+    let _ = engine
+        .start::<_, ()>("boom", (), WorkflowOptions::with_id("c"))
+        .await?
+        .result()
+        .await;
 
     let count_for = |rows: &[WorkflowAggregate], key: &str, val: &str| -> i64 {
         rows.iter()
@@ -727,7 +779,11 @@ async fn workflow_aggregates_completed_and_dequeued_filter() -> Result<()> {
     engine.register("ok", |_ctx: DurableContext, _: ()| async move {
         Ok::<_, Error>(())
     });
-    engine.start_typed::<_, ()>("ok", "w", ()).await?;
+    engine
+        .start::<_, ()>("ok", (), WorkflowOptions::with_id("w"))
+        .await?
+        .result()
+        .await?;
     let now = chrono::Utc::now().timestamp_millis();
     let hour = 3_600_000;
 
@@ -803,7 +859,11 @@ async fn step_aggregates_count_and_duration() -> Result<()> {
         ctx.step("fast", || async { Ok::<_, Error>(3_i64) }).await?;
         Ok::<_, Error>(())
     });
-    engine.start_typed::<_, ()>("work", "w", ()).await?;
+    engine
+        .start::<_, ()>("work", (), WorkflowOptions::with_id("w"))
+        .await?
+        .result()
+        .await?;
 
     // Group by function name; select count and max duration.
     let by_fn = engine
@@ -915,7 +975,11 @@ async fn fork_routes_to_named_queue_and_inherits_version() -> Result<()> {
     );
     engine.launch().await?;
 
-    let orig: i64 = engine.start_typed("double", "wf-orig-q", 21_i64).await?;
+    let orig: i64 = engine
+        .start("double", 21_i64, WorkflowOptions::with_id("wf-orig-q"))
+        .await?
+        .result()
+        .await?;
     assert_eq!(orig, 42);
 
     // Fork onto the named queue: its dispatcher runs the fork, the row records
@@ -1108,7 +1172,7 @@ async fn child_auth_inherits_per_field() -> Result<()> {
     engine.launch().await?;
 
     let h = engine
-        .run_workflow::<_, String>(
+        .start::<_, String>(
             "parent",
             (),
             WorkflowOptions::with_id("wf-auth-parent")
