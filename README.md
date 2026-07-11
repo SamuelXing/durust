@@ -1,187 +1,201 @@
 # durare
 
-A **DBOS-style durable execution** library for Rust, aligned with the
-[DBOS Transact Go SDK](https://github.com/dbos-inc/dbos-transact-golang). Write
-normal async code; each step is checkpointed to a database; after a crash the
-workflow resumes exactly where it left off — completed steps are **not** re-run.
+[![CI](https://github.com/SamuelXing/durust/actions/workflows/ci.yml/badge.svg)](https://github.com/SamuelXing/durust/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-> **durare** is an **independent, community project.** It implements the DBOS
-> durable-execution model and is wire-compatible with the official SDKs on a
-> shared database, but it is **not affiliated with or endorsed by DBOS, Inc.**
-> The name is Latin — *durāre*, "to last, to endure."
+`durare` (Latin *durāre*, "to last") is a durable-execution library for Rust.
+Write ordinary async functions; `durare` checkpoints each step to your database
+and, after a crash, restart, or redeploy, resumes every unfinished workflow
+exactly where it stopped. Completed steps are never re-run.
 
-There is no separate server. The engine is a library that runs inside your worker
-and talks directly to the state backend. Storage sits behind one trait
-(`StateProvider`) with three implementations — **Postgres**, **SQLite**, and an
-in-memory one for tests — so a new backend can be added without touching the
-engine.
-
-## The model
+`durare` is a Rust SDK for [DBOS](https://docs.dbos.dev) durable execution,
+aligned by design with the DBOS Transact SDKs for Python, Go, and TypeScript:
+the same programming model, the same semantics, and the same system schema on
+the same database. There is no server to operate and no sidecar — the engine
+is a library inside your process that talks directly to Postgres or SQLite.
+See [DBOS compatibility](#dbos-compatibility).
 
 ```rust
-use durare::{DurableContext, Error, Result};
+use std::time::Duration;
+use durare::{DurableContext, DurableEngine, Result, WorkflowOptions};
+
+#[durare::step]
+async fn charge_card(ctx: &DurableContext, order_id: String) -> Result<String> {
+    // Any side effect: an HTTP call, an email, a write to another system.
+    // It runs once; the result is checkpointed and replayed thereafter.
+    Ok(format!("ch_{order_id}"))
+}
 
 #[durare::workflow]
-async fn process_order(ctx: DurableContext, order: Order) -> Result<Receipt> {
-    let charge_id = ctx.step("charge_card", || async {
-        Ok::<_, Error>(charge_card(&order).await?)   // side effect, recorded once
-    }).await?;
-
-    let shipment_id = ctx.step("create_shipment", || async {
-        Ok::<_, Error>(create_shipment(&order).await?)
-    }).await?;
-
-    Ok(Receipt { charge_id, shipment_id })
+async fn process_order(ctx: DurableContext, order_id: String) -> Result<String> {
+    let charge_id = charge_card(&ctx, order_id).await?;
+    ctx.sleep(Duration::from_secs(24 * 3600)).await?; // durable timer
+    Ok(charge_id)
 }
-```
 
-```rust
-use durare::{DurableEngine, SqliteProvider, WorkflowOptions};
-use std::sync::Arc;
+#[tokio::main]
+async fn main() -> Result<()> {
+    let engine = DurableEngine::connect("postgres://localhost/app").await?.build().await?;
+    engine.recover().await?; // resume whatever a previous process left unfinished
 
-# async fn run() -> durare::Result<()> {
-let engine = DurableEngine::new(Arc::new(SqliteProvider::connect("sqlite://durare.db").await?)).await?;
-engine.recover().await?;           // resume anything a prior crash left incomplete
-engine.launch().await?;            // start queue dispatchers + cron schedulers
-
-// Non-blocking: returns a handle immediately.
-let handle = engine
-    .start::<_, Receipt>("process_order", order, WorkflowOptions::default())
-    .await?;
-let receipt: Receipt = handle.result().await?;
-# Ok(()) }
-```
-
-Steps are matched to their checkpoints by a **deterministic per-execution
-counter**, so — exactly like Temporal/DBOS — your workflow's control flow must be
-deterministic. Non-determinism (wall-clock, RNG, map iteration order) belongs
-*inside* a step, where its result is recorded.
-
-## Features
-
-Annotate workflows with `#[durare::workflow]` (auto-registered via `inventory`)
-or register them manually with `engine.register(name, f)`.
-
-### Durable steps & retries
-- **`ctx.step(name, closure)`** — runs the closure once, persists its result; on
-  replay returns the stored result without re-running.
-- **`ctx.step_with(StepOptions, closure)`** — adds exponential-backoff retries
-  (`max_retries`, `backoff_factor`, `base_interval`, `max_interval`).
-- **`ctx.sleep(duration)`** — durable timer; the wake instant is recorded as a
-  step so it doesn't drift across crashes.
-
-### Workflow handles
-`start` (string name) and `start_with` (a typed `#[durare::workflow]` marker)
-return a `WorkflowHandle<O>` **without blocking**. Resolve it with
-`handle.result().await` (or `handle.await` — the handle is `IntoFuture`); also
-`handle.get_status().await` and `handle.id()`. The handle is `Clone` and resolves
-through `&self`, so several tasks can observe the same workflow.
-
-### Durable queues
-```rust
-use durare::{WorkflowQueue, RateLimiter};
-use std::time::Duration;
-
-engine.register_queue(
-    WorkflowQueue::new("emails")
-        .worker_concurrency(4)                                    // per-process limit
-        .global_concurrency(20)                                   // across all executors
-        .priority_enabled()                                       // lower priority runs first
-        .rate_limiter(RateLimiter { limit: 50, period: Duration::from_secs(60) }),
-);
-let handle = engine.start::<_, ()>("send_email", msg, opts.queue("emails")).await?;
-```
-A per-queue dispatcher (started by `launch()`) claims work respecting worker /
-global concurrency, rate limits, priority, per-tick **delay**, and queue-scoped
-**deduplication** (`WorkflowOptions { dedup_id, delay, priority, .. }`). On
-Postgres claims use `FOR UPDATE SKIP LOCKED`; SQLite uses a transactional claim.
-
-### Messaging & events
-- **`ctx.send(dest_id, msg, topic)` / `ctx.recv::<T>(topic, timeout)`** — durable,
-  FIFO, exactly-once messaging (the claim and its checkpoint commit atomically);
-  `recv` returns `None` on timeout.
-- **`ctx.set_event(key, value)` / `ctx.get_event::<T>(target_id, key, timeout)`** —
-  key-value events published from a workflow.
-- `engine.send` / `engine.get_event` are available to non-workflow callers.
-
-### Scheduled (cron) workflows
-```rust
-// 6-field cron (sec min hour dom mon dow). The tick input carries the fire
-// time and any context attached to the schedule.
-#[durare::workflow(schedule = "0 0 * * * *")] // top of every hour
-async fn hourly(ctx: DurableContext, tick: ScheduledInput) -> Result<()> {
-    println!("fired for {}", tick.scheduled_time);
+    let handle = engine
+        .start_with(ProcessOrder, "1001".into(), WorkflowOptions::with_id("order-1001"))
+        .await?;
+    println!("charged: {}", handle.await?);
     Ok(())
 }
 ```
-Each tick starts the workflow under a deterministic `sched-<name>-<time>` id, so
-it runs **once per tick even across multiple executors**.
 
-### Timeouts
-`WorkflowOptions { timeout: Some(dur), .. }` fixes a deadline when the workflow
-starts (at claim time for queued workflows); a run that overruns it is cancelled.
+The workflow above sleeps for a day between charging and returning. Kill the
+process at any point — mid-sleep included — and the next `recover()` picks it
+up with the charge intact and only the remaining sleep to wait. The card is
+never charged twice.
 
-### Management & recovery
-- `retrieve_workflow`, `list_workflows(ListFilter { .. })`, `cancel_workflow`,
-  `resume_workflow` (re-runs from checkpoints), `fork_workflow(id, start_step)`
-  (reuses checkpoints before `start_step`, re-executes the rest).
-- `recover()` re-runs incomplete workflows of the engine's **application
-  version**; runs past a recovery-attempt cap are parked in
-  `MAX_RECOVERY_ATTEMPTS_EXCEEDED`; queued workflows are returned to their queue.
+## Features
+
+- **Steps.** `#[durare::step]` functions or `ctx.step` closures. Per-step retry
+  policy with exponential backoff and a retry predicate (`StepOptions`).
+- **Transactions.** `#[durare::transaction]` runs your SQL and records the
+  step's completion in the same database transaction, so the write and its
+  checkpoint commit or roll back together. This makes the step exactly-once,
+  not at-least-once.
+- **Timers.** `ctx.sleep` persists its wake instant; a replay waits only the
+  remaining time.
+- **Queues.** Per-process and global concurrency limits, rate limiting,
+  priorities, delayed enqueue, deduplication (reject or return-existing), and
+  partitioned queues.
+- **Scheduling.** Six-field cron via `#[durare::workflow(schedule = "…")]`,
+  plus a managed schedule API: create, pause, resume, trigger, backfill.
+- **Messaging, events, streams.** Durable FIFO `send`/`recv` between workflows
+  and from the outside, idempotency-key sends, key-value `set_event`/
+  `get_event`, and append-only streams that consumers can tail live.
+- **Child workflows.** `ctx.start_workflow` with deterministic child ids and
+  parent links.
+- **Recovery and versioning.** `recover()` resumes by application version, a
+  version registry routes work across a fleet, and runaway workflows park
+  after a recovery-attempt cap.
+- **Management.** List, cancel, resume, and fork (from an arbitrary step)
+  workflows; per-workflow timeouts; `ctx.patch` for changing workflow code
+  while old runs are still in flight; debouncing for coalescing bursts.
+- **Operations.** An admin HTTP server with the standard DBOS endpoints, and a
+  client for DBOS Conductor.
+- **Out-of-process producers.** A registry-free `Client` for services that
+  submit and observe workflows but run none of them.
 
 ## Quick start
 
-```bash
-cargo test                     # 35 tests; in-memory + SQLite (no server needed)
-cargo run --example order      # in-memory backend, or set DATABASE_URL for Postgres
+```toml
+[dependencies]
+durare = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-### Crash recovery (Postgres)
+Until 0.1 reaches crates.io, use a git dependency:
+`durare = { git = "https://github.com/SamuelXing/durust" }`.
+
+The repository ships ten self-contained examples, one per primitive:
+
+| Example | Shows |
+| --- | --- |
+| `order` | workflow + steps, crash recovery via a fault-injection crash |
+| `saga` | compensation on failure |
+| `pipeline` | queues: fan-out under a concurrency limit |
+| `scheduled` | cron workflows |
+| `transfer` | `#[transaction]`: exactly-once money movement, proven by re-run |
+| `approval` | human-in-the-loop: durable `recv`, events for observers |
+| `client` | out-of-process submit and observe |
+| `timer` | durable sleep |
+| `subworkflow` | child-workflow fan-out |
+| `stream` | live-tailed progress feed |
 
 ```bash
-createdb durare
-export DATABASE_URL=postgres://localhost:5432/durare
+cargo run --example saga          # in-memory, no database needed
 
-# Run 1: a fail-rs failpoint crashes the process right after charging.
-FAILPOINTS=after_charge=return cargo run --example order
-# Run 2: recover() resumes; the card is NOT re-charged (charge step is replayed).
-cargo run --example order
+# Crash recovery, for real:
+createdb app
+export DATABASE_URL=postgres://localhost:5432/app
+FAILPOINTS=after_charge=return cargo run --example order   # charges, then crashes
+cargo run --example order                                  # resumes; does not re-charge
 ```
 
-## Backends & schema
+## How it works
 
-| Backend | Use | Crash recovery |
-| --- | --- | --- |
-| `PostgresProvider` | production / multi-executor | yes |
-| `SqliteProvider` | durable local dev, single node | yes (file DB) |
-| `InMemoryProvider` | tests, examples | no (in-process only) |
+Each side-effecting operation a workflow performs — a step, a sleep, a message
+receive, a child start — is recorded in the `operation_outputs` table, keyed by
+a deterministic per-execution counter and guarded by the operation's name. When
+a workflow is re-executed after a failure, operations that already ran return
+their recorded results instead of running again, and execution proceeds from
+the first checkpoint that is missing.
 
-The schema follows the DBOS canonical tables — `workflow_status`,
-`operation_outputs` (step checkpoints), `notifications`, `workflow_events` —
-applied via embedded, per-dialect migrations (`migrations/{postgres,sqlite}/`)
-using `sqlx::migrate!`. `init()` runs pending migrations on startup; inspect
-state with plain SQL:
+The consequence, as in every durable-execution system: workflow control flow
+must be deterministic. Wall-clock reads, random numbers, and anything else
+non-repeatable belong inside a step, where the result is recorded.
+
+What the guarantees actually are:
+
+| Operation | Guarantee |
+| --- | --- |
+| Workflow state transitions, completion | exactly once |
+| Step side effect | at least once — make external calls idempotent |
+| `#[transaction]` SQL | exactly once (commits with its own checkpoint) |
+| `recv` message consumption | exactly once |
+| Cron tick | once per tick, across any number of executors |
+
+The step caveat is the same one Temporal and the DBOS SDKs carry: a crash can
+land between an external call and its checkpoint. Transactions close that
+window for SQL against the workflow database, which is why they exist as a
+separate primitive.
+
+## DBOS compatibility
+
+`durare` implements the DBOS durable-execution model and stores its state in the
+DBOS system schema. On Postgres the tables live in the `dbos` schema — the same
+schema, tables, and columns the DBOS Transact SDKs for Python, Go, and
+TypeScript use: `workflow_status`, `operation_outputs`, `workflow_events`,
+`notifications`, `streams`, `workflow_schedules`, `queues`, and the version
+registry, applied through embedded per-dialect migrations.
+
+In practice this means:
+
+- Workflow state is inspectable with plain SQL, and rows written by a `durare`
+  worker are legible to standard DBOS tooling pointed at the same database.
+- Arguments, outputs, and errors use the portable serialization envelope, with
+  a structured cross-SDK error format. Custom codecs can be installed through
+  `Serializer`.
+- The admin server exposes the standard DBOS HTTP endpoints (`/dbos-healthz`,
+  `/workflows`, cancel/resume/fork, recovery, queue metadata), and the
+  Conductor client connects to DBOS Conductor for fleet management.
 
 ```sql
-SELECT workflow_uuid, name, status FROM workflow_status;
-SELECT workflow_uuid, function_id, function_name, output FROM operation_outputs;
+SELECT workflow_uuid, name, status FROM dbos.workflow_status;
+SELECT workflow_uuid, function_id, function_name, output FROM dbos.operation_outputs;
 ```
 
-## Exactly-once, honestly
+`durare` is community-maintained.
 
-- **Workflow state transitions are exactly-once** (checkpoint per step, idempotent
-  insert).
-- **A step's external side effect is at-least-once** in the crash window
-  "side-effect committed, checkpoint not yet written." Make external calls
-  idempotent (idempotency keys) — same caveat as Temporal and DBOS.
+## Backends
 
-## Out of scope (for now)
+| Backend | Intended use | Notes |
+| --- | --- | --- |
+| `PostgresProvider` | production, multi-executor | `LISTEN`/`NOTIFY` wakes blocked `recv`/`get_event`; queue claims use `FOR UPDATE SKIP LOCKED`; `connect_with_schema` for a custom schema |
+| `SqliteProvider` | single-node deployments, local development | full durability on a file database |
+| `InMemoryProvider` | tests and examples | no cross-process durability |
 
-Child workflows, streaming, authenticated-user/roles, queue partitioning,
-cross-language serialization, the application-version management API, a conductor
-/ admin server, and Postgres `LISTEN`/`NOTIFY` (blocked `recv`/`get_event` poll
-instead). The `StateProvider` trait is the seam where more backends can be added.
+All three implement one trait, `StateProvider`, which is also the seam for
+adding further backends. Application tests can run workflows against
+`InMemoryProvider` with no infrastructure at all; the crate's own test suite
+runs against all three backends on every commit, with Postgres against a live
+server in CI.
 
 ## License
 
-MIT OR Apache-2.0
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall
+be dual licensed as above, without any additional terms or conditions.
