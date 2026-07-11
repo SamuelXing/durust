@@ -1,6 +1,7 @@
 //! # durare
 //!
-//! A DBOS-style **durable execution** library for Rust.
+//! A [DBOS](https://docs.dbos.dev)-style **durable execution** library for
+//! Rust.
 //!
 //! Write ordinary async code; wrap each side-effecting unit in a step. Every
 //! step's result is checkpointed to a [`StateProvider`] (Postgres, SQLite, or
