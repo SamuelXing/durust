@@ -1372,10 +1372,10 @@ impl DurableEngine {
     where
         I: Serialize,
     {
-        let mut handle: WorkflowHandle<Value> = self
+        let handle: WorkflowHandle<Value> = self
             .run_workflow(name, input, WorkflowOptions::with_id(id))
             .await?;
-        handle.get_result().await
+        handle.result().await
     }
 
     /// Like [`start`](Self::start) but deserializes the output into `O`.
@@ -1384,10 +1384,10 @@ impl DurableEngine {
         I: Serialize,
         O: DeserializeOwned,
     {
-        let mut handle: WorkflowHandle<O> = self
+        let handle: WorkflowHandle<O> = self
             .run_workflow(name, input, WorkflowOptions::with_id(id))
             .await?;
-        handle.get_result().await
+        handle.result().await
     }
 
     /// Get a [`WorkflowHandle`] for an existing workflow. The handle observes the

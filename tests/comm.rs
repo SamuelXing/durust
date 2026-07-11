@@ -18,13 +18,13 @@ async fn send_unblocks_waiting_recv() -> Result<()> {
         Ok::<_, Error>(msg.unwrap_or_default())
     });
 
-    let mut handle = engine
+    let handle = engine
         .run_workflow::<_, String>("waiter", (), WorkflowOptions::with_id("wf-recv"))
         .await?;
     engine
         .send("wf-recv", "hello".to_string(), "greetings")
         .await?;
-    assert_eq!(handle.get_result().await?, "hello");
+    assert_eq!(handle.result().await?, "hello");
     Ok(())
 }
 
@@ -48,18 +48,18 @@ async fn recv_is_fifo() -> Result<()> {
         Ok::<_, Error>(())
     });
 
-    let mut consumer = engine
+    let consumer = engine
         .run_workflow::<_, String>("take_two", (), WorkflowOptions::with_id("wf-fifo"))
         .await?;
-    let mut producer = engine
+    let producer = engine
         .run_workflow::<_, ()>(
             "producer",
             "wf-fifo".to_string(),
             WorkflowOptions::with_id("wf-producer"),
         )
         .await?;
-    producer.get_result().await?;
-    assert_eq!(consumer.get_result().await?, "m1,m2");
+    producer.result().await?;
+    assert_eq!(consumer.result().await?, "m1,m2");
     Ok(())
 }
 

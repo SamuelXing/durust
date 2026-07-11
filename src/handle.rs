@@ -155,15 +155,6 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
         }
     }
 
-    /// Wait for the workflow to finish and return its typed output.
-    ///
-    /// Prefer [`result`](Self::result), which takes `&self`. This `&mut`
-    /// spelling is retained so existing callers keep compiling; it simply
-    /// delegates.
-    pub async fn get_result(&mut self) -> Result<O> {
-        self.result().await
-    }
-
     /// Convert a terminal status row into a typed `Result`.
     fn terminal_to_result(&self, status: WorkflowStatus) -> Result<O> {
         match status.status.as_str() {

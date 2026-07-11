@@ -29,13 +29,9 @@ async fn client_enqueues_work_an_engine_runs() -> Result<()> {
         workflow_id: Some("job-1".to_string()),
         ..Default::default()
     };
-    let mut handle = client.enqueue::<_, i64>("q", "double", 21i64, opts).await?;
+    let handle = client.enqueue::<_, i64>("q", "double", 21i64, opts).await?;
     assert_eq!(handle.id(), "job-1");
-    assert_eq!(
-        handle.get_result().await?,
-        42,
-        "engine ran the enqueued work"
-    );
+    assert_eq!(handle.result().await?, 42, "engine ran the enqueued work");
 
     // The client observes the persisted row and its step.
     let rows = client
@@ -50,8 +46,8 @@ async fn client_enqueues_work_an_engine_runs() -> Result<()> {
     assert!(steps.iter().any(|s| s.name == "mul"));
 
     // retrieve_workflow returns a handle; an unknown id errors.
-    let mut again: durust::WorkflowHandle<i64> = client.retrieve_workflow("job-1").await?;
-    assert_eq!(again.get_result().await?, 42);
+    let again: durust::WorkflowHandle<i64> = client.retrieve_workflow("job-1").await?;
+    assert_eq!(again.result().await?, 42);
     assert!(client.retrieve_workflow::<i64>("nope").await.is_err());
 
     engine.shutdown(Duration::from_secs(1)).await?;
@@ -79,13 +75,13 @@ async fn client_sends_messages_and_reads_events() -> Result<()> {
         workflow_id: Some("waiter-1".to_string()),
         ..Default::default()
     };
-    let mut handle = client.enqueue::<_, String>("q", "waiter", (), opts).await?;
+    let handle = client.enqueue::<_, String>("q", "waiter", (), opts).await?;
 
     // Deliver the message the workflow is waiting for.
     client
         .send("waiter-1", "hello".to_string(), "topic")
         .await?;
-    assert_eq!(handle.get_result().await?, "hello");
+    assert_eq!(handle.result().await?, "hello");
 
     // The event the workflow set is now readable.
     let event: Option<String> = client
@@ -259,8 +255,8 @@ async fn client_reads_a_stream() -> Result<()> {
         workflow_id: Some("p1".to_string()),
         ..Default::default()
     };
-    let mut handle = client.enqueue::<_, ()>("q", "producer", (), opts).await?;
-    handle.get_result().await?;
+    let handle = client.enqueue::<_, ()>("q", "producer", (), opts).await?;
+    handle.result().await?;
 
     let (values, closed) = client.read_stream::<i64>("p1", "s").await?;
     assert_eq!(values, vec![1, 2]);
@@ -438,8 +434,8 @@ async fn client_resumes_a_cancelled_workflow() -> Result<()> {
     client.cancel_workflow("w").await?;
 
     // Resume from the client → the engine's internal dispatcher re-runs it.
-    let mut h: WorkflowHandle<i64> = client.resume_workflow("w").await?;
-    assert_eq!(h.get_result().await?, 2);
+    let h: WorkflowHandle<i64> = client.resume_workflow("w").await?;
+    assert_eq!(h.result().await?, 2);
     assert_eq!(
         S1.load(Ordering::SeqCst),
         1,
@@ -448,8 +444,8 @@ async fn client_resumes_a_cancelled_workflow() -> Result<()> {
 
     // Resuming a completed workflow is a no-op: nothing re-runs, the handle
     // reads the recorded outcome.
-    let mut done: WorkflowHandle<i64> = client.resume_workflow("w").await?;
-    assert_eq!(done.get_result().await?, 2);
+    let done: WorkflowHandle<i64> = client.resume_workflow("w").await?;
+    assert_eq!(done.result().await?, 2);
     assert_eq!(S1.load(Ordering::SeqCst), 1, "no step re-ran on the no-op");
 
     engine.shutdown(Duration::from_secs(1)).await?;
@@ -498,8 +494,8 @@ async fn client_resume_runs_via_internal_queue_not_own_queue() -> Result<()> {
     // Cancel then resume: re-queued onto the internal queue, it runs — it would
     // hang here if resume put it back on the un-listened "orders" queue.
     client.cancel_workflow("j1").await?;
-    let mut h: WorkflowHandle<()> = client.resume_workflow("j1").await?;
-    h.get_result().await?;
+    let h: WorkflowHandle<()> = client.resume_workflow("j1").await?;
+    h.result().await?;
     assert_eq!(
         RAN.load(Ordering::SeqCst),
         1,
@@ -537,16 +533,16 @@ async fn client_forks_a_workflow() -> Result<()> {
     let _: i64 = engine
         .run_workflow::<_, i64>("pipeline", (), WorkflowOptions::with_id("orig"))
         .await?
-        .get_result()
+        .result()
         .await?;
     assert_eq!(SECOND.load(Ordering::SeqCst), 1);
 
     // Client forks from step 1: step 0 reused, step 1 re-executes on the engine.
     let client = Client::new(provider.clone());
-    let mut forked: WorkflowHandle<i64> = client
+    let forked: WorkflowHandle<i64> = client
         .fork_workflow("orig", 1, WorkflowOptions::with_id("forked"))
         .await?;
-    assert_eq!(forked.get_result().await?, 15);
+    assert_eq!(forked.result().await?, 15);
     assert_eq!(SECOND.load(Ordering::SeqCst), 2, "fork re-ran step 1");
 
     engine.shutdown(Duration::from_secs(1)).await?;
@@ -582,13 +578,13 @@ async fn client_triggers_a_schedule_run_on_an_engine() -> Result<()> {
         .create_schedule("yearly", "tick_job", "0 0 0 1 1 *", ScheduleOptions::new())
         .await?;
 
-    let mut h: WorkflowHandle<String> = client.trigger_schedule("yearly").await?;
+    let h: WorkflowHandle<String> = client.trigger_schedule("yearly").await?;
     let id = h.id().to_string();
     assert!(
         id.starts_with("sched-yearly-trigger-"),
         "distinct trigger id, not a regular tick"
     );
-    let out = h.get_result().await?;
+    let out = h.result().await?;
     assert_eq!(
         out,
         id.strip_prefix("sched-yearly-trigger-").unwrap(),
@@ -830,8 +826,8 @@ async fn client_resume_missing_and_completed() -> Result<()> {
     };
     assert_eq!(err.code(), ErrorCode::NonExistentWorkflow);
 
-    let mut done = client.resume_workflow::<i64>("wf-one").await?;
-    assert_eq!(done.get_result().await?, 1, "completed resume is a no-op");
+    let done = client.resume_workflow::<i64>("wf-one").await?;
+    assert_eq!(done.result().await?, 1, "completed resume is a no-op");
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
@@ -901,8 +897,8 @@ async fn client_delayed_cancel_then_resume_bypasses_delay() -> Result<()> {
     client.cancel_workflow("late-1").await?;
 
     let started = std::time::Instant::now();
-    let mut h = client.resume_workflow::<i64>("late-1").await?;
-    assert_eq!(h.get_result().await?, 42);
+    let h = client.resume_workflow::<i64>("late-1").await?;
+    assert_eq!(h.result().await?, 42);
     assert!(
         started.elapsed() < Duration::from_secs(30),
         "the resumed run must not wait out the original 1h delay"

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// `run_workflow` returns a handle immediately while the workflow is still
-/// running; `get_result` then yields the eventual output.
+/// running; `result` then yields the eventual output.
 #[tokio::test]
 async fn run_workflow_is_non_blocking() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
@@ -25,7 +25,7 @@ async fn run_workflow_is_non_blocking() -> Result<()> {
         .await
     });
 
-    let mut handle = engine
+    let handle = engine
         .run_workflow::<_, i64>("slow", (), WorkflowOptions::with_id("wf-slow"))
         .await?;
 
@@ -35,7 +35,7 @@ async fn run_workflow_is_non_blocking() -> Result<()> {
     assert_eq!(handle.id(), "wf-slow");
 
     // Awaiting the handle yields the result and the row becomes terminal.
-    let out = handle.get_result().await?;
+    let out = handle.result().await?;
     assert_eq!(out, 42);
     assert_eq!(handle.get_status().await?.status, STATUS_SUCCESS);
     Ok(())
@@ -156,16 +156,16 @@ async fn launch_and_shutdown_drain() -> Result<()> {
     });
 
     engine.launch().await?;
-    let mut handle = engine
+    let handle = engine
         .run_workflow::<_, i64>("quick", 1_i64, WorkflowOptions::default())
         .await?;
-    let out = handle.get_result().await?;
+    let out = handle.result().await?;
     assert_eq!(out, 2);
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
 
-/// A workflow that runs past its timeout is cancelled: get_result fails and the
+/// A workflow that runs past its timeout is cancelled: result fails and the
 /// status row is CANCELLED with a deadline-exceeded reason.
 #[tokio::test]
 async fn workflow_timeout_cancels() -> Result<()> {
@@ -180,10 +180,10 @@ async fn workflow_timeout_cancels() -> Result<()> {
 
     let mut opts = WorkflowOptions::with_id("wf-timeout");
     opts.timeout = Some(Duration::from_millis(80));
-    let mut handle = engine.run_workflow::<_, i64>("slow", (), opts).await?;
+    let handle = engine.run_workflow::<_, i64>("slow", (), opts).await?;
 
     assert!(
-        handle.get_result().await.is_err(),
+        handle.result().await.is_err(),
         "a workflow exceeding its timeout must not succeed"
     );
     assert_eq!(handle.get_status().await?.status, STATUS_CANCELLED);

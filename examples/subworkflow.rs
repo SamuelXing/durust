@@ -46,8 +46,8 @@ async fn map_reduce(ctx: DurableContext, data: Vec<i64>) -> Result<i64> {
 
     // Reduce: await each child's partial sum.
     let mut total = 0;
-    for mut child in children {
-        total += child.get_result().await?;
+    for child in children {
+        total += child.result().await?;
     }
     Ok(total)
 }

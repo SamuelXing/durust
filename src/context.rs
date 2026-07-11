@@ -267,7 +267,7 @@ impl DurableContext {
     }
 
     /// Start a **child workflow** from within this workflow and return a handle
-    /// to it. Await its result with [`WorkflowHandle::get_result`].
+    /// to it. Await its result with [`WorkflowHandle::result`].
     ///
     /// The child runs durably and independently of the parent. It is keyed to
     /// this call's step position: unless `opts.workflow_id` is set, it gets the

@@ -86,7 +86,7 @@ pub enum Error {
     #[error("workflow name `{0}` is registered more than once")]
     ConflictingRegistration(String),
 
-    /// A blocking operation (recv/get_event/get_result) or a workflow deadline
+    /// A blocking operation (recv/get_event/result) or a workflow deadline
     /// elapsed before completion.
     #[error("operation timed out")]
     Timeout,

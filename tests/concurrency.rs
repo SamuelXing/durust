@@ -105,7 +105,7 @@ async fn select_with_no_branches_errors() -> Result<()> {
     let res = engine
         .run_workflow::<_, (usize, i64)>("empty", (), WorkflowOptions::with_id("e"))
         .await?
-        .get_result()
+        .result()
         .await;
     assert!(res.is_err(), "select with no branches must fail");
     Ok(())

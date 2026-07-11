@@ -44,17 +44,17 @@ async fn pg_serialization_cross_format() -> Result<()> {
         let out: String = engine
             .run_workflow::<_, String>("greet", "ada".to_string(), WorkflowOptions::with_id(&id))
             .await?
-            .get_result()
+            .result()
             .await?;
         assert_eq!(out, "hi ada");
     }
     {
         let engine = engine_with(&url, Serializer::Json).await?;
-        let mut handle = engine.retrieve_workflow::<String>(&id).await?;
+        let handle = engine.retrieve_workflow::<String>(&id).await?;
         let status = handle.get_status().await?;
         assert_eq!(status.input, serde_json::json!("ada"));
         assert_eq!(status.output, Some(serde_json::json!("hi ada")));
-        assert_eq!(handle.get_result().await?, "hi ada");
+        assert_eq!(handle.result().await?, "hi ada");
     }
     Ok(())
 }
@@ -80,7 +80,7 @@ async fn pg_portable_error_envelope_round_trip() -> Result<()> {
             let outcome = engine
                 .run_workflow::<_, ()>("boom", (), WorkflowOptions::with_id(&id))
                 .await?
-                .get_result()
+                .result()
                 .await;
             assert!(outcome.is_err());
             let handle = engine.retrieve_workflow::<()>(&id).await?;
@@ -111,7 +111,7 @@ async fn pg_portable_error_envelope_round_trip() -> Result<()> {
     assert!(default.error_info.is_none());
 
     // A typed Error::Portable keeps its own name/code through storage, and a
-    // separate reader reconstructs it from get_result.
+    // separate reader reconstructs it from result.
     let typed_id = format!("wf-errt-{}", uuid::Uuid::new_v4());
     {
         let provider = PostgresProvider::connect(&url)
@@ -129,7 +129,7 @@ async fn pg_portable_error_envelope_round_trip() -> Result<()> {
         let _ = engine
             .run_workflow::<_, ()>("validate", (), WorkflowOptions::with_id(&typed_id))
             .await?
-            .get_result()
+            .result()
             .await;
     }
     {
@@ -137,7 +137,7 @@ async fn pg_portable_error_envelope_round_trip() -> Result<()> {
             .await?
             .with_serializer(Serializer::Portable);
         let engine = DurableEngine::new(Arc::new(provider)).await?;
-        let mut handle = engine.retrieve_workflow::<()>(&typed_id).await?;
+        let handle = engine.retrieve_workflow::<()>(&typed_id).await?;
         let info = handle
             .get_status()
             .await?
@@ -146,7 +146,7 @@ async fn pg_portable_error_envelope_round_trip() -> Result<()> {
         assert_eq!(info.name, "ValidationError");
         assert_eq!(info.code, Some(serde_json::json!(400)));
         assert!(
-            matches!(handle.get_result().await, Err(Error::Portable(pe)) if pe.name == "ValidationError")
+            matches!(handle.result().await, Err(Error::Portable(pe)) if pe.name == "ValidationError")
         );
     }
 
@@ -236,8 +236,8 @@ async fn pg_auth_context_round_trip() -> Result<()> {
         .authenticated_user("alice")
         .assumed_role("admin")
         .authenticated_roles(["admin", "user"]);
-    let mut handle = engine.run_workflow::<_, String>("whoami", (), opts).await?;
-    assert_eq!(handle.get_result().await?, "alice/admin/admin,user");
+    let handle = engine.run_workflow::<_, String>("whoami", (), opts).await?;
+    assert_eq!(handle.result().await?, "alice/admin/admin,user");
 
     let status = handle.get_status().await?;
     assert_eq!(status.authenticated_user.as_deref(), Some("alice"));
@@ -272,18 +272,18 @@ async fn pg_child_workflow() -> Result<()> {
         Ok::<_, Error>(format!("{n}:{}", ctx.authenticated_user().unwrap_or("-")))
     });
     engine.register("parent", |ctx: DurableContext, n: i64| async move {
-        let mut child = ctx
+        let child = ctx
             .start_workflow::<_, String>("child", n, WorkflowOptions::default())
             .await?;
-        child.get_result().await
+        child.result().await
     });
 
     let parent_id = format!("parent-{tag}");
     let opts = WorkflowOptions::with_id(&parent_id).authenticated_user("alice");
-    let mut handle = engine
+    let handle = engine
         .run_workflow::<_, String>("parent", 5_i64, opts)
         .await?;
-    assert_eq!(handle.get_result().await?, "5:alice");
+    assert_eq!(handle.result().await?, "5:alice");
 
     let child = engine
         .retrieve_workflow::<String>(&format!("{parent_id}-0"))
@@ -317,17 +317,17 @@ async fn pg_workflow_steps() -> Result<()> {
         let v = ctx
             .step("compute", || async { Ok::<_, Error>(42_i64) })
             .await?;
-        let mut child = ctx
+        let child = ctx
             .start_workflow::<_, i64>("kid", v, WorkflowOptions::default())
             .await?;
-        child.get_result().await
+        child.result().await
     });
 
     let id = format!("steps-{tag}");
     let _: i64 = engine
         .run_workflow::<_, i64>("worker", (), WorkflowOptions::with_id(&id))
         .await?
-        .get_result()
+        .result()
         .await?;
 
     let steps = engine.get_workflow_steps(&id).await?;
@@ -365,7 +365,7 @@ async fn pg_patch() -> Result<()> {
     let patched: bool = engine
         .run_workflow::<_, bool>("wf", (), WorkflowOptions::with_id(&fresh))
         .await?
-        .get_result()
+        .result()
         .await?;
     assert!(patched);
     let steps = engine.get_workflow_steps(&fresh).await?;
@@ -390,7 +390,7 @@ async fn pg_patch() -> Result<()> {
     let patched: bool = engine
         .run_workflow::<_, bool>("wf", (), WorkflowOptions::with_id(&old))
         .await?
-        .get_result()
+        .result()
         .await?;
     assert!(!patched, "a pre-patch workflow stays on the old path");
 
@@ -424,7 +424,7 @@ async fn pg_select() -> Result<()> {
     let (index, value): (usize, i64) = engine
         .run_workflow::<_, (usize, i64)>("racer", (), WorkflowOptions::with_id(&id))
         .await?
-        .get_result()
+        .result()
         .await?;
     assert_eq!((index, value), (0, 7));
 
@@ -460,7 +460,7 @@ async fn pg_stream_round_trip() -> Result<()> {
     engine
         .run_workflow::<_, ()>("producer", (), WorkflowOptions::with_id(&id))
         .await?
-        .get_result()
+        .result()
         .await?;
 
     let (values, closed): (Vec<i64>, bool) = engine.read_stream(&id, "nums").await?;
@@ -564,8 +564,8 @@ async fn pg_global_concurrency_caps_running() -> Result<()> {
                 .await?,
         );
     }
-    for mut h in handles {
-        h.get_result().await?;
+    for h in handles {
+        h.result().await?;
     }
     assert_eq!(
         PEAK.load(Ordering::SeqCst),
@@ -640,8 +640,8 @@ async fn pg_bulk_ops() -> Result<()> {
         .resume_workflows::<()>(&[id("wf-1"), id("wf-2")])
         .await?;
     assert_eq!(handles.len(), 2);
-    for mut h in handles {
-        h.get_result().await?;
+    for h in handles {
+        h.result().await?;
     }
     assert_eq!(
         provider
@@ -695,7 +695,7 @@ async fn pg_partitioned_queue_dispatch() -> Result<()> {
 
     let east = format!("east-{tag}");
     let west = format!("west-{tag}");
-    let mut a = engine
+    let a = engine
         .enqueue::<_, i64>(
             "pq",
             "echo",
@@ -703,7 +703,7 @@ async fn pg_partitioned_queue_dispatch() -> Result<()> {
             WorkflowOptions::with_id(&east).partition_key("east"),
         )
         .await?;
-    let mut b = engine
+    let b = engine
         .enqueue::<_, i64>(
             "pq",
             "echo",
@@ -711,8 +711,8 @@ async fn pg_partitioned_queue_dispatch() -> Result<()> {
             WorkflowOptions::with_id(&west).partition_key("west"),
         )
         .await?;
-    assert_eq!(a.get_result().await?, 1);
-    assert_eq!(b.get_result().await?, 2);
+    assert_eq!(a.result().await?, 1);
+    assert_eq!(b.result().await?, 2);
     assert_eq!(
         a.get_status().await?.queue_partition_key.as_deref(),
         Some("east")
@@ -746,7 +746,7 @@ async fn pg_set_workflow_delay() -> Result<()> {
 
     let mut opts = WorkflowOptions::with_id(&wid);
     opts.delay = Some(Duration::from_secs(60));
-    let mut handle = engine.enqueue::<_, i64>("dq", "echo", 8_i64, opts).await?;
+    let handle = engine.enqueue::<_, i64>("dq", "echo", 8_i64, opts).await?;
     assert_eq!(handle.get_status().await?.status, STATUS_DELAYED);
 
     let started = std::time::Instant::now();
@@ -755,7 +755,7 @@ async fn pg_set_workflow_delay() -> Result<()> {
             .set_workflow_delay(&wid, Duration::from_millis(20))
             .await?
     );
-    assert_eq!(handle.get_result().await?, 8);
+    assert_eq!(handle.result().await?, 8);
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "must run on the shortened delay, not the original 60s"
@@ -784,10 +784,10 @@ async fn pg_list_filters_extended() -> Result<()> {
         Ok::<_, Error>(n * 10)
     });
     engine.register("parent", |ctx: DurableContext, _: ()| async move {
-        let mut h = ctx
+        let h = ctx
             .start_workflow::<i64, i64>("child", 5_i64, WorkflowOptions::default())
             .await?;
-        h.get_result().await
+        h.result().await
     });
     let pid = format!("parent-{tag}");
     let out: i64 = engine.start_typed("parent", &pid, ()).await?;
@@ -1066,9 +1066,9 @@ async fn pg_schedule_backfill_apply_trigger() -> Result<()> {
     assert_eq!(engine.list_workflows(&filter).await?.len(), 3);
 
     // Trigger runs once now, under a distinct -trigger- id.
-    let mut handle: WorkflowHandle<()> = engine.trigger_schedule(&name).await?;
+    let handle: WorkflowHandle<()> = engine.trigger_schedule(&name).await?;
     assert!(handle.id().starts_with(&format!("sched-{name}-trigger-")));
-    handle.get_result().await?;
+    handle.result().await?;
 
     engine.delete_schedule(&name).await?;
     Ok(())
@@ -1177,13 +1177,13 @@ async fn pg_client_enqueues_work_an_engine_runs() -> Result<()> {
         workflow_id: Some(job.clone()),
         ..Default::default()
     };
-    let mut handle = client.enqueue::<_, i64>(&queue, &wf, 21i64, opts).await?;
-    assert_eq!(handle.get_result().await?, 42);
+    let handle = client.enqueue::<_, i64>(&queue, &wf, 21i64, opts).await?;
+    assert_eq!(handle.result().await?, 42);
 
     let steps = client.get_workflow_steps(&job).await?;
     assert!(steps.iter().any(|s| s.name == "mul"));
-    let mut again: WorkflowHandle<i64> = client.retrieve_workflow(&job).await?;
-    assert_eq!(again.get_result().await?, 42);
+    let again: WorkflowHandle<i64> = client.retrieve_workflow(&job).await?;
+    assert_eq!(again.result().await?, 42);
 
     engine.shutdown(Duration::from_secs(2)).await?;
     Ok(())
@@ -1229,14 +1229,14 @@ async fn pg_client_debounces() -> Result<()> {
         .debounce(&key, delay, "b".to_string())
         .await?;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let mut h3: WorkflowHandle<String> = client
+    let h3: WorkflowHandle<String> = client
         .debouncer(&wf)
         .debounce(&key, delay, "c".to_string())
         .await?;
 
     assert_eq!(h1.id(), h2.id());
     assert_eq!(h2.id(), h3.id());
-    let out = h3.get_result().await?;
+    let out = h3.result().await?;
     assert_eq!(out, "c", "the debounced run used the latest input");
 
     engine.shutdown(Duration::from_secs(2)).await?;
@@ -1372,7 +1372,7 @@ async fn pg_config_name_routes_on_queue_dispatch() -> Result<()> {
     );
     engine.launch().await?;
 
-    let mut fr = engine
+    let fr = engine
         .enqueue::<_, String>(
             &queue,
             &wf,
@@ -1382,7 +1382,7 @@ async fn pg_config_name_routes_on_queue_dispatch() -> Result<()> {
                 .class_name("Greeter"),
         )
         .await?;
-    let mut en = engine
+    let en = engine
         .enqueue::<_, String>(
             &queue,
             &wf,
@@ -1390,8 +1390,8 @@ async fn pg_config_name_routes_on_queue_dispatch() -> Result<()> {
             WorkflowOptions::with_id(&id_en).config_name("en"),
         )
         .await?;
-    assert_eq!(fr.get_result().await?, "Bonjour, Sam");
-    assert_eq!(en.get_result().await?, "Hello, Sam");
+    assert_eq!(fr.result().await?, "Bonjour, Sam");
+    assert_eq!(en.result().await?, "Hello, Sam");
 
     let status = engine
         .retrieve_workflow::<String>(&id_fr)
@@ -1429,7 +1429,7 @@ async fn pg_client_manages_workflows() -> Result<()> {
     let client = durust::Client::new(provider.clone());
 
     // Enqueue far in the future, then pull it in: the engine runs it.
-    let mut run = client
+    let run = client
         .enqueue::<_, ()>(
             &queue,
             &wf,
@@ -1446,7 +1446,7 @@ async fn pg_client_manages_workflows() -> Result<()> {
             .set_workflow_delay(&run_id, Duration::from_millis(10))
             .await?
     );
-    run.get_result().await?;
+    run.result().await?;
 
     // Enqueue another, cancel it, then delete it.
     client
@@ -1620,7 +1620,7 @@ async fn pg_portable_input_envelope() -> Result<()> {
     let out: String = engine
         .run_workflow::<_, String>("greet", "ada".to_string(), WorkflowOptions::with_id(&id))
         .await?
-        .get_result()
+        .result()
         .await?;
     assert_eq!(out, "hi ada");
 
@@ -2341,7 +2341,7 @@ async fn pg_custom_schema_isolates_tenants() -> Result<()> {
     let out: i64 = engine_a
         .run_workflow::<_, i64>("hello", 21_i64, WorkflowOptions::with_id(&id))
         .await?
-        .get_result()
+        .result()
         .await?;
     assert_eq!(out, 42);
 
@@ -2412,7 +2412,7 @@ async fn pg_export_import_round_trip() -> Result<()> {
     let out: i64 = engine
         .run_workflow::<_, i64>("expo", 21_i64, WorkflowOptions::with_id(&id))
         .await?
-        .get_result()
+        .result()
         .await?;
     assert_eq!(out, 42);
 
@@ -2485,7 +2485,7 @@ async fn pg_recv_wakes_via_listen_notify() -> Result<()> {
         Ok::<_, Error>(msg.unwrap_or_default())
     });
 
-    let mut handle = engine
+    let handle = engine
         .run_workflow::<_, String>("waiter", (), WorkflowOptions::with_id(&id))
         .await?;
     // Let the workflow reach recv and subscribe to the channel.
@@ -2493,7 +2493,7 @@ async fn pg_recv_wakes_via_listen_notify() -> Result<()> {
 
     let started = std::time::Instant::now();
     engine.send(&id, "hello".to_string(), "topic").await?;
-    assert_eq!(handle.get_result().await?, "hello");
+    assert_eq!(handle.result().await?, "hello");
     let elapsed = started.elapsed();
     assert!(
         elapsed < Duration::from_secs(2),
@@ -2527,7 +2527,7 @@ async fn pg_send_with_idempotency_key_delivers_once() -> Result<()> {
     engine
         .run_workflow::<_, ()>("sink", (), WorkflowOptions::with_id(&id))
         .await?
-        .get_result()
+        .result()
         .await?;
 
     engine
@@ -2579,7 +2579,7 @@ async fn pg_get_event_wakes_via_listen_notify() -> Result<()> {
         Ok::<_, Error>(String::new())
     });
 
-    let mut reader = engine
+    let reader = engine
         .run_workflow::<_, String>(
             "reader",
             setter_id.clone(),
@@ -2593,9 +2593,9 @@ async fn pg_get_event_wakes_via_listen_notify() -> Result<()> {
     engine
         .run_workflow::<_, String>("setter", (), WorkflowOptions::with_id(&setter_id))
         .await?
-        .get_result()
+        .result()
         .await?;
-    assert_eq!(reader.get_result().await?, "v");
+    assert_eq!(reader.result().await?, "v");
     let elapsed = started.elapsed();
     assert!(
         elapsed < Duration::from_secs(2),
@@ -2640,7 +2640,7 @@ async fn pg_list_filters_multi_value() -> Result<()> {
             WorkflowOptions::with_id(&a_id).authenticated_user("alice"),
         )
         .await?
-        .get_result()
+        .result()
         .await?;
     engine
         .run_workflow::<_, i64>(
@@ -2649,7 +2649,7 @@ async fn pg_list_filters_multi_value() -> Result<()> {
             WorkflowOptions::with_id(&b_id).authenticated_user("bob"),
         )
         .await?
-        .get_result()
+        .result()
         .await?;
     engine
         .run_workflow::<_, i64>(
@@ -2658,7 +2658,7 @@ async fn pg_list_filters_multi_value() -> Result<()> {
             WorkflowOptions::with_id(&c_id).authenticated_user("carol"),
         )
         .await?
-        .get_result()
+        .result()
         .await?;
 
     // OR across names (mvf_a, mvf_b) scoped to this run's ids.
@@ -2757,7 +2757,7 @@ async fn pg_was_forked_from_survives_import() -> Result<()> {
     engine
         .run_workflow::<_, i64>("wff", 1i64, WorkflowOptions::with_id(&src))
         .await?
-        .get_result()
+        .result()
         .await?;
     // fork_workflow stamps the source and creates the fork row synchronously.
     engine
@@ -2839,8 +2839,8 @@ async fn pg_fork_routes_to_named_queue() -> Result<()> {
     let fork_id = format!("fork-new-{tag}");
     let mut opts = WorkflowOptions::with_id(&fork_id);
     opts.queue = Some(queue.clone());
-    let mut forked = engine.fork_workflow::<i64>(&orig_id, 0, opts).await?;
-    assert_eq!(forked.get_result().await?, 42);
+    let forked = engine.fork_workflow::<i64>(&orig_id, 0, opts).await?;
+    assert_eq!(forked.result().await?, 42);
     let row = provider.get_workflow_status(&fork_id).await?.unwrap();
     assert_eq!(row.queue_name.as_deref(), Some(queue.as_str()));
     assert_eq!(row.app_version, engine.app_version());
@@ -2849,10 +2849,10 @@ async fn pg_fork_routes_to_named_queue() -> Result<()> {
     // so its dispatcher claims and completes the fork.
     let client_fork_id = format!("fork-client-{tag}");
     let client = Client::new(provider.clone());
-    let mut cf: WorkflowHandle<i64> = client
+    let cf: WorkflowHandle<i64> = client
         .fork_workflow(&orig_id, 0, WorkflowOptions::with_id(&client_fork_id))
         .await?;
-    assert_eq!(cf.get_result().await?, 42);
+    assert_eq!(cf.result().await?, 42);
     let crow = provider
         .get_workflow_status(&client_fork_id)
         .await?
@@ -2904,8 +2904,8 @@ async fn pg_renamed_step_fails_as_unexpected_step() -> Result<()> {
         .record_step_result(&id, 0, "first", serde_json::json!(1), None, None)
         .await?;
 
-    let mut h = engine.resume_workflow::<i64>(&id).await?;
-    let err = h.get_result().await.expect_err("replay must fail");
+    let h = engine.resume_workflow::<i64>(&id).await?;
+    let err = h.result().await.expect_err("replay must fail");
     let msg = err.to_string();
     assert!(
         msg.contains("non-deterministic") && msg.contains("renamed") && msg.contains("first"),
@@ -2951,8 +2951,8 @@ async fn pg_resume_routes_to_named_queue() -> Result<()> {
         .await?;
     engine.cancel_workflow(&id).await?;
 
-    let mut h = engine.resume_workflow_on::<i64>(&id, &queue).await?;
-    assert_eq!(h.get_result().await?, 42);
+    let h = engine.resume_workflow_on::<i64>(&id, &queue).await?;
+    assert_eq!(h.result().await?, 42);
     let row = provider.get_workflow_status(&id).await?.unwrap();
     assert_eq!(row.queue_name.as_deref(), Some(queue.as_str()));
     engine.shutdown(Duration::from_secs(2)).await?;
