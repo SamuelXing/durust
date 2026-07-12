@@ -81,7 +81,7 @@ never charged twice.
   workflows; per-workflow timeouts; `ctx.patch` for changing workflow code
   while old runs are still in flight; debouncing for coalescing bursts.
 - **Operations.** An admin HTTP server with the standard DBOS endpoints, and a
-  client for DBOS Conductor.
+  client for DBOS Conductor (behind the `conductor` feature).
 - **Out-of-process producers.** A registry-free `Client` for services that
   submit and observe workflows but run none of them.
 
@@ -89,7 +89,7 @@ never charged twice.
 
 ```toml
 [dependencies]
-durare = "0.1"
+durare = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -116,6 +116,19 @@ createdb app
 export DATABASE_URL=postgres://localhost:5432/app
 FAILPOINTS=after_charge=return cargo run --example order   # charges, then crashes
 cargo run --example order                                  # resumes; does not re-charge
+```
+
+## Cargo features
+
+The quick start needs no features — the in-memory, Postgres, and SQLite backends
+are all built in. One optional component sits behind a flag:
+
+| Feature | Default | Enables |
+| --- | --- | --- |
+| `conductor` | off | The DBOS Conductor client (`Conductor`, `ConductorConfig`, `AlertHandler`) — a websocket client for the DBOS control plane. Opt-in because it pulls in a TLS websocket stack and gzip framing. |
+
+```toml
+durare = { version = "0.2", features = ["conductor"] }
 ```
 
 ## How it works

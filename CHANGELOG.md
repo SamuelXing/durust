@@ -14,6 +14,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `tokio-tungstenite` (TLS websocket) and `flate2` (gzip) dependencies out of
   builds that never talk to the DBOS control plane.
 
+### Documentation
+
+- Added a "Cargo features" section to the crate docs and the README documenting
+  the opt-in `conductor` feature, and corrected the README quick-start dependency
+  to `durare = "0.2"` (a `"0.1"` requirement does not resolve to 0.2.x).
+
 ## [0.2.0] - 2026-07-11
 
 This release proves durare's on-the-wire compatibility with the other DBOS
