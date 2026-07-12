@@ -1,3 +1,4 @@
+#![cfg(feature = "sqlite")]
 //! Serialization-format parity: values written under one format are decoded
 //! correctly by a provider configured for another (dispatch-on-read), which is
 //! the basis for cross-language interop via `portable_json`.

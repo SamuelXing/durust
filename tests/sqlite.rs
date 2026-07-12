@@ -1,3 +1,4 @@
+#![cfg(feature = "sqlite")]
 //! SQLite backend tests: durable state and crash-recovery across "restarts"
 //! (separate engine + provider instances over the same database file).
 

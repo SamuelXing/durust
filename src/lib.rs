@@ -107,8 +107,9 @@
 //! - **Management and operations** — list / cancel / resume / fork, timeouts,
 //!   [`Debouncer`], the registry-less [`Client`] for other processes,
 //!   [`AdminServer`], [`Conductor`] (feature `conductor`).
-//! - **Backends** — [`PostgresProvider`], [`SqliteProvider`], and
-//!   [`InMemoryProvider`], all behind the [`StateProvider`] seam.
+//! - **Backends** — [`PostgresProvider`] (feature `postgres`),
+//!   [`SqliteProvider`] (feature `sqlite`), and [`InMemoryProvider`], all behind
+//!   the [`StateProvider`] seam.
 //!
 //! # Guides
 //!
@@ -120,18 +121,32 @@
 //!
 //! # Cargo features
 //!
-//! The examples above need no features — the in-memory, Postgres, and SQLite
-//! backends are all built in. One optional component is behind a feature flag:
+//! Backends are compiled behind features, all on by default; enable just one to
+//! drop the other's driver. **At least one backend is required** — a
+//! zero-backend build is a compile error. [`InMemoryProvider`] is always
+//! available (no feature).
 //!
+//! - **`postgres`** *(default)* — the [`PostgresProvider`] backend.
+//! - **`sqlite`** *(default)* — the [`SqliteProvider`] backend (a bundled C
+//!   library; drop it with `default-features = false, features = ["postgres"]`
+//!   for a pure-Postgres build that needs no C toolchain).
 //! - **`conductor`** *(off by default)* — the DBOS Conductor client
 //!   ([`Conductor`], [`ConductorConfig`], [`AlertHandler`]): a websocket client
-//!   for the DBOS control plane. Opt-in because it pulls in a TLS websocket
-//!   stack and gzip framing. Enable with
-//!   `durare = { version = "0.2", features = ["conductor"] }`.
+//!   for the DBOS control plane, behind a feature because it pulls in a TLS
+//!   websocket stack and gzip framing.
 // Render `#[doc(cfg(...))]` "available on feature X" banners on docs.rs (which
 // builds with `--cfg docsrs`, see Cargo.toml). Inert on stable and CI builds.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
+
+// A SQL backend is required: the transaction layer and the error type are built
+// on sqlx driver types that exist only when a backend is compiled. The in-memory
+// backend is always available but isn't enough on its own.
+#[cfg(not(any(feature = "postgres", feature = "sqlite")))]
+compile_error!(
+    "durare needs at least one SQL backend feature: enable `postgres` and/or \
+     `sqlite` (both are on by default)."
+);
 
 // Concept guides — std-style module pages (think `std::pin`) that each explain
 // one subsystem, with tested examples. Implementation lives in the private
@@ -153,11 +168,13 @@ mod engine;
 mod error;
 mod handle;
 mod memory;
+#[cfg(feature = "postgres")]
 mod postgres;
 mod provider;
 mod queue;
 mod schedule;
 mod serialize;
+#[cfg(feature = "sqlite")]
 mod sqlite;
 mod tx;
 
@@ -181,6 +198,8 @@ pub use error::{Error, ErrorCode, Result};
 pub use futures_util::{Stream, StreamExt};
 pub use handle::WorkflowHandle;
 pub use memory::InMemoryProvider;
+#[cfg(feature = "postgres")]
+#[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]
 pub use postgres::PostgresProvider;
 pub use provider::{
     is_terminal, ChangeWait, DequeueRequest, ExportedWorkflow, ForkParams, ListFilter,
@@ -196,8 +215,10 @@ pub use schedule::{
 pub use serialize::{
     PortableWorkflowArgs, PortableWorkflowError, Serializer, SerializerCodec, PORTABLE_ERROR_NAME,
 };
+#[cfg(feature = "sqlite")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sqlite")))]
 pub use sqlite::SqliteProvider;
-pub use tx::{IsolationLevel, Param, Row, TransactionOptions, Tx, TxBody};
+pub use tx::{IsolationLevel, Param, Row, RowValue, TransactionOptions, Tx, TxBody};
 
 /// The `#[workflow]` attribute macro. Annotate an
 /// `async fn(DurableContext, Input) -> Result<Output>` to have it

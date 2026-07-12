@@ -1,3 +1,4 @@
+#![cfg(all(feature = "postgres", feature = "sqlite"))]
 //! End-to-end cross-SDK conformance: durare runs a workflow another SDK wrote.
 //!
 //! Mirrors `dbos-transact-py`'s `test_interop_direct_insert` (and Go's

@@ -708,20 +708,33 @@ impl DurableEngine {
     /// # Ok(()) }
     /// ```
     pub async fn connect(url: &str) -> Result<DurableEngineBuilder> {
-        let provider: Arc<dyn StateProvider> =
-            if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-                Arc::new(crate::PostgresProvider::connect(url).await?)
-            } else if url.starts_with("sqlite:") {
-                Arc::new(crate::SqliteProvider::connect(url).await?)
-            } else if url == "memory:" || url == "memory://" {
-                Arc::new(crate::InMemoryProvider::new())
-            } else {
-                return Err(crate::error::Error::app(format!(
-                    "unrecognized state-backend URL scheme in `{url}` \
-                 (expected postgres://, sqlite://, or memory:)"
-                )));
-            };
-        Ok(Self::builder(provider))
+        if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+            #[cfg(feature = "postgres")]
+            return Ok(Self::builder(Arc::new(
+                crate::PostgresProvider::connect(url).await?,
+            )));
+            #[cfg(not(feature = "postgres"))]
+            return Err(crate::error::Error::app(format!(
+                "`{url}` is a Postgres URL but the `postgres` feature is not enabled"
+            )));
+        }
+        if url.starts_with("sqlite:") {
+            #[cfg(feature = "sqlite")]
+            return Ok(Self::builder(Arc::new(
+                crate::SqliteProvider::connect(url).await?,
+            )));
+            #[cfg(not(feature = "sqlite"))]
+            return Err(crate::error::Error::app(format!(
+                "`{url}` is a SQLite URL but the `sqlite` feature is not enabled"
+            )));
+        }
+        if url == "memory:" || url == "memory://" {
+            return Ok(Self::builder(Arc::new(crate::InMemoryProvider::new())));
+        }
+        Err(crate::error::Error::app(format!(
+            "unrecognized state-backend URL scheme in `{url}` \
+             (expected postgres://, sqlite://, or memory:)"
+        )))
     }
 
     /// The shared execution core, built once from the current registrations.

@@ -97,17 +97,21 @@ pub struct Tx<'c> {
 }
 
 enum TxInner<'c> {
+    #[cfg(feature = "postgres")]
     Postgres(&'c mut sqlx::PgConnection),
+    #[cfg(feature = "sqlite")]
     Sqlite(&'c mut sqlx::SqliteConnection),
 }
 
 impl<'c> Tx<'c> {
+    #[cfg(feature = "postgres")]
     pub(crate) fn postgres(conn: &'c mut sqlx::PgConnection) -> Self {
         Tx {
             inner: TxInner::Postgres(conn),
         }
     }
 
+    #[cfg(feature = "sqlite")]
     pub(crate) fn sqlite(conn: &'c mut sqlx::SqliteConnection) -> Self {
         Tx {
             inner: TxInner::Sqlite(conn),
@@ -117,11 +121,13 @@ impl<'c> Tx<'c> {
     /// Run a statement (INSERT/UPDATE/DELETE/DDL); returns rows affected.
     pub async fn execute(&mut self, sql: &str, params: &[Param]) -> Result<u64> {
         match &mut self.inner {
+            #[cfg(feature = "postgres")]
             TxInner::Postgres(conn) => {
                 let sql = to_pg_placeholders(sql);
                 let q = bind_pg(sqlx::query(&sql), params);
                 Ok(q.execute(&mut **conn).await?.rows_affected())
             }
+            #[cfg(feature = "sqlite")]
             TxInner::Sqlite(conn) => {
                 let q = bind_sqlite(sqlx::query(sql), params);
                 Ok(q.execute(&mut **conn).await?.rows_affected())
@@ -132,6 +138,7 @@ impl<'c> Tx<'c> {
     /// Run a query and return every row.
     pub async fn query_all(&mut self, sql: &str, params: &[Param]) -> Result<Vec<Row>> {
         match &mut self.inner {
+            #[cfg(feature = "postgres")]
             TxInner::Postgres(conn) => {
                 let sql = to_pg_placeholders(sql);
                 let q = bind_pg(sqlx::query(&sql), params);
@@ -143,6 +150,7 @@ impl<'c> Tx<'c> {
                     })
                     .collect())
             }
+            #[cfg(feature = "sqlite")]
             TxInner::Sqlite(conn) => {
                 let q = bind_sqlite(sqlx::query(sql), params);
                 let rows = q.fetch_all(&mut **conn).await?;
@@ -159,6 +167,7 @@ impl<'c> Tx<'c> {
     /// Run a query and return the first row, or `None` if it matched nothing.
     pub async fn query_opt(&mut self, sql: &str, params: &[Param]) -> Result<Option<Row>> {
         match &mut self.inner {
+            #[cfg(feature = "postgres")]
             TxInner::Postgres(conn) => {
                 let sql = to_pg_placeholders(sql);
                 let q = bind_pg(sqlx::query(&sql), params);
@@ -166,6 +175,7 @@ impl<'c> Tx<'c> {
                     inner: RowInner::Postgres(r),
                 }))
             }
+            #[cfg(feature = "sqlite")]
             TxInner::Sqlite(conn) => {
                 let q = bind_sqlite(sqlx::query(sql), params);
                 Ok(q.fetch_optional(&mut **conn).await?.map(|r| Row {
@@ -190,23 +200,61 @@ pub struct Row {
 }
 
 enum RowInner {
+    #[cfg(feature = "postgres")]
     Postgres(sqlx::postgres::PgRow),
+    #[cfg(feature = "sqlite")]
     Sqlite(sqlx::sqlite::SqliteRow),
 }
+
+/// A value readable from a transactional-step [`Row`] column, via [`Row::get`]
+/// / [`Row::try_get`].
+///
+/// Blanket-implemented for every type sqlx can decode on the backend(s) you
+/// compiled — you never implement it yourself. Its bounds track the enabled
+/// backend features: with both `postgres` and `sqlite` a value must decode on
+/// both; with a single backend, only that one.
+#[cfg(all(feature = "postgres", feature = "sqlite"))]
+pub trait RowValue<'r>:
+    sqlx::Decode<'r, sqlx::Postgres>
+    + sqlx::Type<sqlx::Postgres>
+    + sqlx::Decode<'r, sqlx::Sqlite>
+    + sqlx::Type<sqlx::Sqlite>
+{
+}
+#[cfg(all(feature = "postgres", feature = "sqlite"))]
+impl<'r, T> RowValue<'r> for T where
+    T: sqlx::Decode<'r, sqlx::Postgres>
+        + sqlx::Type<sqlx::Postgres>
+        + sqlx::Decode<'r, sqlx::Sqlite>
+        + sqlx::Type<sqlx::Sqlite>
+{
+}
+
+/// A value readable from a transactional-step [`Row`] column (Postgres-only build).
+#[cfg(all(feature = "postgres", not(feature = "sqlite")))]
+pub trait RowValue<'r>: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres> {}
+#[cfg(all(feature = "postgres", not(feature = "sqlite")))]
+impl<'r, T> RowValue<'r> for T where T: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>
+{}
+
+/// A value readable from a transactional-step [`Row`] column (SQLite-only build).
+#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+pub trait RowValue<'r>: sqlx::Decode<'r, sqlx::Sqlite> + sqlx::Type<sqlx::Sqlite> {}
+#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+impl<'r, T> RowValue<'r> for T where T: sqlx::Decode<'r, sqlx::Sqlite> + sqlx::Type<sqlx::Sqlite> {}
 
 impl Row {
     /// Read column `col` as `T`, panicking on a decode/missing-column error.
     /// Use [`Row::try_get`] to handle that error instead.
     pub fn get<'r, T>(&'r self, col: &str) -> T
     where
-        T: sqlx::Decode<'r, sqlx::Postgres>
-            + sqlx::Type<sqlx::Postgres>
-            + sqlx::Decode<'r, sqlx::Sqlite>
-            + sqlx::Type<sqlx::Sqlite>,
+        T: RowValue<'r>,
     {
         use sqlx::Row as _;
         match &self.inner {
+            #[cfg(feature = "postgres")]
             RowInner::Postgres(r) => r.get::<T, _>(col),
+            #[cfg(feature = "sqlite")]
             RowInner::Sqlite(r) => r.get::<T, _>(col),
         }
     }
@@ -215,14 +263,13 @@ impl Row {
     /// failure.
     pub fn try_get<'r, T>(&'r self, col: &str) -> Result<T>
     where
-        T: sqlx::Decode<'r, sqlx::Postgres>
-            + sqlx::Type<sqlx::Postgres>
-            + sqlx::Decode<'r, sqlx::Sqlite>
-            + sqlx::Type<sqlx::Sqlite>,
+        T: RowValue<'r>,
     {
         use sqlx::Row as _;
         match &self.inner {
+            #[cfg(feature = "postgres")]
             RowInner::Postgres(r) => Ok(r.try_get::<T, _>(col)?),
+            #[cfg(feature = "sqlite")]
             RowInner::Sqlite(r) => Ok(r.try_get::<T, _>(col)?),
         }
     }
@@ -260,6 +307,7 @@ pub enum IsolationLevel {
 
 impl IsolationLevel {
     /// The `SET TRANSACTION ISOLATION LEVEL` clause for Postgres.
+    #[cfg(feature = "postgres")]
     pub(crate) fn pg_sql(self) -> &'static str {
         match self {
             IsolationLevel::ReadCommitted => "READ COMMITTED",
@@ -398,6 +446,7 @@ impl TransactionOptions {
 
 /// Rewrite `?` placeholders to Postgres `$1, $2, …`, leaving any `?` inside a
 /// single-quoted string literal untouched.
+#[cfg(feature = "postgres")]
 fn to_pg_placeholders(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len() + 8);
     let mut n = 0u32;
@@ -419,6 +468,7 @@ fn to_pg_placeholders(sql: &str) -> String {
     out
 }
 
+#[cfg(feature = "postgres")]
 fn bind_pg<'q>(
     mut q: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
     params: &'q [Param],
@@ -436,6 +486,7 @@ fn bind_pg<'q>(
     q
 }
 
+#[cfg(feature = "sqlite")]
 fn bind_sqlite<'q>(
     mut q: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
     params: &'q [Param],
@@ -457,6 +508,7 @@ fn bind_sqlite<'q>(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn placeholders_rewritten_outside_string_literals() {
         assert_eq!(

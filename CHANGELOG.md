@@ -13,12 +13,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   default. Enable it with `features = ["conductor"]`. This keeps its
   `tokio-tungstenite` (TLS websocket) and `flate2` (gzip) dependencies out of
   builds that never talk to the DBOS control plane.
+- The Postgres and SQLite backends are now cargo features (`postgres`,
+  `sqlite`), both enabled by default. Enable a single backend to drop the
+  other's driver: a Postgres-only build skips SQLite's bundled C library, and a
+  SQLite-only build skips the Postgres network/TLS driver. **At least one backend
+  is required** — a build with neither is a compile error. `InMemoryProvider`
+  stays available in every build.
 
 ### Documentation
 
 - Added a "Cargo features" section to the crate docs and the README documenting
-  the opt-in `conductor` feature, and corrected the README quick-start dependency
-  to `durare = "0.2"` (a `"0.1"` requirement does not resolve to 0.2.x).
+  the `postgres`, `sqlite`, and opt-in `conductor` features, and corrected the
+  README quick-start dependency to `durare = "0.2"` (a `"0.1"` requirement does
+  not resolve to 0.2.x).
 
 ## [0.2.0] - 2026-07-11
 

@@ -1,3 +1,4 @@
+#![cfg(feature = "sqlite")]
 //! Crash-tolerance of the scheduler at the three interesting points in a tick's
 //! life: after it is persisted but before it runs, *during* the run, and after
 //! the run but before the schedule is rescheduled (`last_fired_at`).

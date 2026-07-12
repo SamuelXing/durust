@@ -34,6 +34,17 @@ members = ["durare-macros"]
 resolver = "2"
 
 [features]
+# Backends are on by default. Enable just one to drop the other's driver: a
+# Postgres-only build skips SQLite's bundled C library, and a SQLite-only build
+# skips the Postgres network/TLS driver. At least one backend is required — a
+# zero-backend build is a compile error (the in-memory backend is always
+# available, but the crate needs a SQL connection type to build).
+default = ["postgres", "sqlite"]
+# Postgres backend (`PostgresProvider`): pulls in the sqlx Postgres driver.
+postgres = ["sqlx/postgres"]
+# SQLite backend (`SqliteProvider`): pulls in the sqlx SQLite driver (a bundled
+# C library, so this is the feature to drop when you only use Postgres).
+sqlite = ["sqlx/sqlite"]
 # The DBOS Conductor client (`Conductor`, `ConductorConfig`, `AlertHandler`) — a
 # long-lived websocket client for the cloud control plane — is opt-in. Enable it
 # with `features = ["conductor"]`; it is kept out of the default build so workers
@@ -76,8 +87,12 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 # connection loop (and the sub-tasks later parts will spawn).
 tokio-util = { version = "0.7", default-features = false }
 durare-macros = { path = "durare-macros", version = "0.1" }
-# Postgres backend. If your sqlx version complains about features, see README.
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "json", "chrono", "migrate"] }
+# SQL backends. The driver features (`postgres`, `sqlite`) are pulled in by the
+# crate's own `postgres`/`sqlite` features, not here, so a single-backend build
+# compiles only the driver it uses. The base features (runtime, TLS, JSON,
+# chrono, migrations) are shared. If your sqlx version complains about features,
+# see README.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "macros", "json", "chrono", "migrate"] }
 # Crash-injection hooks (e.g. in the schedule fire loop). Without the
 # `failpoints` feature every `fail_point!` compiles to a no-op, so this is
 # zero-cost in normal builds; tests/examples turn the feature on (below).
@@ -96,6 +111,7 @@ fail = { version = "0.5", features = ["failpoints"] }
 [[example]]
 name = "order"
 path = "examples/order.rs"
+required-features = ["postgres"]
 
 [[example]]
 name = "saga"
@@ -112,6 +128,7 @@ path = "examples/scheduled.rs"
 [[example]]
 name = "transfer"
 path = "examples/transfer.rs"
+required-features = ["sqlite"]
 
 [[example]]
 name = "approval"

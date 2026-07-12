@@ -112,4 +112,10 @@
 pub use crate::{IsolationLevel, Param, Row, TransactionOptions, Tx, TxBody};
 
 #[allow(unused_imports)]
-use crate::{DurableContext, InMemoryProvider, PostgresProvider, SqliteProvider};
+#[cfg(feature = "postgres")]
+use crate::PostgresProvider;
+#[allow(unused_imports)]
+#[cfg(feature = "sqlite")]
+use crate::SqliteProvider;
+#[allow(unused_imports)]
+use crate::{DurableContext, InMemoryProvider};

@@ -120,15 +120,21 @@ cargo run --example order                                  # resumes; does not r
 
 ## Cargo features
 
-The quick start needs no features — the in-memory, Postgres, and SQLite backends
-are all built in. One optional component sits behind a flag:
+Backends are compiled behind features, all on by default; enable just one to
+drop the other's driver. **At least one backend is required** — a build with
+neither is a compile error. `InMemoryProvider` is always available (no feature).
 
 | Feature | Default | Enables |
 | --- | --- | --- |
-| `conductor` | off | The DBOS Conductor client (`Conductor`, `ConductorConfig`, `AlertHandler`) — a websocket client for the DBOS control plane. Opt-in because it pulls in a TLS websocket stack and gzip framing. |
+| `postgres` | ✅ | The `PostgresProvider` backend (sqlx Postgres driver). |
+| `sqlite` | ✅ | The `SqliteProvider` backend (sqlx SQLite driver — a bundled C library). |
+| `conductor` | — | The DBOS Conductor client (`Conductor`, `ConductorConfig`, `AlertHandler`) — a websocket client for the DBOS control plane; pulls in a TLS websocket stack and gzip framing. |
+
+For a Postgres-only build (no SQLite C compile) that also enables the Conductor
+client:
 
 ```toml
-durare = { version = "0.2", features = ["conductor"] }
+durare = { version = "0.2", default-features = false, features = ["postgres", "conductor"] }
 ```
 
 ## How it works
@@ -195,10 +201,12 @@ SELECT workflow_uuid, function_id, function_name, output FROM dbos.operation_out
 | `InMemoryProvider` | tests and examples | no cross-process durability |
 
 All three implement one trait, `StateProvider`, which is also the seam for
-adding further backends. Application tests can run workflows against
-`InMemoryProvider` with no infrastructure at all; the crate's own test suite
-runs against all three backends on every commit, with Postgres against a live
-server in CI.
+adding further backends. `PostgresProvider` and `SqliteProvider` are gated by the
+`postgres` and `sqlite` [Cargo features](#cargo-features) (both on by default);
+`InMemoryProvider` is always available. Application tests can run workflows
+against `InMemoryProvider` with no infrastructure at all; the crate's own test
+suite runs against all three backends on every commit, with Postgres against a
+live server in CI.
 
 ## Minimum supported Rust version
 

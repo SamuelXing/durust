@@ -78,9 +78,11 @@ pub(crate) const STREAM_CLOSED_SENTINEL: &str = "__DBOS_STREAM_CLOSED__";
 /// `LISTEN`/`NOTIFY` channel a new `notifications` row is announced on (the
 /// `dbos_notifications_trigger` payload is `destination_uuid::topic`). Shared
 /// verbatim with the other SDKs and the schema trigger.
+#[cfg(feature = "postgres")]
 pub(crate) const NOTIFICATIONS_CHANNEL: &str = "dbos_notifications_channel";
 /// `LISTEN`/`NOTIFY` channel a new `workflow_events` row is announced on (the
 /// `dbos_workflow_events_trigger` payload is `workflow_uuid::key`).
+#[cfg(feature = "postgres")]
 pub(crate) const WORKFLOW_EVENTS_CHANNEL: &str = "dbos_workflow_events_channel";
 
 /// A condition a blocked `recv`/`get_event` wants to be nudged about, so it can
@@ -107,6 +109,7 @@ pub enum ChangeWait<'a> {
 
 impl ChangeWait<'_> {
     /// The `LISTEN`/`NOTIFY` channel this condition is announced on.
+    #[cfg(feature = "postgres")]
     pub(crate) fn channel(&self) -> &'static str {
         match self {
             ChangeWait::Notification { .. } => NOTIFICATIONS_CHANNEL,
@@ -116,6 +119,7 @@ impl ChangeWait<'_> {
 
     /// The `NOTIFY` payload the schema trigger emits for this condition
     /// (`workflow_uuid::topic` / `workflow_uuid::key`).
+    #[cfg(feature = "postgres")]
     pub(crate) fn payload(&self) -> String {
         match self {
             ChangeWait::Notification { workflow_id, topic } => format!("{workflow_id}::{topic}"),
@@ -1018,6 +1022,7 @@ pub(crate) const EXPORT_STATUS_STR_COLS: &[&str] = &[
 ];
 /// The integer columns of an exported `workflow_status` row (see
 /// [`EXPORT_STATUS_STR_COLS`]).
+#[cfg(feature = "sqlite")]
 pub(crate) const EXPORT_STATUS_INT_COLS: &[&str] = &[
     "created_at",
     "updated_at",

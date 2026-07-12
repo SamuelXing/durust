@@ -1,3 +1,4 @@
+#![cfg(feature = "postgres")]
 //! Postgres backend tests. Skipped unless `DATABASE_URL` points at a reachable
 //! Postgres instance (ideally an empty database — `init` runs the migrations).
 //!

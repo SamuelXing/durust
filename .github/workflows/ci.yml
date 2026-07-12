@@ -105,7 +105,7 @@ jobs:
         run: cargo doc --no-deps --all-features
 
   features:
-    name: no-default-features (conductor off)
+    name: feature matrix (single backend)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -113,7 +113,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # The crate must build and lint cleanly with the conductor feature gated
-      # off, so non-conductor code never leans on a conductor-only symbol or dep.
-      - name: clippy --no-default-features
-        run: cargo clippy --no-default-features --all-targets -- -D warnings
+      # Each backend must build and lint on its own, with the other backend's
+      # driver and the conductor stack all absent. `--lib --examples` (not
+      # `--all-targets`): the full test suite runs under `--all-features` in the
+      # `test` job; here we guard the single-backend library + its examples.
+      - name: clippy (postgres only)
+        run: cargo clippy --no-default-features --features postgres --lib --examples -- -D warnings
+      - name: clippy (sqlite only)
+        run: cargo clippy --no-default-features --features sqlite --lib --examples -- -D warnings

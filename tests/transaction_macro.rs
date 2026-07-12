@@ -1,3 +1,4 @@
+#![cfg(feature = "sqlite")]
 //! `#[durare::transaction]`: an async fn whose body runs as a transactional
 //! step — the SQL writes and the checkpoint commit together — with no
 //! `|tx| Box::pin(async move { ... })` wrapper. Requires a SQL backend;
