@@ -21,6 +21,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   launch: a process self-elects as latest when it first registers its version (so
   its queue config lands on the first launch), and an already-registered
   older-version straggler will not overwrite a newer queue's configuration.
+- Durable `ctx.now()`, `ctx.uuid()`, and `ctx.random()`: read the wall clock,
+  mint a v4 UUID, or draw an `f64` in `[0, 1)` inside a workflow and have the
+  value **checkpointed** — recorded on first execution and replayed identically
+  after a recovery, instead of silently breaking determinism the way a bare
+  `Utc::now()` / `Uuid::new_v4()` would. Each consumes one step slot, like
+  `ctx.sleep`.
 
 ### Changed
 

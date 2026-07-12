@@ -853,6 +853,89 @@ impl DurableContext {
         }
     }
 
+    /// A durable wall-clock read. Records the current instant on first execution
+    /// and replays that same instant thereafter, so a timestamp taken inside a
+    /// workflow is stable across recovery — where a bare `Utc::now()` would
+    /// silently return a different value and break determinism.
+    ///
+    /// ```no_run
+    /// # use durare::{DurableContext, Result};
+    /// # async fn ex(ctx: DurableContext) -> Result<()> {
+    /// let started = ctx.now().await?; // same value on every replay
+    /// # Ok(()) }
+    /// ```
+    pub async fn now(&self) -> Result<chrono::DateTime<chrono::Utc>> {
+        self.durable_value("DBOS.now", chrono::Utc::now).await
+    }
+
+    /// A durable random UUID (v4): minted on first execution and replayed
+    /// thereafter. The safe way to generate an id inside a workflow — a bare
+    /// `Uuid::new_v4()` would differ on recovery. Returned as a string.
+    pub async fn uuid(&self) -> Result<String> {
+        self.durable_value("DBOS.uuid", || uuid::Uuid::new_v4().to_string())
+            .await
+    }
+
+    /// A durable random `f64` in `[0, 1)`: drawn on first execution and replayed
+    /// thereafter. For any randomness a workflow's control flow depends on.
+    pub async fn random(&self) -> Result<f64> {
+        self.durable_value("DBOS.random", || {
+            // 48 fully-random bits from a v4 UUID (OS-entropy-backed via
+            // getrandom). Bytes 0..6 precede the version/variant nibbles, so
+            // they are uniformly random; 48 bits are exactly representable in an
+            // f64 mantissa, giving a uniform value in [0, 1).
+            let b = uuid::Uuid::new_v4().into_bytes();
+            let n = (0..6).fold(0u64, |acc, i| (acc << 8) | b[i] as u64);
+            n as f64 / (1u64 << 48) as f64
+        })
+        .await
+    }
+
+    /// Record (first execution) or replay (thereafter) a non-deterministic value
+    /// under a reserved `DBOS.*` op at the next seq, so a clock/RNG/UUID read
+    /// returns the same value on every replay. The shared machinery behind
+    /// [`now`](Self::now), [`uuid`](Self::uuid), and [`random`](Self::random) —
+    /// the same record-or-replay shape as [`sleep`](Self::sleep)'s wake instant.
+    async fn durable_value<T, P>(&self, name: &str, produce: P) -> Result<T>
+    where
+        T: Serialize + DeserializeOwned,
+        P: FnOnce() -> T,
+    {
+        let seq = self.next_seq();
+        match self
+            .provider
+            .get_step_result(&self.workflow_id, seq)
+            .await?
+        {
+            Some(rec) => {
+                if rec.name != name {
+                    return Err(Error::unexpected_step(
+                        &self.workflow_id,
+                        seq,
+                        name,
+                        rec.name,
+                    ));
+                }
+                outcome_value(rec.outcome)
+            }
+            None => {
+                let value = produce();
+                let outcome = self
+                    .provider
+                    .record_step_result(
+                        &self.workflow_id,
+                        seq,
+                        name,
+                        serde_json::to_value(&value)?,
+                        None,
+                        None,
+                    )
+                    .await?;
+                outcome_value(outcome)
+            }
+        }
+    }
+
     /// Durably send a message to another workflow on `topic`. Recorded as a
     /// `DBOS.send` step, so a replay does not re-send.
     ///

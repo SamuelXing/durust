@@ -3245,3 +3245,48 @@ async fn sqlite_persists_queue_registry_across_restart() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// F2 — a durable now()/uuid() value persists to the database and replays
+/// identically for a fresh engine over the same file (survives a restart),
+/// where fresh reads would differ.
+#[tokio::test]
+async fn sqlite_durable_now_uuid_replay_across_restart() -> Result<()> {
+    fn register_clocked(engine: &mut DurableEngine) {
+        engine.register("clocked", |ctx: DurableContext, _: ()| async move {
+            let now = ctx.now().await?.timestamp_micros();
+            let id = ctx.uuid().await?;
+            Ok::<_, Error>((now, id))
+        });
+    }
+
+    let (url, path) = temp_db_url("f2");
+
+    let first = {
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        register_clocked(&mut engine);
+        engine
+            .start::<(), (i64, String)>("clocked", (), WorkflowOptions::with_id("wf-f2"))
+            .await?
+            .result()
+            .await?
+    };
+
+    // Fresh engine + provider over the same file: re-running the id replays the
+    // recorded now/uuid from the database rather than drawing fresh ones.
+    let second = {
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        register_clocked(&mut engine);
+        engine
+            .start::<(), (i64, String)>("clocked", (), WorkflowOptions::with_id("wf-f2"))
+            .await?
+            .result()
+            .await?
+    };
+
+    assert_eq!(
+        first, second,
+        "durable now/uuid replay identically after a restart"
+    );
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
