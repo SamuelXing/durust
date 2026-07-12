@@ -72,6 +72,11 @@
 //! the value observed and the timeout deadline, and a [durable
 //! select](DurableContext::select) records which branch won.
 //!
+//! The [determinism guide](crate::determinism) is the full rulebook this
+//! section sketches: the catalog of non-determinism foot-guns and their durable
+//! fixes, the types that are safe to store and send, and where dependencies
+//! live.
+//!
 //! # Crash recovery
 //!
 //! On startup, call [`DurableEngine::recover`]: it finds every workflow this

@@ -93,7 +93,8 @@ durare = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-The repository ships ten self-contained examples, one per primitive:
+The repository ships eleven self-contained examples, one per primitive plus the
+dependency-injection pattern:
 
 | Example | Shows |
 | --- | --- |
@@ -107,6 +108,7 @@ The repository ships ten self-contained examples, one per primitive:
 | `timer` | durable sleep |
 | `subworkflow` | child-workflow fan-out |
 | `stream` | live-tailed progress feed |
+| `dependencies` | dependency injection: deps in a global, read inside steps |
 
 ```bash
 cargo run --example saga          # in-memory, no database needed
