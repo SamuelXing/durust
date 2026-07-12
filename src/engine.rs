@@ -1,5 +1,5 @@
 use crate::context::{AuthContext, DurableContext};
-use crate::error::{Error, ErrorCode, Result};
+use crate::error::{panic_message, Error, ErrorCode, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{
     is_terminal, DequeueRequest, ForkParams, ListFilter, StateProvider, StepAggregate,
@@ -12,10 +12,12 @@ use crate::schedule::{
     ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus, WorkflowSchedule,
 };
 use chrono::{DateTime, Utc};
+use futures_util::FutureExt;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2248,16 +2250,21 @@ async fn run_to_completion(
 ) -> Result<Value> {
     let provider = rt.provider().clone();
     let ctx = DurableContext::new(id.clone(), rt, auth);
-    let run = handler(ctx, input);
+    // Catch a panic in the workflow body so it can't unwind past the status
+    // write below — which would strand the row PENDING with observers waiting
+    // forever (finding F1). Steps catch their own panics (subject to retry);
+    // this handles a panic in the workflow body itself.
+    let run = AssertUnwindSafe(handler(ctx, input)).catch_unwind();
 
     // Enforce a workflow deadline if one was set: when it elapses, the run
     // future is dropped (cancelled at its next await) and the workflow is
-    // marked CANCELLED.
-    let result = match deadline_ms {
+    // marked CANCELLED. `caught` is `Ok(returned)` if the body finished (returned
+    // Ok or Err) or `Err(panic)` if it panicked.
+    let caught = match deadline_ms {
         Some(dl) => {
             let remaining = (dl - chrono::Utc::now().timestamp_millis()).max(0) as u64;
             match tokio::time::timeout(Duration::from_millis(remaining), run).await {
-                Ok(r) => r,
+                Ok(caught) => caught,
                 Err(_elapsed) => {
                     provider
                         .set_workflow_status(&id, STATUS_CANCELLED, None, Some("deadline exceeded"))
@@ -2267,6 +2274,22 @@ async fn run_to_completion(
             }
         }
         None => run.await,
+    };
+
+    // A panic in the workflow body is treated as a *recoverable* failure, like a
+    // crash — not a terminal error (finding F1, option B; the durable-execution
+    // norm, where only a returned error terminates a workflow). Leave the row in
+    // its current non-terminal state so a later `recover()` re-runs it from its
+    // checkpoints, bounded by the recovery-attempt cap (a deterministic panic
+    // eventually dead-letters). Surface the panic to the owning caller, but write
+    // no terminal status.
+    let result = match caught {
+        Ok(returned) => returned,
+        Err(payload) => {
+            let msg = panic_message(&*payload);
+            tracing::error!(id = %id, panic = %msg, "workflow panicked; left recoverable for recovery to re-run");
+            return Err(Error::app(format!("workflow panicked: {msg}")));
+        }
     };
 
     match result {

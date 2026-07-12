@@ -43,6 +43,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   which for a unit-typed workflow silently returned `Ok(())`, masking the
   failure, and for other output types produced a confusing deserialization
   error. It now returns the typed error above.
+- A panic in a workflow or step body is now caught rather than unwinding past the
+  terminal-status write, which previously left the row non-terminal (`PENDING`)
+  with any polling observer waiting forever. A panic in a **step** becomes a step
+  error subject to that step's retry policy (a step that panics once can succeed
+  on retry). A panic in the **workflow body** is treated as a recoverable failure,
+  like a crash: the row is left non-terminal and a later `recover()` re-runs it
+  from its checkpoints (bounded by the recovery-attempt cap — a deterministic
+  panic eventually dead-letters), matching the durable-execution model where only
+  a returned error terminates a workflow. (Requires the default `panic = "unwind"`;
+  under `panic = "abort"` there is nothing to catch.)
 
 ## [0.3.0] - 2026-07-12
 

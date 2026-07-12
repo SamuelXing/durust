@@ -313,6 +313,19 @@ fn is_retryable_db_code(code: &str) -> bool {
 /// The crate-wide result type: `Result<T, Error>`.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Extract a human-readable message from a caught panic payload — the
+/// `Box<dyn Any + Send>` returned by `catch_unwind`. In the common case
+/// (`panic!`, `unwrap`, `assert!`) the payload is a `&str` or `String`.
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "panicked with a non-string payload".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
