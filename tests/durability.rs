@@ -198,3 +198,66 @@ async fn durable_sleep_is_not_repeated_on_replay() -> Result<()> {
     );
     Ok(())
 }
+
+/// F2 — a durable clock/UUID/RNG read is recorded on first execution and
+/// replayed identically thereafter: a timestamp, id, or random draw taken in a
+/// workflow body survives recovery without breaking determinism. (A bare
+/// `Utc::now()` / `Uuid::new_v4()` would silently differ on the replay.)
+#[tokio::test]
+async fn durable_now_uuid_random_are_stable_across_replays() -> Result<()> {
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(provider).await?;
+
+    engine.register("clocked", |ctx: DurableContext, _: ()| async move {
+        let now = ctx.now().await?.timestamp_micros();
+        let id = ctx.uuid().await?;
+        let r = ctx.random().await?;
+        Ok::<_, Error>((now, id, r))
+    });
+
+    let first = engine
+        .start::<(), (i64, String, f64)>("clocked", (), WorkflowOptions::with_id("wf-1"))
+        .await?
+        .result()
+        .await?;
+    // Re-execute the same id: the recorded now/uuid/random replay identically.
+    let second = engine
+        .start::<(), (i64, String, f64)>("clocked", (), WorkflowOptions::with_id("wf-1"))
+        .await?
+        .result()
+        .await?;
+
+    assert_eq!(
+        first, second,
+        "now/uuid/random must be stable across replays"
+    );
+    assert!(
+        (0.0..1.0).contains(&first.2),
+        "random() is in [0, 1): {}",
+        first.2
+    );
+    Ok(())
+}
+
+/// Distinct durable-value calls consume distinct seq slots and get independent
+/// values, so two `ctx.uuid()` calls in one workflow mint different ids.
+#[tokio::test]
+async fn durable_uuid_calls_in_one_workflow_are_distinct() -> Result<()> {
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(provider).await?;
+
+    engine.register("two_ids", |ctx: DurableContext, _: ()| async move {
+        let a = ctx.uuid().await?;
+        let b = ctx.uuid().await?;
+        Ok::<_, Error>((a, b))
+    });
+
+    let (a, b) = engine
+        .start::<(), (String, String)>("two_ids", (), WorkflowOptions::with_id("wf"))
+        .await?
+        .result()
+        .await?;
+    assert_ne!(a, b, "two uuid() calls mint distinct ids");
+    assert!(!a.is_empty() && !b.is_empty());
+    Ok(())
+}
