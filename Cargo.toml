@@ -155,6 +155,10 @@ path = "examples/subworkflow.rs"
 name = "stream"
 path = "examples/stream.rs"
 
+[[example]]
+name = "dependencies"
+path = "examples/dependencies.rs"
+
 # docs.rs builds with every feature enabled so conductor (and any future gated
 # APIs) appear in the rendered docs, and with `--cfg docsrs` so the
 # `#[doc(cfg(...))]` "available on feature" banners render. A local `cargo doc`

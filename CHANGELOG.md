@@ -54,6 +54,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a returned error terminates a workflow. (Requires the default `panic = "unwind"`;
   under `panic = "abort"` there is nothing to catch.)
 
+### Documentation
+
+- Added a `determinism` concept guide — a `std`-style companion to the
+  `durability` guide covering how to write a correct workflow body: the catalog
+  of non-determinism foot-guns (wall clock, RNG, `HashMap` iteration order,
+  `spawn`/task races, `Drop` side effects, direct env/config/file/network reads)
+  and their durable fixes; the durable-safe data rules for values that cross a
+  checkpoint-and-replay or cross-SDK boundary (no `NaN`/infinity, string-encoded
+  integers past 2⁵³, ordered maps for byte-stable records); and the
+  dependency-injection pattern — build a pool/client/config once at startup into
+  a process global and read it inside steps, never in durable state — with a note
+  on why workflows stay free functions and the trigger that would justify a
+  method-based API.
+- Added `examples/dependencies.rs`, a runnable companion to that guide's
+  dependency-injection section: a `PricingService` (stand-in for an HTTP client
+  and its config) wired through a global `OnceLock` and read inside a step, with
+  a re-run proving the dependency is invoked exactly once while the replay serves
+  the checkpoint.
+
 ## [0.3.0] - 2026-07-12
 
 The feature-gating release: optional components you don't use no longer weigh
