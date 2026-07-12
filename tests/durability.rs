@@ -1,6 +1,9 @@
 //! Backend-free tests using the in-memory provider.
 
-use durare::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
+use durare::{
+    DurableContext, DurableEngine, Error, InMemoryProvider, Result, StateProvider, StepOptions,
+    WorkflowOptions, STATUS_PENDING, STATUS_SUCCESS,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -259,5 +262,103 @@ async fn durable_uuid_calls_in_one_workflow_are_distinct() -> Result<()> {
         .await?;
     assert_ne!(a, b, "two uuid() calls mint distinct ids");
     assert!(!a.is_empty() && !b.is_empty());
+    Ok(())
+}
+
+/// F1 — a panic in a workflow body is caught and treated as a *recoverable*
+/// failure (like a crash), not a terminal error: the row is left non-terminal so
+/// a later `recover()` re-runs it from its checkpoints. A workflow that panics
+/// once is recovered to completion. (The default hook prints the panic to stderr;
+/// the owning caller observes it as an error.)
+#[tokio::test]
+async fn workflow_body_panic_is_recoverable() -> Result<()> {
+    static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("panicky", |_ctx: DurableContext, _: ()| async move {
+        if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("boom on the first attempt");
+        }
+        Ok::<_, Error>(())
+    });
+
+    // First execution panics: the owning caller sees an error, but the row is
+    // left recoverable (PENDING), not terminally failed.
+    let res = engine
+        .start::<(), ()>("panicky", (), WorkflowOptions::with_id("wf-panic"))
+        .await?
+        .result()
+        .await;
+    assert!(
+        res.is_err(),
+        "the owning caller observes the panic as an error"
+    );
+    assert_eq!(
+        provider
+            .get_workflow_status("wf-panic")
+            .await?
+            .unwrap()
+            .status,
+        STATUS_PENDING,
+        "a panicked workflow is left recoverable, not terminally failed"
+    );
+
+    // recover() re-runs it; the second attempt does not panic and completes.
+    assert!(
+        engine.recover().await? >= 1,
+        "recovery picks up the panicked run"
+    );
+    assert_eq!(
+        provider
+            .get_workflow_status("wf-panic")
+            .await?
+            .unwrap()
+            .status,
+        STATUS_SUCCESS,
+        "the recovered run completes"
+    );
+    assert_eq!(
+        ATTEMPTS.load(Ordering::SeqCst),
+        2,
+        "panicked once, then recovered"
+    );
+    Ok(())
+}
+
+/// F1 refinement — a panic in a step body is caught and turned into a step
+/// error, so it is subject to the step's retry policy: a step that panics once
+/// succeeds on retry (rather than failing the whole workflow immediately).
+#[tokio::test]
+async fn step_panic_is_caught_and_retried() -> Result<()> {
+    static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("retry_panic", |ctx: DurableContext, _: ()| async move {
+        ctx.step_with(
+            StepOptions::new("flaky")
+                .max_retries(3)
+                .base_interval(Duration::from_millis(1)),
+            || async {
+                if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("first attempt panics");
+                }
+                Ok::<_, Error>(42_i64)
+            },
+        )
+        .await
+    });
+
+    let out: i64 = engine
+        .start::<(), i64>("retry_panic", (), WorkflowOptions::with_id("wf-retry"))
+        .await?
+        .result()
+        .await?;
+    assert_eq!(out, 42);
+    assert_eq!(
+        ATTEMPTS.load(Ordering::SeqCst),
+        2,
+        "the step panicked once, then succeeded on retry"
+    );
     Ok(())
 }

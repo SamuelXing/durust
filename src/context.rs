@@ -1,11 +1,13 @@
 use crate::engine::{Runtime, WorkflowOptions};
-use crate::error::{Error, Result};
+use crate::error::{panic_message, Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{ChangeWait, StateProvider, StepOutcome, WorkflowStatus, STATUS_CANCELLED};
 use crate::tx::{TransactionOptions, Tx, TxBody};
+use futures_util::FutureExt;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::future::{poll_fn, Future};
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
@@ -432,7 +434,7 @@ impl DurableContext {
             return Ok(stored);
         }
         let started = chrono::Utc::now().timestamp_millis();
-        match f().await {
+        match run_step_catching(name, f()).await {
             Ok(v) => self.checkpoint(seq, name, v, Some(started)).await,
             Err(e) => self.record_failure(seq, name, e, Some(started)).await,
         }
@@ -750,7 +752,7 @@ impl DurableContext {
     {
         let mut attempt: u32 = 0;
         loop {
-            match f().await {
+            match run_step_catching(&opts.name, f()).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
                     // A predicate that rejects the error stops retries immediately,
@@ -1358,4 +1360,18 @@ const PATCH_PREFIX: &str = "DBOS.patch-";
 /// error (so a replayed failed step returns the same error without re-running).
 fn outcome_value<T: DeserializeOwned>(outcome: StepOutcome) -> Result<T> {
     Ok(serde_json::from_value(outcome.into_value_result()?)?)
+}
+
+/// Await a step's future, converting a panic in the step body into an error so
+/// it flows through the normal failure path — retry (per [`StepOptions`]), then
+/// checkpoint the failure — instead of unwinding the whole workflow. A step that
+/// panics is treated as a failed step, subject to its retry policy.
+async fn run_step_catching<T>(name: &str, fut: impl Future<Output = Result<T>>) -> Result<T> {
+    match AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(result) => result,
+        Err(payload) => Err(Error::app(format!(
+            "step `{name}` panicked: {}",
+            panic_message(&*payload)
+        ))),
+    }
 }
