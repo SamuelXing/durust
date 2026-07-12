@@ -1,6 +1,7 @@
 //! Conductor client (part 1): connection lifecycle + the executor-lifecycle
 //! handlers. A local websocket server stands in for the cloud conductor: it
 //! pushes requests and asserts on the client's responses.
+#![cfg(feature = "conductor")]
 
 use durare::{
     AlertHandler, Conductor, ConductorConfig, DurableContext, DurableEngine, Error,

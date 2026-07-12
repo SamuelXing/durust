@@ -33,6 +33,14 @@ exclude = [
 members = ["durare-macros"]
 resolver = "2"
 
+[features]
+# The DBOS Conductor client (`Conductor`, `ConductorConfig`, `AlertHandler`) — a
+# long-lived websocket client for the cloud control plane — is opt-in. Enable it
+# with `features = ["conductor"]`; it is kept out of the default build so workers
+# that never talk to the control plane don't compile the stack it needs
+# (tokio-tungstenite for the TLS websocket, flate2 for gzip framing).
+conductor = ["dep:tokio-tungstenite", "dep:flate2"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -54,13 +62,15 @@ base64 = "0.21"
 # builds get distinct versions and version-gated dispatch/recovery works.
 sha2 = "0.10"
 # gzip framing for the conductor's portable workflow export/import payloads.
-flate2 = "1"
+# Conductor-only, so optional and pulled in by the `conductor` feature.
+flate2 = { version = "1", optional = true }
 # Admin HTTP control surface (opt-in via `AdminServer::start`). Default features
 # give the tokio/http1/json stack the handlers need.
 axum = "0.7"
-# Conductor websocket client (opt-in via `Conductor::start`). rustls to match the
-# rest of the TLS stack; `futures-util` drives the split Sink/Stream.
-tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
+# Conductor websocket client. rustls to match the rest of the TLS stack;
+# `futures-util` drives the split Sink/Stream. Conductor-only, so optional and
+# pulled in by the `conductor` feature.
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"], optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 # CancellationToken for structured, level-triggered shutdown of the conductor
 # connection loop (and the sub-tasks later parts will spawn).
@@ -122,3 +132,11 @@ path = "examples/subworkflow.rs"
 [[example]]
 name = "stream"
 path = "examples/stream.rs"
+
+# docs.rs builds with every feature enabled so conductor (and any future gated
+# APIs) appear in the rendered docs, and with `--cfg docsrs` so the
+# `#[doc(cfg(...))]` "available on feature" banners render. A local `cargo doc`
+# ignores this table, so stable and CI builds are unaffected.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

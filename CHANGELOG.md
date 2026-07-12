@@ -6,6 +6,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **(breaking)** The DBOS Conductor client — `Conductor`, `ConductorConfig`,
+  `AlertHandler` — now lives behind an opt-in `conductor` cargo feature, off by
+  default. Enable it with `features = ["conductor"]`. This keeps its
+  `tokio-tungstenite` (TLS websocket) and `flate2` (gzip) dependencies out of
+  builds that never talk to the DBOS control plane.
+
 ## [0.2.0] - 2026-07-11
 
 This release proves durare's on-the-wire compatibility with the other DBOS

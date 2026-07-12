@@ -37,7 +37,9 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all --check
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        # --all-features so opt-in features (conductor) are linted too; the
+        # no-default-features job below guards the lean floor.
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
   msrv:
     name: msrv (1.88)
@@ -83,9 +85,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: test
-        run: cargo test --all-targets
+        # --all-features so opt-in features (conductor) are exercised; the
+        # no-default-features job guards that the crate still builds without them.
+        run: cargo test --all-targets --all-features
       - name: doc tests
-        run: cargo test --doc
+        run: cargo test --doc --all-features
 
   docs:
     name: doc build
@@ -99,3 +103,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo doc
         run: cargo doc --no-deps --all-features
+
+  features:
+    name: no-default-features (conductor off)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The crate must build and lint cleanly with the conductor feature gated
+      # off, so non-conductor code never leans on a conductor-only symbol or dep.
+      - name: clippy --no-default-features
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
