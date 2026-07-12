@@ -1,5 +1,8 @@
 use crate::error::{Error, Result};
-use crate::provider::{is_terminal, StateProvider, WorkflowStatus, STATUS_CANCELLED, STATUS_ERROR};
+use crate::provider::{
+    is_terminal, StateProvider, WorkflowStatus, STATUS_CANCELLED, STATUS_ERROR,
+    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED,
+};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::future::{Future, IntoFuture};
@@ -168,6 +171,12 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
     fn terminal_to_result(&self, status: WorkflowStatus) -> Result<O> {
         match status.status.as_str() {
             STATUS_CANCELLED => Err(Error::Cancelled(self.id.clone())),
+            // A workflow parked past its recovery-attempt cap has no result;
+            // surface the typed error instead of trying to decode a null output
+            // (which for a unit-typed workflow would spuriously succeed).
+            STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED => {
+                Err(Error::MaxRecoveryAttemptsExceeded(self.id.clone()))
+            }
             // A workflow that failed under portable mode carries a structured
             // error; reconstruct it so an observer reads the same name/code/data
             // any SDK wrote. Otherwise the bare message.

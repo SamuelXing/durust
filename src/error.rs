@@ -25,6 +25,10 @@ pub enum ErrorCode {
     QueueDeduplicated,
     /// The workflow was cancelled; execution was refused.
     WorkflowCancelled,
+    /// The workflow exceeded its configured recovery-attempt cap and was parked
+    /// in the terminal `MAX_RECOVERY_ATTEMPTS_EXCEEDED` (dead-letter) state; it
+    /// will not be recovered or re-run again.
+    MaxRecoveryAttemptsExceeded,
     /// Two workflows were registered under the same name (or configured-instance
     /// key) when building the engine.
     ConflictingRegistration,
@@ -86,6 +90,14 @@ pub enum Error {
     /// The workflow was cancelled by an operator; execution was refused.
     #[error("workflow `{0}` was cancelled")]
     Cancelled(String),
+
+    /// The workflow was recovered more times than the configured cap
+    /// (`max_recovery_attempts`) and has been parked in the terminal
+    /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED` (dead-letter) state — it will not be
+    /// recovered or re-run again. Awaiting its result surfaces this error so a
+    /// caller can distinguish a parked workflow from one that ran to completion.
+    #[error("workflow `{0}` exceeded its maximum recovery attempts")]
+    MaxRecoveryAttemptsExceeded(String),
 
     /// Two workflows were registered under the same name (or configured-instance
     /// key) when building the engine — the name→function registry must be
@@ -186,6 +198,12 @@ impl Error {
         Error::NonExistentWorkflow(id.into())
     }
 
+    /// Construct a [`Error::MaxRecoveryAttemptsExceeded`] for a workflow parked
+    /// in the dead-letter state.
+    pub fn max_recovery_attempts_exceeded(id: impl Into<String>) -> Self {
+        Error::MaxRecoveryAttemptsExceeded(id.into())
+    }
+
     /// Construct a [`Error::ConflictingRegistration`] for a duplicate name.
     pub fn conflicting_registration(name: impl Into<String>) -> Self {
         Error::ConflictingRegistration(name.into())
@@ -226,6 +244,7 @@ impl Error {
             Error::NonExistentWorkflow(_) => ErrorCode::NonExistentWorkflow,
             Error::QueueDeduplicated { .. } => ErrorCode::QueueDeduplicated,
             Error::Cancelled(_) => ErrorCode::WorkflowCancelled,
+            Error::MaxRecoveryAttemptsExceeded(_) => ErrorCode::MaxRecoveryAttemptsExceeded,
             Error::ConflictingRegistration(_) => ErrorCode::ConflictingRegistration,
             Error::Timeout => ErrorCode::Timeout,
             Error::UnexpectedStep { .. } => ErrorCode::UnexpectedStep,
@@ -309,6 +328,10 @@ mod tests {
         assert_eq!(
             Error::queue_deduplicated("q", "d").code(),
             ErrorCode::QueueDeduplicated
+        );
+        assert_eq!(
+            Error::max_recovery_attempts_exceeded("wf").code(),
+            ErrorCode::MaxRecoveryAttemptsExceeded
         );
         assert_eq!(
             Error::UnknownWorkflow("n".into()).code(),

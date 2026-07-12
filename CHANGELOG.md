@@ -6,6 +6,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `Error::MaxRecoveryAttemptsExceeded` and the matching
+  `ErrorCode::MaxRecoveryAttemptsExceeded`: a workflow that exceeds its
+  recovery-attempt cap and is parked in the `MAX_RECOVERY_ATTEMPTS_EXCEEDED`
+  dead-letter state now surfaces this typed error when its result is awaited, so
+  a caller can distinguish a parked workflow from one that ran to completion.
+
+### Fixed
+
+- Awaiting a dead-lettered workflow (`WorkflowHandle::result` /
+  `retrieve_workflow` + `await`) no longer falls through to output decoding —
+  which for a unit-typed workflow silently returned `Ok(())`, masking the
+  failure, and for other output types produced a confusing deserialization
+  error. It now returns the typed error above.
+
 ## [0.3.0] - 2026-07-12
 
 The feature-gating release: optional components you don't use no longer weigh

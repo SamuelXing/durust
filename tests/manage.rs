@@ -2,9 +2,9 @@
 //! and version-gated recovery. Backend-free (in-memory provider).
 
 use durare::{
-    DurableContext, DurableEngine, Error, InMemoryProvider, ListFilter, Result, StateProvider,
-    StepAggregateQuery, WorkflowAggregate, WorkflowAggregateQuery, WorkflowOptions, WorkflowStatus,
-    STATUS_CANCELLED, STATUS_ENQUEUED, STATUS_PENDING, STATUS_SUCCESS,
+    DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, ListFilter, Result,
+    StateProvider, StepAggregateQuery, WorkflowAggregate, WorkflowAggregateQuery, WorkflowOptions,
+    WorkflowStatus, STATUS_CANCELLED, STATUS_ENQUEUED, STATUS_PENDING, STATUS_SUCCESS,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -404,6 +404,17 @@ async fn recover_caps_attempts() -> Result<()> {
             .status,
         "MAX_RECOVERY_ATTEMPTS_EXCEEDED"
     );
+
+    // Awaiting the parked workflow surfaces the typed error, not a spurious
+    // `Ok(())` from decoding the null output (the pre-fix behavior for a
+    // unit-typed workflow) — so a caller can branch on the code.
+    let handle = engine.retrieve_workflow::<()>("wf-loop").await?;
+    let err = handle.await.expect_err("a parked workflow has no result");
+    assert!(
+        matches!(err, Error::MaxRecoveryAttemptsExceeded(ref id) if id == "wf-loop"),
+        "expected MaxRecoveryAttemptsExceeded, got {err:?}"
+    );
+    assert_eq!(err.code(), ErrorCode::MaxRecoveryAttemptsExceeded);
     Ok(())
 }
 

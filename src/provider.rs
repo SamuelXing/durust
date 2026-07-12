@@ -423,8 +423,9 @@ pub struct WorkflowStatus {
     pub priority: i32,
     /// Deduplication key, unique per queue among active workflows.
     pub dedup_id: Option<String>,
-    /// How many times recovery has re-dispatched this workflow (not yet
-    /// incremented; reserved for capping recovery retries).
+    /// How many times recovery has re-dispatched this workflow. Incremented on
+    /// each recovery pass; once it exceeds the engine's `max_recovery_attempts`
+    /// the workflow is parked in `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
     pub recovery_attempts: i32,
     /// Parent workflow id (reserved for child workflows; not yet populated).
     pub parent_workflow_id: Option<String>,
