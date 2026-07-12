@@ -4,7 +4,7 @@
 
 use durare::{
     DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, ListFilter, RateLimiter,
-    Result, WorkflowOptions, WorkflowQueue, STATUS_DELAYED, STATUS_ENQUEUED,
+    Result, StateProvider, WorkflowOptions, WorkflowQueue, STATUS_DELAYED, STATUS_ENQUEUED,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -517,6 +517,80 @@ async fn partitioned_queue_ignores_keyless_enqueue() -> Result<()> {
     );
 
     engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// launch() persists the registered queues into the database-backed registry
+/// (the `queues` table), readable via list_queues() — the fleet-wide view the
+/// conductor uses, distinct from the in-process list_registered_queues(). The
+/// always-present internal queue stays unsurfaced.
+#[tokio::test]
+async fn launch_persists_the_queue_registry() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(())
+    });
+    engine.register_queue(
+        test_queue("emails")
+            .worker_concurrency(4)
+            .global_concurrency(10)
+            .rate_limiter(RateLimiter {
+                limit: 50,
+                period: Duration::from_secs(60),
+            }),
+    );
+    engine.register_queue(test_queue("billing").priority_enabled());
+    engine.launch().await?;
+
+    let queues = engine.list_queues().await?;
+    // Sorted by name; the internal queue is not surfaced.
+    let names: Vec<&str> = queues.iter().map(|q| q.name.as_str()).collect();
+    assert_eq!(names, ["billing", "emails"]);
+
+    let emails = queues.iter().find(|q| q.name == "emails").unwrap();
+    assert_eq!(emails.worker_concurrency, Some(4));
+    assert_eq!(emails.global_concurrency, Some(10));
+    let rl = emails.rate_limit.as_ref().expect("rate limit persisted");
+    assert_eq!(rl.limit, 50);
+    assert_eq!(rl.period, Duration::from_secs(60));
+
+    let billing = queues.iter().find(|q| q.name == "billing").unwrap();
+    assert!(billing.priority_enabled);
+    assert!(billing.rate_limit.is_none());
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// upsert_queue's conflict policy: a first write inserts; a name collision does
+/// nothing unless the caller may overwrite (the engine resolves that from the
+/// application version).
+#[tokio::test]
+async fn queue_upsert_respects_conflict_policy() -> Result<()> {
+    let provider = InMemoryProvider::new();
+    provider
+        .upsert_queue(&WorkflowQueue::new("q").worker_concurrency(1), true)
+        .await?;
+
+    // A writer that may NOT overwrite leaves the stored config untouched.
+    provider
+        .upsert_queue(&WorkflowQueue::new("q").worker_concurrency(9), false)
+        .await?;
+    let stored = provider.list_queues().await?;
+    assert_eq!(stored.len(), 1);
+    assert_eq!(
+        stored[0].worker_concurrency,
+        Some(1),
+        "no-overwrite policy kept the original config"
+    );
+
+    // A writer that MAY overwrite replaces it.
+    provider
+        .upsert_queue(&WorkflowQueue::new("q").worker_concurrency(9), true)
+        .await?;
+    let stored = provider.list_queues().await?;
+    assert_eq!(stored.len(), 1, "still one row (upsert, not insert)");
+    assert_eq!(stored[0].worker_concurrency, Some(9), "update overwrote it");
     Ok(())
 }
 

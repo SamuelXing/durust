@@ -12,6 +12,7 @@ use crate::provider::{
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
 use crate::tx::{TransactionOptions, Tx, TxBody};
+use crate::{RateLimiter, WorkflowQueue};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
@@ -19,6 +20,7 @@ use sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::{QueryBuilder, Row};
 use std::collections::BTreeMap;
 use std::str::FromStr;
+use std::time::Duration;
 
 const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, executor_id, \
      application_version, queue_name, queue_partition_key, priority, deduplication_id, recovery_attempts, \
@@ -1546,6 +1548,58 @@ impl StateProvider for SqliteProvider {
         Ok(res.rows_affected() > 0)
     }
 
+    async fn upsert_queue(&self, queue: &WorkflowQueue, update_existing: bool) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+        // A name collision does nothing unless the engine resolved that this
+        // process may overwrite (it runs the latest application version).
+        let conflict = if update_existing {
+            "ON CONFLICT (name) DO UPDATE SET \
+             concurrency = excluded.concurrency, \
+             worker_concurrency = excluded.worker_concurrency, \
+             rate_limit_max = excluded.rate_limit_max, \
+             rate_limit_period_sec = excluded.rate_limit_period_sec, \
+             priority_enabled = excluded.priority_enabled, \
+             partition_queue = excluded.partition_queue, \
+             polling_interval_sec = excluded.polling_interval_sec, \
+             updated_at = excluded.updated_at"
+        } else {
+            "ON CONFLICT (name) DO NOTHING"
+        };
+        let sql = format!(
+            "INSERT INTO queues \
+             (queue_id, name, concurrency, worker_concurrency, rate_limit_max, \
+              rate_limit_period_sec, priority_enabled, partition_queue, \
+              polling_interval_sec, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) {conflict}"
+        );
+        sqlx::query(&sql)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&queue.name)
+            .bind(queue.global_concurrency)
+            .bind(queue.worker_concurrency.map(|n| n as i64))
+            .bind(queue.rate_limit.as_ref().map(|r| r.limit))
+            .bind(queue.rate_limit.as_ref().map(|r| r.period.as_secs_f64()))
+            .bind(queue.priority_enabled)
+            .bind(queue.partitioned)
+            .bind(queue.base_polling_interval.as_secs_f64())
+            .bind(now)
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_queues(&self) -> Result<Vec<WorkflowQueue>> {
+        let rows = sqlx::query(
+            "SELECT name, concurrency, worker_concurrency, rate_limit_max, \
+             rate_limit_period_sec, priority_enabled, partition_queue, polling_interval_sec \
+             FROM queues ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row_to_queue).collect())
+    }
+
     async fn export_workflow(
         &self,
         workflow_id: &str,
@@ -1856,6 +1910,31 @@ fn row_to_version(row: &sqlx::sqlite::SqliteRow) -> VersionInfo {
         version_timestamp: ms_to_dt(row.get("version_timestamp")),
         created_at: ms_to_dt(row.get("created_at")),
     }
+}
+
+fn row_to_queue(row: &sqlx::sqlite::SqliteRow) -> WorkflowQueue {
+    let rate_limit = match (
+        row.get::<Option<i64>, _>("rate_limit_max"),
+        row.get::<Option<f64>, _>("rate_limit_period_sec"),
+    ) {
+        (Some(limit), Some(period_sec)) => Some(RateLimiter {
+            limit,
+            period: Duration::from_secs_f64(period_sec),
+        }),
+        _ => None,
+    };
+    // Start from the defaults so the fields the table doesn't store
+    // (`max_tasks_per_iteration`, `max_polling_interval`) are populated.
+    let mut q = WorkflowQueue::new(row.get::<String, _>("name"));
+    q.global_concurrency = row.get::<Option<i64>, _>("concurrency");
+    q.worker_concurrency = row
+        .get::<Option<i64>, _>("worker_concurrency")
+        .map(|n| n as usize);
+    q.rate_limit = rate_limit;
+    q.priority_enabled = row.get::<bool, _>("priority_enabled");
+    q.partitioned = row.get::<bool, _>("partition_queue");
+    q.base_polling_interval = Duration::from_secs_f64(row.get::<f64, _>("polling_interval_sec"));
+    q
 }
 
 /// Encode a schedule's optional context as the stored JSON text (`null` when

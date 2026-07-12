@@ -3,8 +3,9 @@
 //! (separate engine + provider instances over the same database file).
 
 use durare::{
-    DurableContext, DurableEngine, Error, ListFilter, Result, ScheduledInput, SqliteProvider,
-    TransactionOptions, WorkflowOptions, WorkflowQueue, STATUS_CANCELLED, STATUS_SUCCESS,
+    DurableContext, DurableEngine, Error, ListFilter, RateLimiter, Result, ScheduledInput,
+    SqliteProvider, TransactionOptions, WorkflowOptions, WorkflowQueue, STATUS_CANCELLED,
+    STATUS_SUCCESS,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -3203,6 +3204,43 @@ async fn sqlite_schema_migrations_and_pragmas() -> Result<()> {
         "existing data survives a re-open + re-init"
     );
     pool.close().await;
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// launch() persists the queue registry to the `queues` table; a fresh engine
+/// over the same database file reads it back — the durable, fleet-wide registry.
+#[tokio::test]
+async fn sqlite_persists_queue_registry_across_restart() -> Result<()> {
+    let (url, path) = temp_db_url("queues");
+    {
+        let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+        engine.register("noop", |_ctx: DurableContext, _: ()| async move {
+            Ok::<_, Error>(())
+        });
+        engine.register_queue(
+            WorkflowQueue::new("emails")
+                .worker_concurrency(4)
+                .rate_limiter(RateLimiter {
+                    limit: 50,
+                    period: Duration::from_secs(30),
+                }),
+        );
+        engine.launch().await?;
+        engine.shutdown(Duration::from_secs(1)).await?;
+    }
+
+    // Fresh engine + provider over the same file: the registry survived, and is
+    // readable without re-registering the queue in this process.
+    let engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    let queues = engine.list_queues().await?;
+    let names: Vec<&str> = queues.iter().map(|q| q.name.as_str()).collect();
+    assert_eq!(names, ["emails"]);
+    assert_eq!(queues[0].worker_concurrency, Some(4));
+    let rl = queues[0].rate_limit.as_ref().expect("rate limit survived");
+    assert_eq!(rl.limit, 50);
+    assert_eq!(rl.period, Duration::from_secs(30));
 
     let _ = std::fs::remove_file(path);
     Ok(())

@@ -9,6 +9,7 @@ use crate::provider::{
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::tx::TxBody;
+use crate::WorkflowQueue;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
@@ -54,6 +55,8 @@ struct Inner {
     schedules: HashMap<String, WorkflowSchedule>,
     /// Registered application versions keyed by `version_name`.
     versions: HashMap<String, VersionInfo>,
+    /// Persisted queue registry keyed by `name` (the `queues`-table analog).
+    queues: HashMap<String, WorkflowQueue>,
 }
 
 /// In-memory [`StateProvider`] for tests and quick starts (no database needed).
@@ -1196,6 +1199,23 @@ impl StateProvider for InMemoryProvider {
             }
             None => Ok(false),
         }
+    }
+
+    async fn upsert_queue(&self, queue: &WorkflowQueue, update_existing: bool) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        // Insert a new row; overwrite an existing one only when asked (the
+        // conflict policy the engine resolves from application version).
+        if update_existing || !g.queues.contains_key(&queue.name) {
+            g.queues.insert(queue.name.clone(), queue.clone());
+        }
+        Ok(())
+    }
+
+    async fn list_queues(&self) -> Result<Vec<WorkflowQueue>> {
+        let g = self.inner.lock().await;
+        let mut queues: Vec<WorkflowQueue> = g.queues.values().cloned().collect();
+        queues.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(queues)
     }
 
     async fn export_workflow(

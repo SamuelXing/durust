@@ -6,8 +6,8 @@
 
 use durare::{
     DurableContext, DurableEngine, Error, ErrorCode, ListFilter, PortableWorkflowError,
-    PostgresProvider, Result, ScheduledInput, Serializer, StateProvider, TransactionOptions,
-    WorkflowOptions, WorkflowQueue, WorkflowStatus, STATUS_PENDING,
+    PostgresProvider, RateLimiter, Result, ScheduledInput, Serializer, StateProvider,
+    TransactionOptions, WorkflowOptions, WorkflowQueue, WorkflowStatus, STATUS_PENDING,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -3032,5 +3032,89 @@ async fn pg_resume_routes_to_named_queue() -> Result<()> {
     let row = provider.get_workflow_status(&id).await?.unwrap();
     assert_eq!(row.queue_name.as_deref(), Some(queue.as_str()));
     engine.shutdown(Duration::from_secs(2)).await?;
+    Ok(())
+}
+
+/// The queue registry is persisted to Postgres on launch and read back via
+/// list_queues(), with the INTEGER/DOUBLE PRECISION columns intact.
+#[tokio::test]
+async fn pg_persists_queue_registry() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_persists_queue_registry: DATABASE_URL unset");
+        return Ok(());
+    };
+    // Unique name so the shared test DB doesn't collide across tests/re-runs.
+    let qname = format!("emails-{}", uuid::Uuid::new_v4());
+
+    {
+        let mut engine =
+            DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
+        engine.register("noop", |_ctx: DurableContext, _: ()| async move {
+            Ok::<_, Error>(())
+        });
+        engine.register_queue(
+            WorkflowQueue::new(&qname)
+                .worker_concurrency(4)
+                .global_concurrency(10)
+                .rate_limiter(RateLimiter {
+                    limit: 50,
+                    period: Duration::from_secs(30),
+                }),
+        );
+        engine.launch().await?;
+        engine.shutdown(Duration::from_secs(1)).await?;
+    }
+
+    // Fresh engine reads the persisted row back.
+    let engine = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
+    let stored = engine.list_queues().await?;
+    let q = stored
+        .iter()
+        .find(|q| q.name == qname)
+        .expect("queue persisted to the registry");
+    assert_eq!(q.global_concurrency, Some(10));
+    assert_eq!(q.worker_concurrency, Some(4));
+    let rl = q.rate_limit.as_ref().expect("rate limit persisted");
+    assert_eq!(rl.limit, 50);
+    assert_eq!(rl.period, Duration::from_secs(30));
+
+    Ok(())
+}
+
+/// upsert_queue's conflict policy on Postgres: a name collision leaves the row
+/// unchanged unless the caller may overwrite.
+#[tokio::test]
+async fn pg_queue_upsert_conflict_policy() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_queue_upsert_conflict_policy: DATABASE_URL unset");
+        return Ok(());
+    };
+    // connect() does not run migrations — building an engine does. Create one so
+    // the schema exists, then exercise the provider methods directly (keeps the
+    // test self-sufficient rather than relying on another test migrating first).
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    let _engine = DurableEngine::new(provider.clone()).await?;
+    let qname = format!("policy-{}", uuid::Uuid::new_v4());
+
+    provider
+        .upsert_queue(&WorkflowQueue::new(&qname).worker_concurrency(1), true)
+        .await?;
+    // May-not-overwrite: original config kept.
+    provider
+        .upsert_queue(&WorkflowQueue::new(&qname).worker_concurrency(9), false)
+        .await?;
+    let stored = provider.list_queues().await?;
+    let q = stored.iter().find(|q| q.name == qname).unwrap();
+    assert_eq!(q.worker_concurrency, Some(1), "no-overwrite kept original");
+
+    // May-overwrite: replaced, still a single row.
+    provider
+        .upsert_queue(&WorkflowQueue::new(&qname).worker_concurrency(9), true)
+        .await?;
+    let stored = provider.list_queues().await?;
+    let matching: Vec<_> = stored.iter().filter(|q| q.name == qname).collect();
+    assert_eq!(matching.len(), 1, "upsert, not a second insert");
+    assert_eq!(matching[0].worker_concurrency, Some(9), "update overwrote");
+
     Ok(())
 }

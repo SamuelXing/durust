@@ -12,6 +12,7 @@ use crate::provider::{
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
 use crate::tx::{IsolationLevel, TransactionOptions, Tx, TxBody};
+use crate::{RateLimiter, WorkflowQueue};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
@@ -1862,6 +1863,60 @@ impl StateProvider for PostgresProvider {
         Ok(res.rows_affected() > 0)
     }
 
+    async fn upsert_queue(&self, queue: &WorkflowQueue, update_existing: bool) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+        // A name collision does nothing unless the engine resolved that this
+        // process may overwrite (it runs the latest application version).
+        let conflict = if update_existing {
+            "ON CONFLICT (name) DO UPDATE SET \
+             concurrency = excluded.concurrency, \
+             worker_concurrency = excluded.worker_concurrency, \
+             rate_limit_max = excluded.rate_limit_max, \
+             rate_limit_period_sec = excluded.rate_limit_period_sec, \
+             priority_enabled = excluded.priority_enabled, \
+             partition_queue = excluded.partition_queue, \
+             polling_interval_sec = excluded.polling_interval_sec, \
+             updated_at = excluded.updated_at"
+        } else {
+            "ON CONFLICT (name) DO NOTHING"
+        };
+        // The concurrency columns are `INTEGER` (int4) in the DBOS schema, so
+        // bind them as i32 (SQLite is dynamically typed; Postgres is not).
+        let sql = format!(
+            "INSERT INTO queues \
+             (queue_id, name, concurrency, worker_concurrency, rate_limit_max, \
+              rate_limit_period_sec, priority_enabled, partition_queue, \
+              polling_interval_sec, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) {conflict}"
+        );
+        sqlx::query(&sql)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&queue.name)
+            .bind(queue.global_concurrency.map(|n| n as i32))
+            .bind(queue.worker_concurrency.map(|n| n as i32))
+            .bind(queue.rate_limit.as_ref().map(|r| r.limit as i32))
+            .bind(queue.rate_limit.as_ref().map(|r| r.period.as_secs_f64()))
+            .bind(queue.priority_enabled)
+            .bind(queue.partitioned)
+            .bind(queue.base_polling_interval.as_secs_f64())
+            .bind(now)
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_queues(&self) -> Result<Vec<WorkflowQueue>> {
+        let rows = sqlx::query(
+            "SELECT name, concurrency, worker_concurrency, rate_limit_max, \
+             rate_limit_period_sec, priority_enabled, partition_queue, polling_interval_sec \
+             FROM queues ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row_to_queue).collect())
+    }
+
     async fn export_workflow(
         &self,
         workflow_id: &str,
@@ -2184,6 +2239,32 @@ fn row_to_version(row: &sqlx::postgres::PgRow) -> VersionInfo {
         version_timestamp: ms_to_dt(row.get("version_timestamp")),
         created_at: ms_to_dt(row.get("created_at")),
     }
+}
+
+fn row_to_queue(row: &sqlx::postgres::PgRow) -> WorkflowQueue {
+    // Concurrency columns are `INTEGER` (int4); widen back to the queue's i64/usize.
+    let rate_limit = match (
+        row.get::<Option<i32>, _>("rate_limit_max"),
+        row.get::<Option<f64>, _>("rate_limit_period_sec"),
+    ) {
+        (Some(limit), Some(period_sec)) => Some(RateLimiter {
+            limit: limit as i64,
+            period: Duration::from_secs_f64(period_sec),
+        }),
+        _ => None,
+    };
+    // Start from the defaults so the fields the table doesn't store
+    // (`max_tasks_per_iteration`, `max_polling_interval`) are populated.
+    let mut q = WorkflowQueue::new(row.get::<String, _>("name"));
+    q.global_concurrency = row.get::<Option<i32>, _>("concurrency").map(|n| n as i64);
+    q.worker_concurrency = row
+        .get::<Option<i32>, _>("worker_concurrency")
+        .map(|n| n as usize);
+    q.rate_limit = rate_limit;
+    q.priority_enabled = row.get::<bool, _>("priority_enabled");
+    q.partitioned = row.get::<bool, _>("partition_queue");
+    q.base_polling_interval = Duration::from_secs_f64(row.get::<f64, _>("polling_interval_sec"));
+    q
 }
 
 /// Encode a schedule's optional context as the stored JSON text (`null` when

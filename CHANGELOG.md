@@ -13,6 +13,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   recovery-attempt cap and is parked in the `MAX_RECOVERY_ATTEMPTS_EXCEEDED`
   dead-letter state now surfaces this typed error when its result is awaited, so
   a caller can distinguish a parked workflow from one that ran to completion.
+- The queue registry is now persisted to the `queues` table on `launch` — the
+  database-backed, fleet-wide registry the DBOS conductor and control plane read —
+  and `DurableEngine::list_queues()` reads it back. A queue registered by any
+  executor against a shared database is visible to every conductor pointed at it,
+  matching the Go and Python SDKs. The conflict policy matches Go's default: an
+  older executor mid-rolling-deploy will not overwrite a newer queue's stored
+  configuration.
+
+### Changed
+
+- The Conductor client's queue views (`list_queues` / `get_queue`) now read the
+  database-backed `queues` table (fleet-wide) rather than this process's in-memory
+  registry, so a conductor sees queues registered by every executor. The admin
+  server's `/dbos-workflow-queues-metadata` still reports the local in-process
+  registry (matching Go).
 
 ### Fixed
 

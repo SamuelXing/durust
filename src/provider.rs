@@ -1486,6 +1486,21 @@ pub trait StateProvider: Send + Sync {
     /// Returns whether a row matched (no-op if the name is unknown).
     async fn set_latest_application_version(&self, version_name: &str) -> Result<bool>;
 
+    /// Persist a queue's configuration into the `queues` table — the
+    /// database-backed registry the conductor reads fleet-wide, distinct from the
+    /// engine's in-process registry. Keyed by `name`: a first write inserts;
+    /// a name collision does nothing unless `update_existing`, which overwrites
+    /// the stored configuration. Called once per registered queue on `launch`.
+    async fn upsert_queue(&self, queue: &crate::WorkflowQueue, update_existing: bool)
+        -> Result<()>;
+
+    /// Every queue persisted in the `queues` table, sorted by name — the
+    /// database-backed (fleet-wide) counterpart to the engine's in-process
+    /// `list_registered_queues`. Fields not stored in the table
+    /// (`max_tasks_per_iteration`, `max_polling_interval`) come back at their
+    /// defaults.
+    async fn list_queues(&self) -> Result<Vec<crate::WorkflowQueue>>;
+
     /// Export a workflow and (when `export_children`) all of its transitive
     /// children into the portable [`ExportedWorkflow`] form. The root workflow is
     /// first in the returned list, followed by descendants discovered through

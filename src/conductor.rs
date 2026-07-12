@@ -819,12 +819,13 @@ async fn handle_list_queues(
     ws: &mut WsStream,
     rid: &str,
 ) -> Result<()> {
-    let output: Vec<Value> = engine
-        .list_registered_queues()
-        .iter()
-        .map(format_queue)
-        .collect();
-    let mut resp = base_response("list_queues", rid, None);
+    // Read the database-backed registry (fleet-wide), not just this process's
+    // in-memory queues — so the conductor sees every executor's queues.
+    let (output, err) = match engine.list_queues().await {
+        Ok(qs) => (qs.iter().map(format_queue).collect::<Vec<_>>(), None),
+        Err(e) => (vec![], Some(format!("failed to list queues: {e}"))),
+    };
+    let mut resp = base_response("list_queues", rid, err);
     resp.insert("output".into(), json!(output));
     send(ws, resp).await
 }
@@ -842,13 +843,18 @@ async fn handle_get_queue(
     text: &str,
 ) -> Result<()> {
     let req: GetQueueRequest = serde_json::from_str(text)?;
-    let output = engine
-        .list_registered_queues()
-        .iter()
-        .find(|q| q.name == req.name)
-        .map(format_queue);
-    let mut resp = base_response("get_queue", rid, None);
-    resp.insert("output".into(), output.unwrap_or(Value::Null));
+    let (output, err) = match engine.list_queues().await {
+        Ok(qs) => (
+            qs.iter()
+                .find(|q| q.name == req.name)
+                .map(format_queue)
+                .unwrap_or(Value::Null),
+            None,
+        ),
+        Err(e) => (Value::Null, Some(format!("failed to get queue: {e}"))),
+    };
+    let mut resp = base_response("get_queue", rid, err);
+    resp.insert("output".into(), output);
     send(ws, resp).await
 }
 

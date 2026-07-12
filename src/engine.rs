@@ -846,6 +846,16 @@ impl DurableEngine {
         queues
     }
 
+    /// Every queue persisted in the shared `queues` table, sorted by name — the
+    /// database-backed, fleet-wide registry (queues any executor registered
+    /// against this database persist on `launch`). Unlike
+    /// [`list_registered_queues`](Self::list_registered_queues), which returns
+    /// only the queues registered in *this* process, this reads the table the
+    /// conductor and the DBOS control plane use.
+    pub async fn list_queues(&self) -> Result<Vec<WorkflowQueue>> {
+        self.provider.list_queues().await
+    }
+
     /// All workflows registered on this engine — both `#[durare::workflow]`
     /// auto-registrations and manual [`register`](Self::register) calls — sorted
     /// by name. Each entry carries its cron schedule if it is a scheduled
@@ -1071,20 +1081,45 @@ impl DurableEngine {
         self.shutting_down.store(false, Ordering::Relaxed);
         let rt = self.runtime();
 
-        // Register this process's application version and warn if it is not the
-        // latest (a newer deploy has registered a higher version).
+        // Register this process's application version.
         if let Err(e) = self
             .provider
             .create_application_version(&self.app_version)
             .await
         {
             tracing::warn!(version = %self.app_version, error = %e, "failed to register application version");
-        } else if let Ok(Some(latest)) = self.provider.get_latest_application_version().await {
-            if latest.version_name != self.app_version {
-                tracing::warn!(
-                    current = %self.app_version, latest = %latest.version_name,
-                    "current application version is not the latest"
-                );
+        }
+
+        // Resolve the queue-registry conflict policy from the application version
+        // (matching Go's default): this process may overwrite an existing queue
+        // row only if it runs the latest registered version, so an older executor
+        // mid-rolling-deploy can't clobber a newer queue's configuration. Treat a
+        // lookup failure as "not latest" — don't overwrite on uncertainty. This
+        // also drives the not-the-latest warning.
+        let update_existing = match self.provider.get_latest_application_version().await {
+            Ok(Some(latest)) => {
+                if latest.version_name != self.app_version {
+                    tracing::warn!(
+                        current = %self.app_version, latest = %latest.version_name,
+                        "current application version is not the latest"
+                    );
+                }
+                latest.version_name == self.app_version
+            }
+            Ok(None) => true, // no versions registered yet: this process is first
+            Err(_) => false,  // unknown: don't overwrite
+        };
+
+        // Persist the registered queues into the `queues` table so the conductor
+        // (and a foreign SDK's control plane) can see this executor's queues
+        // fleet-wide. The internal queue is an implementation detail and stays
+        // unsurfaced, matching `list_registered_queues`.
+        for queue in self.queues.values() {
+            if queue.name == INTERNAL_QUEUE {
+                continue;
+            }
+            if let Err(e) = self.provider.upsert_queue(queue, update_existing).await {
+                tracing::warn!(queue = %queue.name, error = %e, "failed to persist queue to the registry");
             }
         }
 
