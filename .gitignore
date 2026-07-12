@@ -1,4 +1,6 @@
 /target
+# Stray target dir from running cargo inside the workspace member directly.
+/durare-macros/target/
 Cargo.lock
 **/*.rs.bk
 .env
