@@ -19,13 +19,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   SQLite-only build skips the Postgres network/TLS driver. **At least one backend
   is required** — a build with neither is a compile error. `InMemoryProvider`
   stays available in every build.
+- **(breaking)** The admin HTTP server (`AdminServer`) is now behind an opt-in
+  `admin` cargo feature, off by default. Enable it with `features = ["admin"]`.
+  This keeps the axum/hyper/tower HTTP stack out of builds that don't expose the
+  DBOS admin endpoints.
 
 ### Documentation
 
 - Added a "Cargo features" section to the crate docs and the README documenting
-  the `postgres`, `sqlite`, and opt-in `conductor` features, and corrected the
-  README quick-start dependency to `durare = "0.2"` (a `"0.1"` requirement does
-  not resolve to 0.2.x).
+  the `postgres`, `sqlite`, and opt-in `conductor`/`admin` features, and
+  corrected the README quick-start dependency to `durare = "0.2"` (a `"0.1"`
+  requirement does not resolve to 0.2.x).
 
 ## [0.2.0] - 2026-07-11
 

@@ -129,6 +129,7 @@ neither is a compile error. `InMemoryProvider` is always available (no feature).
 | `postgres` | ✅ | The `PostgresProvider` backend (sqlx Postgres driver). |
 | `sqlite` | ✅ | The `SqliteProvider` backend (sqlx SQLite driver — a bundled C library). |
 | `conductor` | — | The DBOS Conductor client (`Conductor`, `ConductorConfig`, `AlertHandler`) — a websocket client for the DBOS control plane; pulls in a TLS websocket stack and gzip framing. |
+| `admin` | — | The `AdminServer` HTTP control surface — health, recovery, and workflow-management endpoints for the DBOS console/conductor and health probes; pulls in the axum/hyper/tower stack. |
 
 For a Postgres-only build (no SQLite C compile) that also enables the Conductor
 client:
@@ -181,9 +182,10 @@ In practice this means:
 - Arguments, outputs, and errors use the portable serialization envelope, with
   a structured cross-SDK error format. Custom codecs can be installed through
   `Serializer`.
-- The admin server exposes the standard DBOS HTTP endpoints (`/dbos-healthz`,
-  `/workflows`, cancel/resume/fork, recovery, queue metadata), and the
-  Conductor client connects to DBOS Conductor for fleet management.
+- The admin server (behind the `admin` feature) exposes the standard DBOS HTTP
+  endpoints (`/dbos-healthz`, `/workflows`, cancel/resume/fork, recovery, queue
+  metadata), and the Conductor client connects to DBOS Conductor for fleet
+  management.
 
 ```sql
 SELECT workflow_uuid, name, status FROM dbos.workflow_status;

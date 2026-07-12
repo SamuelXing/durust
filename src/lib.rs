@@ -106,7 +106,7 @@
 //!   [`patch`](DurableContext::patch).
 //! - **Management and operations** — list / cancel / resume / fork, timeouts,
 //!   [`Debouncer`], the registry-less [`Client`] for other processes,
-//!   [`AdminServer`], [`Conductor`] (feature `conductor`).
+//!   [`AdminServer`] (feature `admin`), [`Conductor`] (feature `conductor`).
 //! - **Backends** — [`PostgresProvider`] (feature `postgres`),
 //!   [`SqliteProvider`] (feature `sqlite`), and [`InMemoryProvider`], all behind
 //!   the [`StateProvider`] seam.
@@ -134,6 +134,10 @@
 //!   ([`Conductor`], [`ConductorConfig`], [`AlertHandler`]): a websocket client
 //!   for the DBOS control plane, behind a feature because it pulls in a TLS
 //!   websocket stack and gzip framing.
+//! - **`admin`** *(off by default)* — the [`AdminServer`] HTTP control surface
+//!   (health, recovery, and workflow management for the DBOS console/conductor
+//!   and health probes), behind a feature because it pulls in the axum/hyper/tower
+//!   HTTP stack.
 // Render `#[doc(cfg(...))]` "available on feature X" banners on docs.rs (which
 // builds with `--cfg docsrs`, see Cargo.toml). Inert on stable and CI builds.
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -158,6 +162,7 @@ pub mod messaging;
 pub mod queues;
 pub mod transactions;
 
+#[cfg(feature = "admin")]
 mod admin;
 mod client;
 #[cfg(feature = "conductor")]
@@ -178,6 +183,8 @@ mod serialize;
 mod sqlite;
 mod tx;
 
+#[cfg(feature = "admin")]
+#[cfg_attr(docsrs, doc(cfg(feature = "admin")))]
 pub use admin::AdminServer;
 pub use client::Client;
 #[cfg(feature = "conductor")]

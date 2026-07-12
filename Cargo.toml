@@ -51,6 +51,10 @@ sqlite = ["sqlx/sqlite"]
 # that never talk to the control plane don't compile the stack it needs
 # (tokio-tungstenite for the TLS websocket, flate2 for gzip framing).
 conductor = ["dep:tokio-tungstenite", "dep:flate2"]
+# The admin HTTP server (`AdminServer`): health, recovery, and workflow-
+# management endpoints the DBOS console/conductor and health probes call. Opt-in
+# — off by default it drops the axum/hyper/tower HTTP stack.
+admin = ["dep:axum"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -75,9 +79,10 @@ sha2 = "0.10"
 # gzip framing for the conductor's portable workflow export/import payloads.
 # Conductor-only, so optional and pulled in by the `conductor` feature.
 flate2 = { version = "1", optional = true }
-# Admin HTTP control surface (opt-in via `AdminServer::start`). Default features
-# give the tokio/http1/json stack the handlers need.
-axum = "0.7"
+# Admin HTTP control surface (`AdminServer`). Admin-only, so optional and pulled
+# in by the `admin` feature; its default features give the tokio/http1/json
+# stack the handlers need.
+axum = { version = "0.7", optional = true }
 # Conductor websocket client. rustls to match the rest of the TLS stack;
 # `futures-util` drives the split Sink/Stream. Conductor-only, so optional and
 # pulled in by the `conductor` feature.
