@@ -1204,14 +1204,22 @@ impl DurableEngine {
 
         // Dispatch the recovery snapshot taken above on a background task, so
         // launch stays prompt — a recovered workflow runs to completion, which
-        // would otherwise block startup for its full duration. The recovered runs
-        // are tracked by `inflight`, so `shutdown` drains them. (`tokio::spawn` is
-        // not an await, so the dispatcher lock above is fine to hold across it.)
+        // would otherwise block startup for its full duration. The task holds a
+        // drain guard for its whole lifetime — non-queued recovered runs execute
+        // inside it, on no tracked task of their own — so `shutdown` waits it
+        // out with no window between records where the in-flight count dips to
+        // zero; and once shutdown begins, the dispatch loop stops starting
+        // workflows it has not reached yet. (`tokio::spawn` is not an await, so
+        // the dispatcher lock above is fine to hold across it.)
         if !to_recover.is_empty() {
             let rt = rt.clone();
             let max = self.max_recovery_attempts;
+            let shutting_down = self.shutting_down.clone();
+            self.inflight.fetch_add(1, Ordering::Relaxed);
+            let guard = InflightGuard(self.inflight.clone());
             tokio::spawn(async move {
-                match dispatch_pending_workflows(&rt, max, to_recover).await {
+                let _guard = guard;
+                match dispatch_pending_workflows(&rt, max, to_recover, &shutting_down).await {
                     Ok(ids) => {
                         tracing::info!(count = ids.len(), "recovered pending workflows on launch")
                     }
@@ -1302,7 +1310,12 @@ impl DurableEngine {
     }
 
     /// Stop the queue dispatchers and wait for in-flight workflow tasks started
-    /// here to drain (up to `timeout`).
+    /// here to drain (up to `timeout`). Runs re-dispatched by recovery —
+    /// [`recover`](Self::recover) or
+    /// [`recover_on_launch`](EngineConfig::recover_on_launch) — drain too: a
+    /// recovery still working through its snapshot finishes the run it is on,
+    /// starts no more, and leaves the untouched remainder `PENDING` for a later
+    /// recovery.
     pub async fn shutdown(&self, timeout: Duration) -> Result<()> {
         self.shutting_down.store(true, Ordering::Relaxed);
         // Stop claiming new work first, then drain what is already running. An
@@ -1882,7 +1895,13 @@ impl DurableEngine {
     /// workflow that was recovered. Backs the admin server's
     /// `POST /dbos-workflow-recovery`, which recovers a named set of executors.
     pub async fn recover_pending_for(&self, executor_ids: &[String]) -> Result<Vec<String>> {
-        recover_pending_workflows(&self.runtime(), self.max_recovery_attempts, executor_ids).await
+        recover_pending_workflows(
+            &self.runtime(),
+            self.max_recovery_attempts,
+            executor_ids,
+            &self.shutting_down,
+        )
+        .await
     }
 }
 
@@ -1898,9 +1917,10 @@ pub(crate) async fn recover_pending_workflows(
     rt: &Arc<Runtime>,
     max_recovery_attempts: i32,
     executor_ids: &[String],
+    shutting_down: &AtomicBool,
 ) -> Result<Vec<String>> {
     let pending = list_pending_workflows(rt, executor_ids).await?;
-    dispatch_pending_workflows(rt, max_recovery_attempts, pending).await
+    dispatch_pending_workflows(rt, max_recovery_attempts, pending, shutting_down).await
 }
 
 /// The `PENDING` workflows of this app version owned by the given executors
@@ -1923,13 +1943,32 @@ pub(crate) async fn list_pending_workflows(
 /// Re-dispatch a snapshot of pending workflows: each is bumped past the recovery
 /// cap (parking it if exceeded), re-queued if it was claimed off a queue, or
 /// otherwise re-run to completion.
+///
+/// Once `shutting_down` is observed set, no further workflows are started; the
+/// remainder stays `PENDING` for a later recovery. Only shutdown stops the loop
+/// — recovery on a [`deactivate`](DurableEngine::deactivate)d engine is
+/// deliberate, since the admin recovery endpoint exists to re-dispatch work.
 pub(crate) async fn dispatch_pending_workflows(
     rt: &Arc<Runtime>,
     max_recovery_attempts: i32,
     pending: Vec<WorkflowStatus>,
+    shutting_down: &AtomicBool,
 ) -> Result<Vec<String>> {
+    let total = pending.len();
     let mut recovered = Vec::new();
-    for record in pending {
+    for (dispatched, record) in pending.into_iter().enumerate() {
+        // Checked before each record — and before its recovery-attempt bump, so
+        // a workflow this loop never reaches doesn't burn an attempt. The run
+        // already in flight is not cut; shutdown waits it out via the caller's
+        // drain guard.
+        if shutting_down.load(Ordering::Relaxed) {
+            tracing::info!(
+                dispatched,
+                remaining = total - dispatched,
+                "shutdown began during recovery; leaving the remaining pending workflows for a later recovery"
+            );
+            break;
+        }
         let attempts = rt
             .provider
             .bump_recovery_attempts(&record.id, max_recovery_attempts)

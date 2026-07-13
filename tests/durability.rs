@@ -4,7 +4,7 @@ use durare::{
     DurableContext, DurableEngine, Error, InMemoryProvider, Result, StateProvider, StepOptions,
     WorkflowOptions, STATUS_PENDING, STATUS_SUCCESS,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -463,6 +463,79 @@ async fn launch_does_not_recover_by_default() -> Result<()> {
             .status,
         STATUS_SUCCESS,
         "the manually recovered run completes"
+    );
+    Ok(())
+}
+
+/// The graceful-shutdown contract holds for launch recovery: a run the
+/// launch-recovery task re-dispatched counts as in-flight, so `shutdown` waits
+/// it out rather than returning while it is mid-run.
+#[tokio::test]
+async fn shutdown_drains_a_launch_recovered_run() -> Result<()> {
+    static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+
+    // First "process": leave a PENDING run behind.
+    let provider = Arc::new(InMemoryProvider::new());
+    {
+        let mut engine = DurableEngine::new(provider.clone()).await?;
+        engine.register("drain-probe", |_ctx: DurableContext, _: ()| async move {
+            if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("boom on the first attempt");
+            }
+            RUNNING.store(true, Ordering::SeqCst);
+            // Long enough that a shutdown which doesn't drain would return
+            // while this run is still going.
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            Ok::<_, Error>(())
+        });
+        let _ = engine
+            .start::<(), ()>("drain-probe", (), WorkflowOptions::with_id("wf-drain"))
+            .await?
+            .result()
+            .await;
+    }
+
+    // Second "process" opts in; launch() re-dispatches the run in the background.
+    let mut builder = DurableEngine::builder(provider.clone());
+    builder.recover_on_launch(true);
+    builder.register("drain-probe", |_ctx: DurableContext, _: ()| async move {
+        if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("boom on the first attempt");
+        }
+        RUNNING.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        Ok::<_, Error>(())
+    });
+    let engine = builder.build().await?;
+    engine.launch().await?;
+
+    // Wait until the recovered run is genuinely mid-flight...
+    for _ in 0..500 {
+        if RUNNING.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(RUNNING.load(Ordering::SeqCst), "the recovered run started");
+
+    // ...then shut down. Draining means the run finished (SUCCESS) by the time
+    // shutdown returns; without the drain guard, shutdown would return
+    // immediately and the row would still be PENDING here.
+    engine.shutdown(Duration::from_secs(10)).await?;
+    assert_eq!(
+        provider
+            .get_workflow_status("wf-drain")
+            .await?
+            .unwrap()
+            .status,
+        STATUS_SUCCESS,
+        "shutdown waited for the launch-recovered run to finish"
+    );
+    assert_eq!(
+        ATTEMPTS.load(Ordering::SeqCst),
+        2,
+        "crashed once, then recovered on launch"
     );
     Ok(())
 }

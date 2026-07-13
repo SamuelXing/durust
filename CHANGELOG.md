@@ -18,7 +18,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   gone, not running concurrently. Enable it for a single-process app, or when you
   set a distinct `DBOS__VMID` per process; otherwise keep driving recovery
   yourself with `recover()`. (A future release may default it on once recovery
-  is liveness-aware.)
+  is liveness-aware.) Recovery honors the graceful-shutdown contract: runs it
+  re-dispatches count as in-flight, so `shutdown` drains them, and a shutdown
+  that begins mid-recovery stops further dispatch — the run in flight finishes,
+  the untouched remainder stays pending for a later recovery.
 
 ## [0.3.1] - 2026-07-12
 
