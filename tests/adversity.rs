@@ -296,3 +296,352 @@ async fn pg_recovery_honors_executor_ownership() -> Result<()> {
     b.shutdown(Duration::from_secs(10)).await?;
     Ok(())
 }
+
+/// Park this task forever — a live-but-stalled executor from the database's
+/// point of view: its claims and non-terminal rows persist, but it makes no
+/// further progress.
+async fn stall() -> ! {
+    std::future::pending::<()>().await;
+    unreachable!()
+}
+
+/// The version gate under contention: two engines of *different* pinned
+/// versions race one queue. Version-stamped rows must go only to their own
+/// version's engine, and ''-version rows only to the **latest**-registered
+/// one — asserted by executor attribution on every completed row, with an
+/// exactly-once body count. Runs in a private database: the ''-half of the
+/// contract legitimately depends on global "latest", which the shared test
+/// database cannot guarantee.
+#[tokio::test]
+async fn pg_version_gate_routes_under_contention() -> Result<()> {
+    let Some(base_url) = database_url() else {
+        eprintln!("skipping pg_version_gate_routes_under_contention: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let dbname = format!("durare_vgate_{tag}");
+    let admin = sqlx::postgres::PgPool::connect(&base_url).await.unwrap();
+    sqlx::raw_sql(&format!("CREATE DATABASE {dbname}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let url = with_database(&base_url, &dbname);
+
+    let queue = format!("vgate-q-{tag}");
+    let wf = format!("vgate-task-{tag}");
+    let (ver1, ver2) = (format!("v1-{tag}"), format!("v2-{tag}"));
+    let (exec1, exec2) = (format!("xv1-{tag}"), format!("xv2-{tag}"));
+
+    // Launch v1 first, v2 second: v2's fresh registration is newest → latest.
+    let mut engines = Vec::new();
+    for (ver, exec) in [(&ver1, &exec1), (&ver2, &exec2)] {
+        let provider = PostgresProvider::connect(&url).await?;
+        let config = EngineConfig::default()
+            .app_version(ver.as_str())
+            .executor_id(exec.as_str());
+        let mut engine = DurableEngine::with_config(Arc::new(provider), config).await?;
+        engine.register(&wf, |ctx: DurableContext, task: String| async move {
+            bump(body_runs(), &task);
+            ctx.step("work", || async {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                Ok::<_, Error>(())
+            })
+            .await
+        });
+        engine.register_queue(WorkflowQueue::new(&queue));
+        engine.launch().await?;
+        engines.push(engine);
+    }
+
+    // Three producers: v1-stamped, v2-stamped, and ''-stamped (a plain client).
+    let producer = Arc::new(PostgresProvider::connect(&url).await?);
+    let mk_client = |ver: Option<&str>| {
+        let c = durare::Client::new(producer.clone());
+        match ver {
+            Some(v) => c.with_app_version(v),
+            None => c,
+        }
+    };
+    let groups: [(&str, Option<&str>); 3] = [
+        ("g1", Some(ver1.as_str())),
+        ("g2", Some(ver2.as_str())),
+        ("g0", None),
+    ];
+    let mut ids = Vec::new();
+    for (group, ver) in groups {
+        let client = mk_client(ver);
+        for n in 0..6 {
+            let id = format!("{group}-{n}-{tag}");
+            let opts = WorkflowOptions {
+                workflow_id: Some(id.clone()),
+                ..Default::default()
+            };
+            let _ = client
+                .enqueue::<_, ()>(&queue, &wf, id.clone(), opts)
+                .await?;
+            ids.push((group, id));
+        }
+    }
+
+    // Every row completes; each is attributed to exactly the right executor.
+    let probe = PostgresProvider::connect(&url).await?;
+    for (group, id) in &ids {
+        let mut status = None;
+        for _ in 0..200 {
+            let row = probe.get_workflow_status(id).await?.unwrap();
+            if row.status == STATUS_SUCCESS {
+                status = Some(row);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let row = status.unwrap_or_else(|| panic!("{id}: never completed"));
+        let expected_exec = match *group {
+            "g1" => &exec1,
+            _ => &exec2, // v2 rows AND ''-rows (latest) both belong to v2
+        };
+        assert_eq!(
+            row.executor_id.as_str(),
+            expected_exec,
+            "{id}: claimed by the right version's executor under contention"
+        );
+        assert_eq!(
+            body_runs().lock().unwrap().get(id).copied(),
+            Some(1),
+            "{id}: executed exactly once"
+        );
+    }
+
+    for engine in &engines {
+        engine.shutdown(Duration::from_secs(10)).await?;
+    }
+    drop(engines);
+    drop(probe);
+    drop(producer);
+    if let Err(e) = sqlx::raw_sql(&format!("DROP DATABASE {dbname} WITH (FORCE)"))
+        .execute(&admin)
+        .await
+    {
+        eprintln!("vgate test: leaving {dbname} behind: {e}");
+    }
+    Ok(())
+}
+
+/// Swap the database name in a Postgres URL (`…/olddb?params` → `…/newdb?params`).
+fn with_database(url: &str, dbname: &str) -> String {
+    let (head, query) = match url.split_once('?') {
+        Some((h, q)) => (h, Some(q)),
+        None => (url, None),
+    };
+    let (prefix, _) = head
+        .rsplit_once('/')
+        .expect("postgres URL should end in /dbname");
+    match query {
+        Some(q) => format!("{prefix}/{dbname}?{q}"),
+        None => format!("{prefix}/{dbname}"),
+    }
+}
+
+/// The documented sharp edge, pinned: two **live** engines sharing one
+/// executor id, the second launching with `recover_on_launch(true)`, will
+/// re-dispatch the first's in-flight workflow — double execution. This is
+/// exactly why the flag defaults **off** and requires a unique executor id
+/// per live process; if this test ever fails, that safety story changed.
+#[tokio::test]
+async fn pg_duplicate_executor_id_double_runs_with_recover_on_launch() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!(
+            "skipping pg_duplicate_executor_id_double_runs_with_recover_on_launch: DATABASE_URL unset"
+        );
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let wf = format!("dup-task-{tag}");
+    let wf_id = format!("wf-dup-{tag}");
+    let ver = format!("vdup-{tag}");
+    let exec = format!("dup-exec-{tag}"); // the SAME id on both engines
+    let entries = Arc::new(AtomicUsize::new(0));
+
+    let register = |engine: &mut DurableEngine, entries: Arc<AtomicUsize>| {
+        engine.register(&wf, move |ctx: DurableContext, _: ()| {
+            let entries = entries.clone();
+            async move {
+                // First execution (engine A): checkpoint one step, then stall
+                // while still live. Second execution (engine B's recovery):
+                // run to completion.
+                let first = entries.fetch_add(1, Ordering::SeqCst) == 0;
+                ctx.step("s1", || async { Ok::<_, Error>(()) }).await?;
+                if first {
+                    stall().await;
+                }
+                ctx.step("s2", || async { Ok::<_, Error>(()) }).await?;
+                Ok::<_, Error>(())
+            }
+        });
+    };
+
+    // Engine A: starts the workflow and stalls mid-body — alive, in flight.
+    let provider_a = PostgresProvider::connect(&url).await?;
+    let config_a = EngineConfig::default()
+        .app_version(ver.as_str())
+        .executor_id(exec.as_str());
+    let mut a = DurableEngine::with_config(Arc::new(provider_a), config_a).await?;
+    register(&mut a, entries.clone());
+    let _handle = a
+        .start::<(), ()>(&wf, (), WorkflowOptions::with_id(&wf_id))
+        .await?;
+    for _ in 0..200 {
+        if entries.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await; // s1 checkpoint settles
+
+    // Engine B: SAME executor id, recover_on_launch(true). Its launch-recovery
+    // sees "its own" pending work — which is A's live, in-flight run — and
+    // re-dispatches it.
+    let provider_b = PostgresProvider::connect(&url).await?;
+    let config_b = EngineConfig::default()
+        .app_version(ver.as_str())
+        .executor_id(exec.as_str())
+        .recover_on_launch(true);
+    let mut b = DurableEngine::with_config(Arc::new(provider_b), config_b).await?;
+    register(&mut b, entries.clone());
+    b.launch().await?;
+
+    let probe = PostgresProvider::connect(&url).await?;
+    let mut status = String::new();
+    for _ in 0..200 {
+        status = probe.get_workflow_status(&wf_id).await?.unwrap().status;
+        if status == STATUS_SUCCESS {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        status, STATUS_SUCCESS,
+        "B's launch-recovery re-ran A's workflow"
+    );
+    assert_eq!(
+        entries.load(Ordering::SeqCst),
+        2,
+        "double execution: A still live, B re-dispatched the same run — the \
+         reason recover_on_launch is opt-in and needs unique executor ids"
+    );
+
+    b.shutdown(Duration::from_secs(10)).await?;
+    Ok(())
+}
+
+/// The safe half of split-brain: taking over a **live but stalled** executor
+/// with an explicit `recover_pending_for` is bounded — checkpointed steps are
+/// served from their records (their effects never repeat), only the frontier
+/// runs, and the workflow completes while the stalled owner still exists.
+#[tokio::test]
+async fn pg_takeover_of_live_stalled_executor_is_bounded() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_takeover_of_live_stalled_executor_is_bounded: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let wf = format!("stall-task-{tag}");
+    let wf_id = format!("wf-stall-{tag}");
+    let ver = format!("vstall-{tag}");
+    let (exec_a, exec_b) = (format!("stall-a-{tag}"), format!("stall-b-{tag}"));
+    let entries = Arc::new(AtomicUsize::new(0));
+
+    let register = |engine: &mut DurableEngine, entries: Arc<AtomicUsize>, tag: String| {
+        engine.register(&wf, move |ctx: DurableContext, _: ()| {
+            let entries = entries.clone();
+            let tag = tag.clone();
+            async move {
+                let first = entries.fetch_add(1, Ordering::SeqCst) == 0;
+                let k1 = format!("stall-s1-{tag}");
+                ctx.step("s1", || async {
+                    bump(step_runs(), &k1);
+                    Ok::<_, Error>(())
+                })
+                .await?;
+                if first {
+                    stall().await;
+                }
+                let k2 = format!("stall-s2-{tag}");
+                ctx.step("s2", || async {
+                    bump(step_runs(), &k2);
+                    Ok::<_, Error>(())
+                })
+                .await?;
+                Ok::<_, Error>(())
+            }
+        });
+    };
+
+    // A runs s1 (checkpointed), then stalls mid-body — alive.
+    let provider_a = PostgresProvider::connect(&url).await?;
+    let config_a = EngineConfig::default()
+        .app_version(ver.as_str())
+        .executor_id(exec_a.as_str());
+    let mut a = DurableEngine::with_config(Arc::new(provider_a), config_a).await?;
+    register(&mut a, entries.clone(), tag.clone());
+    let _handle = a
+        .start::<(), ()>(&wf, (), WorkflowOptions::with_id(&wf_id))
+        .await?;
+    for _ in 0..200 {
+        if step_runs()
+            .lock()
+            .unwrap()
+            .get(&format!("stall-s1-{tag}"))
+            .copied()
+            == Some(1)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await; // s1 checkpoint settles
+
+    // B (its own executor id, same pinned version) explicitly takes over A's
+    // executor while A is still alive.
+    let provider_b = PostgresProvider::connect(&url).await?;
+    let config_b = EngineConfig::default()
+        .app_version(ver.as_str())
+        .executor_id(exec_b.as_str());
+    let mut b = DurableEngine::with_config(Arc::new(provider_b), config_b).await?;
+    register(&mut b, entries.clone(), tag.clone());
+    let recovered = b.recover_pending_for(std::slice::from_ref(&exec_a)).await?;
+    assert!(recovered.contains(&wf_id), "takeover re-dispatched the run");
+
+    let probe = PostgresProvider::connect(&url).await?;
+    assert_eq!(
+        probe.get_workflow_status(&wf_id).await?.unwrap().status,
+        STATUS_SUCCESS,
+        "the takeover completed the workflow while the owner still lives"
+    );
+    assert_eq!(
+        step_runs()
+            .lock()
+            .unwrap()
+            .get(&format!("stall-s1-{tag}"))
+            .copied(),
+        Some(1),
+        "the checkpointed step never re-ran"
+    );
+    assert_eq!(
+        step_runs()
+            .lock()
+            .unwrap()
+            .get(&format!("stall-s2-{tag}"))
+            .copied(),
+        Some(1),
+        "the frontier step ran exactly once"
+    );
+    assert_eq!(
+        entries.load(Ordering::SeqCst),
+        2,
+        "one stalled run, one replay"
+    );
+
+    b.shutdown(Duration::from_secs(10)).await?;
+    Ok(())
+}
