@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
+use tokio_util::task::TaskTracker;
 
 /// How often the schedule reconciler lists persisted schedules and installs or
 /// retires per-schedule firing loops. Short so a freshly created or paused
@@ -450,9 +451,11 @@ pub struct DurableEngine {
     /// work (dispatchers/scheduler aborted) but keeps serving in-flight runs and
     /// the admin server. Idempotent.
     deactivated: Arc<AtomicBool>,
-    /// Count of workflow tasks this process is currently running, so
-    /// [`shutdown`](Self::shutdown) can drain before returning.
-    inflight: Arc<AtomicUsize>,
+    /// Tracks every in-flight workflow-run task so [`shutdown`](Self::shutdown)
+    /// can drain them before returning. A run is spawned *through* the tracker,
+    /// so it is counted from the instant it is created — no separate guard to
+    /// keep in sync.
+    tasks: TaskTracker,
     /// Per-queue dispatcher tasks spawned by [`launch`](Self::launch).
     dispatchers: std::sync::Mutex<Vec<JoinHandle<()>>>,
     /// Shared execution core, built once from the registrations on first run and
@@ -618,7 +621,7 @@ impl DurableEngineBuilder {
             recover_on_launch: self.config.resolve_recover_on_launch(),
             shutting_down: Arc::new(AtomicBool::new(false)),
             deactivated: Arc::new(AtomicBool::new(false)),
-            inflight: Arc::new(AtomicUsize::new(0)),
+            tasks: TaskTracker::new(),
             dispatchers: std::sync::Mutex::new(Vec::new()),
             runtime: std::sync::OnceLock::new(),
         })
@@ -692,7 +695,7 @@ impl DurableEngine {
             recover_on_launch: config.resolve_recover_on_launch(),
             shutting_down: Arc::new(AtomicBool::new(false)),
             deactivated: Arc::new(AtomicBool::new(false)),
-            inflight: Arc::new(AtomicUsize::new(0)),
+            tasks: TaskTracker::new(),
             dispatchers: std::sync::Mutex::new(Vec::new()),
             runtime: std::sync::OnceLock::new(),
         })
@@ -789,7 +792,7 @@ impl DurableEngine {
                     queues: self.queues.clone(),
                     executor_id: self.executor_id.clone(),
                     app_version: self.app_version.clone(),
-                    inflight: self.inflight.clone(),
+                    tasks: self.tasks.clone(),
                 })
             })
             .clone()
@@ -1125,6 +1128,9 @@ impl DurableEngine {
             return Ok(());
         }
         self.shutting_down.store(false, Ordering::Relaxed);
+        // A prior `shutdown` closed the tracker; reopen it so this launch's runs
+        // are tracked and the next `shutdown` can drain them.
+        self.tasks.reopen();
         let rt = self.runtime();
 
         // Register this process's application version.
@@ -1204,21 +1210,17 @@ impl DurableEngine {
 
         // Dispatch the recovery snapshot taken above on a background task, so
         // launch stays prompt — a recovered workflow runs to completion, which
-        // would otherwise block startup for its full duration. The task holds a
-        // drain guard for its whole lifetime — non-queued recovered runs execute
-        // inside it, on no tracked task of their own — so `shutdown` waits it
-        // out with no window between records where the in-flight count dips to
-        // zero; and once shutdown begins, the dispatch loop stops starting
-        // workflows it has not reached yet. (`tokio::spawn` is not an await, so
-        // the dispatcher lock above is fine to hold across it.)
+        // would otherwise block startup for its full duration. Spawned through
+        // the tracker (non-queued recovered runs execute inline within it, on no
+        // tracked task of their own), so `shutdown` waits the whole recovery out;
+        // once shutdown begins, the dispatch loop stops starting workflows it has
+        // not reached yet. (`spawn` is not an await, so holding the dispatcher
+        // lock above across it is fine.)
         if !to_recover.is_empty() {
             let rt = rt.clone();
             let max = self.max_recovery_attempts;
             let shutting_down = self.shutting_down.clone();
-            self.inflight.fetch_add(1, Ordering::Relaxed);
-            let guard = InflightGuard(self.inflight.clone());
-            tokio::spawn(async move {
-                let _guard = guard;
+            self.tasks.spawn(async move {
                 match dispatch_pending_workflows(&rt, max, to_recover, &shutting_down).await {
                     Ok(ids) => {
                         tracing::info!(count = ids.len(), "recovered pending workflows on launch")
@@ -1329,13 +1331,11 @@ impl DurableEngine {
         {
             d.abort();
         }
-        let deadline = std::time::Instant::now() + timeout;
-        while self.inflight.load(Ordering::Acquire) > 0 {
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        // Drain in-flight runs, bounded by `timeout`: `close` lets `wait` return
+        // once the tracked set empties. A run still going when the deadline passes
+        // is left mid-flight — durable, so a later recovery resumes it.
+        self.tasks.close();
+        let _ = tokio::time::timeout(timeout, self.tasks.wait()).await;
         Ok(())
     }
 
@@ -2032,7 +2032,7 @@ pub(crate) struct Runtime {
     queues: HashMap<String, Arc<WorkflowQueue>>,
     executor_id: String,
     app_version: String,
-    inflight: Arc<AtomicUsize>,
+    tasks: TaskTracker,
 }
 
 impl Runtime {
@@ -2110,7 +2110,8 @@ impl Runtime {
     }
 
     /// Spawn a run on a task this caller owns (for a local [`WorkflowHandle`]).
-    /// The task holds a drain guard so [`DurableEngine::shutdown`] waits it out.
+    /// Spawned through the [`TaskTracker`] so [`DurableEngine::shutdown`] waits it
+    /// out — the task is counted from the moment it is created.
     fn spawn_owned(
         self: &Arc<Self>,
         id: String,
@@ -2120,10 +2121,7 @@ impl Runtime {
         auth: AuthContext,
     ) -> JoinHandle<Result<Value>> {
         let rt = self.clone();
-        self.inflight.fetch_add(1, Ordering::Relaxed);
-        let guard = InflightGuard(self.inflight.clone());
-        tokio::spawn(async move {
-            let _guard = guard;
+        self.tasks.spawn(async move {
             run_to_completion(rt, handler, id, input, deadline_ms, auth).await
         })
     }
@@ -2140,7 +2138,8 @@ impl Runtime {
         auth: AuthContext,
     ) {
         let join = self.spawn_owned(id, handler, input, deadline_ms, auth);
-        // Detach: the inflight guard inside the task keeps shutdown correct.
+        // Detach: the run is tracked by the `TaskTracker`, so shutdown still
+        // drains it.
         drop(join);
     }
 
@@ -2230,8 +2229,11 @@ impl Runtime {
 }
 
 /// Decrements the in-flight counter when a workflow task ends (even on panic).
-struct InflightGuard(Arc<AtomicUsize>);
-impl Drop for InflightGuard {
+/// Releases a per-partition worker-concurrency slot when a queued run finishes,
+/// even if it panics. (Shutdown-drain is handled separately by the engine's
+/// [`TaskTracker`]; this only bounds how many runs a queue starts at once.)
+struct RunningGuard(Arc<AtomicUsize>);
+impl Drop for RunningGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Release);
     }
@@ -2257,7 +2259,6 @@ async fn queue_dispatch_loop(
     let provider = rt.provider.clone();
     let executor_id = rt.executor_id.clone();
     let app_version = rt.app_version.clone();
-    let inflight = rt.inflight.clone();
     // Local running count per partition key (`""` for a non-partitioned queue).
     let local_running: std::sync::Mutex<HashMap<String, Arc<AtomicUsize>>> = Default::default();
     let mut interval = queue.base_polling_interval;
@@ -2345,19 +2346,17 @@ async fn queue_dispatch_loop(
                                 .await;
                             continue;
                         };
-                        inflight.fetch_add(1, Ordering::Relaxed);
                         counter.fetch_add(1, Ordering::Relaxed);
-                        let rt = rt.clone();
-                        let inflight_guard = InflightGuard(inflight.clone());
-                        let local_guard = InflightGuard(counter.clone());
+                        let run_rt = rt.clone();
+                        let local_guard = RunningGuard(counter.clone());
                         let auth = AuthContext::from_status(&wf);
-                        tokio::spawn(async move {
-                            let _inflight = inflight_guard;
+                        // Spawn through the tracker so `shutdown` drains this run.
+                        rt.tasks.spawn(async move {
                             let _local = local_guard;
                             // Terminal state is recorded by run_to_completion;
                             // a handle observing this workflow polls it.
                             let _ = run_to_completion(
-                                rt,
+                                run_rt,
                                 handler,
                                 wf.id,
                                 wf.input,

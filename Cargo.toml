@@ -90,7 +90,7 @@ tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"], 
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 # CancellationToken for structured, level-triggered shutdown of the conductor
 # connection loop (and the sub-tasks later parts will spawn).
-tokio-util = { version = "0.7", default-features = false }
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 durare-macros = { path = "durare-macros", version = "0.1" }
 # SQL backends. The driver features (`postgres`, `sqlite`) are pulled in by the
 # crate's own `postgres`/`sqlite` features, not here, so a single-backend build
