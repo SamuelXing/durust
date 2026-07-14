@@ -6,6 +6,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-07-13
+
+Recovery ergonomics and shutdown correctness: launch can now (opt-in) resume
+the work a previous run left pending, and shutdown promptly stops the
+background loops and genuinely drains every in-flight run — including recovered
+ones. `durare-macros` is unchanged and stays at `0.1.0`.
+
+One compatibility note: `EngineConfig` gained a public field
+(`recover_on_launch`), which is technically breaking for code constructing it
+as an exhaustive struct literal. The documented construction path —
+`EngineConfig::default()` plus setters — and `..Default::default()` literals
+are unaffected, and no such literal usage is known. (Marking the config structs
+`#[non_exhaustive]` is queued for the pre-1.0 API review, so field additions
+stop being breaking at all.)
+
 ### Added
 
 - Opt-in recovery on launch: `EngineConfig::recover_on_launch(true)` (or the
@@ -233,7 +248,8 @@ workflows after a crash.
   tables the DBOS Transact SDKs use, plus a portable cross-SDK serialization
   envelope.
 
-[Unreleased]: https://github.com/SamuelXing/durare/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/SamuelXing/durare/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/SamuelXing/durare/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/SamuelXing/durare/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/SamuelXing/durare/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/SamuelXing/durare/compare/v0.1.1...v0.2.0
