@@ -24,6 +24,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 /// How often the schedule reconciler lists persisted schedules and installs or
 /// retires per-schedule firing loops. Short so a freshly created or paused
@@ -444,15 +446,19 @@ pub struct DurableEngine {
     /// workflows in the background on startup (off by default; opt-in). See
     /// [`EngineConfig::recover_on_launch`].
     recover_on_launch: bool,
-    /// Flipped by [`shutdown`](Self::shutdown); background loops observe it.
-    shutting_down: Arc<AtomicBool>,
+    /// Cancelled by [`shutdown`](Self::shutdown) to stop the background loops.
+    /// [`launch`](Self::launch) installs a fresh token after a shutdown, since a
+    /// cancelled token can't be reset.
+    shutdown_token: std::sync::Mutex<CancellationToken>,
     /// Set by [`deactivate`](Self::deactivate): this process stops claiming new
     /// work (dispatchers/scheduler aborted) but keeps serving in-flight runs and
     /// the admin server. Idempotent.
     deactivated: Arc<AtomicBool>,
-    /// Count of workflow tasks this process is currently running, so
-    /// [`shutdown`](Self::shutdown) can drain before returning.
-    inflight: Arc<AtomicUsize>,
+    /// Tracks every in-flight workflow-run task so [`shutdown`](Self::shutdown)
+    /// can drain them before returning. A run is spawned *through* the tracker,
+    /// so it is counted from the instant it is created — no separate guard to
+    /// keep in sync.
+    tasks: TaskTracker,
     /// Per-queue dispatcher tasks spawned by [`launch`](Self::launch).
     dispatchers: std::sync::Mutex<Vec<JoinHandle<()>>>,
     /// Shared execution core, built once from the registrations on first run and
@@ -616,9 +622,9 @@ impl DurableEngineBuilder {
             app_version,
             max_recovery_attempts: self.max_recovery_attempts,
             recover_on_launch: self.config.resolve_recover_on_launch(),
-            shutting_down: Arc::new(AtomicBool::new(false)),
+            shutdown_token: std::sync::Mutex::new(CancellationToken::new()),
             deactivated: Arc::new(AtomicBool::new(false)),
-            inflight: Arc::new(AtomicUsize::new(0)),
+            tasks: TaskTracker::new(),
             dispatchers: std::sync::Mutex::new(Vec::new()),
             runtime: std::sync::OnceLock::new(),
         })
@@ -690,9 +696,9 @@ impl DurableEngine {
             app_version,
             max_recovery_attempts: 100,
             recover_on_launch: config.resolve_recover_on_launch(),
-            shutting_down: Arc::new(AtomicBool::new(false)),
+            shutdown_token: std::sync::Mutex::new(CancellationToken::new()),
             deactivated: Arc::new(AtomicBool::new(false)),
-            inflight: Arc::new(AtomicUsize::new(0)),
+            tasks: TaskTracker::new(),
             dispatchers: std::sync::Mutex::new(Vec::new()),
             runtime: std::sync::OnceLock::new(),
         })
@@ -789,7 +795,7 @@ impl DurableEngine {
                     queues: self.queues.clone(),
                     executor_id: self.executor_id.clone(),
                     app_version: self.app_version.clone(),
-                    inflight: self.inflight.clone(),
+                    tasks: self.tasks.clone(),
                 })
             })
             .clone()
@@ -1124,7 +1130,18 @@ impl DurableEngine {
         if self.is_deactivated() {
             return Ok(());
         }
-        self.shutting_down.store(false, Ordering::Relaxed);
+        // A prior `shutdown` cancelled the token and closed the tracker. Install a
+        // fresh token (a cancelled one can't be reset) and reopen the tracker, so
+        // this launch's loops and runs are live and the next `shutdown` stops and
+        // drains them.
+        let cancel = {
+            let mut token = self.shutdown_token.lock().expect("shutdown token poisoned");
+            if token.is_cancelled() {
+                *token = CancellationToken::new();
+            }
+            token.clone()
+        };
+        self.tasks.reopen();
         let rt = self.runtime();
 
         // Register this process's application version.
@@ -1193,33 +1210,29 @@ impl DurableEngine {
             tasks.push(tokio::spawn(queue_dispatch_loop(
                 queue.clone(),
                 rt.clone(),
-                self.shutting_down.clone(),
+                cancel.clone(),
             )));
         }
         tasks.push(tokio::spawn(schedule_reconciler(
             rt.clone(),
-            self.shutting_down.clone(),
+            cancel.clone(),
             self.macro_schedules(),
         )));
 
         // Dispatch the recovery snapshot taken above on a background task, so
         // launch stays prompt — a recovered workflow runs to completion, which
-        // would otherwise block startup for its full duration. The task holds a
-        // drain guard for its whole lifetime — non-queued recovered runs execute
-        // inside it, on no tracked task of their own — so `shutdown` waits it
-        // out with no window between records where the in-flight count dips to
-        // zero; and once shutdown begins, the dispatch loop stops starting
-        // workflows it has not reached yet. (`tokio::spawn` is not an await, so
-        // the dispatcher lock above is fine to hold across it.)
+        // would otherwise block startup for its full duration. Spawned through
+        // the tracker (non-queued recovered runs execute inline within it, on no
+        // tracked task of their own), so `shutdown` waits the whole recovery out;
+        // once shutdown begins, the dispatch loop stops starting workflows it has
+        // not reached yet. (`spawn` is not an await, so holding the dispatcher
+        // lock above across it is fine.)
         if !to_recover.is_empty() {
             let rt = rt.clone();
             let max = self.max_recovery_attempts;
-            let shutting_down = self.shutting_down.clone();
-            self.inflight.fetch_add(1, Ordering::Relaxed);
-            let guard = InflightGuard(self.inflight.clone());
-            tokio::spawn(async move {
-                let _guard = guard;
-                match dispatch_pending_workflows(&rt, max, to_recover, &shutting_down).await {
+            let cancel = cancel.clone();
+            self.tasks.spawn(async move {
+                match dispatch_pending_workflows(&rt, max, to_recover, &cancel).await {
                     Ok(ids) => {
                         tracing::info!(count = ids.len(), "recovered pending workflows on launch")
                     }
@@ -1317,7 +1330,10 @@ impl DurableEngine {
     /// starts no more, and leaves the untouched remainder `PENDING` for a later
     /// recovery.
     pub async fn shutdown(&self, timeout: Duration) -> Result<()> {
-        self.shutting_down.store(true, Ordering::Relaxed);
+        self.shutdown_token
+            .lock()
+            .expect("shutdown token poisoned")
+            .cancel();
         // Stop claiming new work first, then drain what is already running. An
         // aborted dispatcher can leave a freshly claimed workflow PENDING; the
         // next launch's recover() re-runs it from its checkpoints.
@@ -1329,13 +1345,11 @@ impl DurableEngine {
         {
             d.abort();
         }
-        let deadline = std::time::Instant::now() + timeout;
-        while self.inflight.load(Ordering::Acquire) > 0 {
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        // Drain in-flight runs, bounded by `timeout`: `close` lets `wait` return
+        // once the tracked set empties. A run still going when the deadline passes
+        // is left mid-flight — durable, so a later recovery resumes it.
+        self.tasks.close();
+        let _ = tokio::time::timeout(timeout, self.tasks.wait()).await;
         Ok(())
     }
 
@@ -1895,11 +1909,16 @@ impl DurableEngine {
     /// workflow that was recovered. Backs the admin server's
     /// `POST /dbos-workflow-recovery`, which recovers a named set of executors.
     pub async fn recover_pending_for(&self, executor_ids: &[String]) -> Result<Vec<String>> {
+        let cancel = self
+            .shutdown_token
+            .lock()
+            .expect("shutdown token poisoned")
+            .clone();
         recover_pending_workflows(
             &self.runtime(),
             self.max_recovery_attempts,
             executor_ids,
-            &self.shutting_down,
+            &cancel,
         )
         .await
     }
@@ -1917,10 +1936,10 @@ pub(crate) async fn recover_pending_workflows(
     rt: &Arc<Runtime>,
     max_recovery_attempts: i32,
     executor_ids: &[String],
-    shutting_down: &AtomicBool,
+    cancel: &CancellationToken,
 ) -> Result<Vec<String>> {
     let pending = list_pending_workflows(rt, executor_ids).await?;
-    dispatch_pending_workflows(rt, max_recovery_attempts, pending, shutting_down).await
+    dispatch_pending_workflows(rt, max_recovery_attempts, pending, cancel).await
 }
 
 /// The `PENDING` workflows of this app version owned by the given executors
@@ -1944,7 +1963,7 @@ pub(crate) async fn list_pending_workflows(
 /// cap (parking it if exceeded), re-queued if it was claimed off a queue, or
 /// otherwise re-run to completion.
 ///
-/// Once `shutting_down` is observed set, no further workflows are started; the
+/// Once cancellation is observed, no further workflows are started; the
 /// remainder stays `PENDING` for a later recovery. Only shutdown stops the loop
 /// — recovery on a [`deactivate`](DurableEngine::deactivate)d engine is
 /// deliberate, since the admin recovery endpoint exists to re-dispatch work.
@@ -1952,7 +1971,7 @@ pub(crate) async fn dispatch_pending_workflows(
     rt: &Arc<Runtime>,
     max_recovery_attempts: i32,
     pending: Vec<WorkflowStatus>,
-    shutting_down: &AtomicBool,
+    cancel: &CancellationToken,
 ) -> Result<Vec<String>> {
     let total = pending.len();
     let mut recovered = Vec::new();
@@ -1961,7 +1980,7 @@ pub(crate) async fn dispatch_pending_workflows(
         // a workflow this loop never reaches doesn't burn an attempt. The run
         // already in flight is not cut; shutdown waits it out via the caller's
         // drain guard.
-        if shutting_down.load(Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             tracing::info!(
                 dispatched,
                 remaining = total - dispatched,
@@ -2032,7 +2051,7 @@ pub(crate) struct Runtime {
     queues: HashMap<String, Arc<WorkflowQueue>>,
     executor_id: String,
     app_version: String,
-    inflight: Arc<AtomicUsize>,
+    tasks: TaskTracker,
 }
 
 impl Runtime {
@@ -2110,7 +2129,8 @@ impl Runtime {
     }
 
     /// Spawn a run on a task this caller owns (for a local [`WorkflowHandle`]).
-    /// The task holds a drain guard so [`DurableEngine::shutdown`] waits it out.
+    /// Spawned through the [`TaskTracker`] so [`DurableEngine::shutdown`] waits it
+    /// out — the task is counted from the moment it is created.
     fn spawn_owned(
         self: &Arc<Self>,
         id: String,
@@ -2120,10 +2140,7 @@ impl Runtime {
         auth: AuthContext,
     ) -> JoinHandle<Result<Value>> {
         let rt = self.clone();
-        self.inflight.fetch_add(1, Ordering::Relaxed);
-        let guard = InflightGuard(self.inflight.clone());
-        tokio::spawn(async move {
-            let _guard = guard;
+        self.tasks.spawn(async move {
             run_to_completion(rt, handler, id, input, deadline_ms, auth).await
         })
     }
@@ -2140,7 +2157,8 @@ impl Runtime {
         auth: AuthContext,
     ) {
         let join = self.spawn_owned(id, handler, input, deadline_ms, auth);
-        // Detach: the inflight guard inside the task keeps shutdown correct.
+        // Detach: the run is tracked by the `TaskTracker`, so shutdown still
+        // drains it.
         drop(join);
     }
 
@@ -2229,9 +2247,11 @@ impl Runtime {
     }
 }
 
-/// Decrements the in-flight counter when a workflow task ends (even on panic).
-struct InflightGuard(Arc<AtomicUsize>);
-impl Drop for InflightGuard {
+/// Releases a per-partition worker-concurrency slot when a queued run finishes,
+/// even if it panics. (Shutdown-drain is handled separately by the engine's
+/// [`TaskTracker`]; this only bounds how many runs a queue starts at once.)
+struct RunningGuard(Arc<AtomicUsize>);
+impl Drop for RunningGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Release);
     }
@@ -2252,18 +2272,17 @@ impl Drop for InflightGuard {
 async fn queue_dispatch_loop(
     queue: Arc<WorkflowQueue>,
     rt: Arc<Runtime>,
-    shutting_down: Arc<AtomicBool>,
+    cancel: CancellationToken,
 ) {
     let provider = rt.provider.clone();
     let executor_id = rt.executor_id.clone();
     let app_version = rt.app_version.clone();
-    let inflight = rt.inflight.clone();
     // Local running count per partition key (`""` for a non-partitioned queue).
     let local_running: std::sync::Mutex<HashMap<String, Arc<AtomicUsize>>> = Default::default();
     let mut interval = queue.base_polling_interval;
 
     loop {
-        if shutting_down.load(Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             return;
         }
 
@@ -2345,19 +2364,17 @@ async fn queue_dispatch_loop(
                                 .await;
                             continue;
                         };
-                        inflight.fetch_add(1, Ordering::Relaxed);
                         counter.fetch_add(1, Ordering::Relaxed);
-                        let rt = rt.clone();
-                        let inflight_guard = InflightGuard(inflight.clone());
-                        let local_guard = InflightGuard(counter.clone());
+                        let run_rt = rt.clone();
+                        let local_guard = RunningGuard(counter.clone());
                         let auth = AuthContext::from_status(&wf);
-                        tokio::spawn(async move {
-                            let _inflight = inflight_guard;
+                        // Spawn through the tracker so `shutdown` drains this run.
+                        rt.tasks.spawn(async move {
                             let _local = local_guard;
                             // Terminal state is recorded by run_to_completion;
                             // a handle observing this workflow polls it.
                             let _ = run_to_completion(
-                                rt,
+                                run_rt,
                                 handler,
                                 wf.id,
                                 wf.input,
@@ -2386,7 +2403,11 @@ async fn queue_dispatch_loop(
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
         let jitter = 0.95 + (nanos % 1000) as f64 / 10_000.0;
-        tokio::time::sleep(interval.mul_f64(jitter)).await;
+        // Wake immediately on shutdown rather than sleeping out the poll interval.
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(interval.mul_f64(jitter)) => {}
+        }
     }
 }
 
@@ -2563,13 +2584,13 @@ async fn backfill_ticks(
 /// the code.
 async fn schedule_reconciler(
     rt: Arc<Runtime>,
-    shutting_down: Arc<AtomicBool>,
+    cancel: CancellationToken,
     macro_schedules: Vec<WorkflowSchedule>,
 ) {
     let mut installed: HashMap<String, InstalledSchedule> = HashMap::new();
 
     loop {
-        if shutting_down.load(Ordering::Relaxed) {
+        if cancel.is_cancelled() {
             for entry in installed.values() {
                 entry.stop.store(true, Ordering::Relaxed);
             }
@@ -2587,7 +2608,7 @@ async fn schedule_reconciler(
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "schedule reconciler: failed to list schedules");
-                sleep_until_or_shutdown(SCHEDULE_RECONCILE_INTERVAL, &shutting_down).await;
+                sleep_until_or_shutdown(SCHEDULE_RECONCILE_INTERVAL, &cancel).await;
                 continue;
             }
         };
@@ -2646,11 +2667,11 @@ async fn schedule_reconciler(
                 schedule,
                 rt.clone(),
                 stop,
-                shutting_down.clone(),
+                cancel.clone(),
             ));
         }
 
-        sleep_until_or_shutdown(SCHEDULE_RECONCILE_INTERVAL, &shutting_down).await;
+        sleep_until_or_shutdown(SCHEDULE_RECONCILE_INTERVAL, &cancel).await;
     }
 }
 
@@ -2663,7 +2684,7 @@ async fn schedule_fire_loop(
     schedule: WorkflowSchedule,
     rt: Arc<Runtime>,
     stop: Arc<AtomicBool>,
-    shutting_down: Arc<AtomicBool>,
+    cancel: CancellationToken,
 ) {
     let cron = match parse_cron(&schedule.schedule) {
         Ok(s) => s,
@@ -2678,14 +2699,14 @@ async fn schedule_fire_loop(
     let tz = schedule.cron_timezone.as_deref();
 
     loop {
-        if stop.load(Ordering::Relaxed) || shutting_down.load(Ordering::Relaxed) {
+        if stop.load(Ordering::Relaxed) || cancel.is_cancelled() {
             return;
         }
         let Some(next) = next_cron_instant(&cron, tz, Utc::now()) else {
             return;
         };
         let wait = (next - Utc::now()).to_std().unwrap_or(Duration::ZERO);
-        if !sleep_until_or_stop(wait, &stop, &shutting_down).await {
+        if !sleep_until_or_stop(wait, &stop, &cancel).await {
             return;
         }
 
@@ -2721,30 +2742,33 @@ async fn schedule_fire_loop(
     }
 }
 
-/// Sleep up to `dur`, returning early if the engine starts shutting down. Used
-/// by the reconciler between passes.
-async fn sleep_until_or_shutdown(dur: Duration, shutting_down: &Arc<AtomicBool>) {
-    sleep_until_or_stop(dur, &Arc::new(AtomicBool::new(false)), shutting_down).await;
+/// Sleep up to `dur`, waking immediately if the engine starts shutting down.
+/// Used by the reconciler between passes.
+async fn sleep_until_or_shutdown(dur: Duration, cancel: &CancellationToken) {
+    tokio::select! {
+        _ = cancel.cancelled() => {}
+        _ = tokio::time::sleep(dur) => {}
+    }
 }
 
-/// Sleep up to `dur` in short slices so `stop`/`shutting_down` are observed
-/// promptly. Returns `true` if the full duration elapsed, `false` if it was cut
-/// short by a stop/shutdown signal.
-async fn sleep_until_or_stop(
-    dur: Duration,
-    stop: &Arc<AtomicBool>,
-    shutting_down: &Arc<AtomicBool>,
-) -> bool {
+/// Sleep up to `dur`, returning `false` early if `stop` is set (polled in short
+/// slices, since it is not awaitable) or the engine starts shutting down
+/// (immediate). Returns `true` if the full duration elapsed.
+async fn sleep_until_or_stop(dur: Duration, stop: &AtomicBool, cancel: &CancellationToken) -> bool {
     let deadline = std::time::Instant::now() + dur;
     loop {
-        if stop.load(Ordering::Relaxed) || shutting_down.load(Ordering::Relaxed) {
+        if stop.load(Ordering::Relaxed) {
             return false;
         }
         let now = std::time::Instant::now();
         if now >= deadline {
             return true;
         }
-        tokio::time::sleep((deadline - now).min(Duration::from_millis(100))).await;
+        let slice = (deadline - now).min(Duration::from_millis(100));
+        tokio::select! {
+            _ = cancel.cancelled() => return false,
+            _ = tokio::time::sleep(slice) => {}
+        }
     }
 }
 

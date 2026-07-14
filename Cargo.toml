@@ -88,9 +88,10 @@ axum = { version = "0.7", optional = true }
 # pulled in by the `conductor` feature.
 tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"], optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
-# CancellationToken for structured, level-triggered shutdown of the conductor
-# connection loop (and the sub-tasks later parts will spawn).
-tokio-util = { version = "0.7", default-features = false }
+# CancellationToken (the engine's shutdown signal and the conductor connection
+# loop) and TaskTracker (draining in-flight runs on shutdown; needs `rt`).
+# TaskTracker first appeared in 0.7.10, hence the floor.
+tokio-util = { version = "0.7.10", default-features = false, features = ["rt"] }
 durare-macros = { path = "durare-macros", version = "0.1" }
 # SQL backends. The driver features (`postgres`, `sqlite`) are pulled in by the
 # crate's own `postgres`/`sqlite` features, not here, so a single-backend build
