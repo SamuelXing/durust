@@ -230,7 +230,12 @@ async fn pg_auth_context_round_trip() -> Result<()> {
     };
     let tag = uuid::Uuid::new_v4();
     let provider = PostgresProvider::connect(&url).await?;
-    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    // Pinned version: the fork below lands on the shared internal queue, and
+    // every engine in this binary shares the default (binary-hash) version —
+    // a sibling test's engine could claim the row and die with it. A unique
+    // version keeps this test's internal-queue work claimable only here.
+    let ver = format!("v-auth-{tag}");
+    let mut engine = DurableEngine::new_with_version(Arc::new(provider), &ver).await?;
     engine.register("whoami", |ctx: DurableContext, _: ()| async move {
         Ok::<_, Error>(format!(
             "{}/{}/{}",
@@ -1184,19 +1189,25 @@ async fn pg_client_enqueues_work_an_engine_runs() -> Result<()> {
         eprintln!("skipping pg_client_enqueues_work_an_engine_runs: DATABASE_URL unset");
         return Ok(());
     };
-    let wf = format!("double-{}", uuid::Uuid::new_v4());
-    let queue = format!("q-{}", uuid::Uuid::new_v4());
-    let job = format!("job-{}", uuid::Uuid::new_v4());
+    let tag = uuid::Uuid::new_v4();
+    let wf = format!("double-{tag}");
+    let queue = format!("q-{tag}");
+    let job = format!("job-{tag}");
 
     let provider = Arc::new(PostgresProvider::connect(&url).await?);
-    let mut engine = DurableEngine::new(provider.clone()).await?;
+    // Pinned version on both sides: an unversioned client stamps '' — rows
+    // claimable only by the globally *latest*-registered version, which any
+    // concurrently launching test can steal. Pinning makes the claim path
+    // deterministic regardless of what else registers versions.
+    let ver = format!("v-cew-{tag}");
+    let mut engine = DurableEngine::new_with_version(provider.clone(), &ver).await?;
     engine.register(&wf, |ctx: DurableContext, n: i64| async move {
         ctx.step("mul", || async { Ok::<_, Error>(n * 2) }).await
     });
     engine.register_queue(WorkflowQueue::new(&queue));
     engine.launch().await?;
 
-    let client = Client::new(provider.clone());
+    let client = Client::new(provider.clone()).with_app_version(&ver);
     let opts = WorkflowOptions {
         workflow_id: Some(job.clone()),
         ..Default::default()
@@ -1439,19 +1450,25 @@ async fn pg_client_manages_workflows() -> Result<()> {
         eprintln!("skipping pg_client_manages_workflows: DATABASE_URL unset");
         return Ok(());
     };
-    let wf = format!("ping-{}", uuid::Uuid::new_v4());
-    let queue = format!("q-{}", uuid::Uuid::new_v4());
-    let run_id = format!("run-{}", uuid::Uuid::new_v4());
-    let cancel_id = format!("cancel-{}", uuid::Uuid::new_v4());
+    let tag = uuid::Uuid::new_v4();
+    let wf = format!("ping-{tag}");
+    let queue = format!("q-{tag}");
+    let run_id = format!("run-{tag}");
+    let cancel_id = format!("cancel-{tag}");
 
     let provider = Arc::new(PostgresProvider::connect(&url).await?);
-    let mut engine = DurableEngine::new(provider.clone()).await?;
+    // Pinned version on both sides: an unversioned client stamps '' — rows
+    // claimable only by the globally *latest*-registered version, which any
+    // concurrently launching test can steal. Pinning makes the claim path
+    // deterministic regardless of what else registers versions.
+    let ver = format!("v-cmw-{tag}");
+    let mut engine = DurableEngine::new_with_version(provider.clone(), &ver).await?;
     engine.register(&wf, |_ctx: DurableContext, _: ()| async move {
         Ok::<_, Error>(())
     });
     engine.register_queue(WorkflowQueue::new(&queue));
     engine.launch().await?;
-    let client = durare::Client::new(provider.clone());
+    let client = durare::Client::new(provider.clone()).with_app_version(&ver);
 
     // Enqueue far in the future, then pull it in: the engine runs it.
     let run = client
@@ -2893,7 +2910,13 @@ async fn pg_fork_routes_to_named_queue() -> Result<()> {
     let queue = format!("fork-q-{tag}");
 
     let provider = Arc::new(PostgresProvider::connect(&url).await?);
-    let mut engine = DurableEngine::new(provider.clone()).await?;
+    // Pinned version: the client fork below lands on the shared internal
+    // queue, and every engine in this binary shares the default (binary-hash)
+    // version — a sibling test's engine could claim the row and die with it,
+    // stranding it PENDING and hanging `cf.result()` forever. A unique version
+    // keeps this test's internal-queue work claimable only here.
+    let ver = format!("v-fork-{tag}");
+    let mut engine = DurableEngine::new_with_version(provider.clone(), &ver).await?;
     engine.register(&wf, |_ctx: DurableContext, n: i64| async move {
         Ok::<_, Error>(n * 2)
     });

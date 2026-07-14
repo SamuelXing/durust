@@ -191,10 +191,24 @@ async fn durare_runs_a_foreign_written_portable_workflow() -> Result<()> {
 /// Postgres tests.
 #[tokio::test]
 async fn durare_runs_a_foreign_written_portable_workflow_pg() -> Result<()> {
-    let Ok(url) = std::env::var("DATABASE_URL") else {
+    let Ok(base_url) = std::env::var("DATABASE_URL") else {
         eprintln!("skipping pg interop test: DATABASE_URL not set");
         return Ok(());
     };
+    // The foreign row below carries `application_version = ''` — claimable only
+    // by the engine running the *latest registered* version. The version
+    // registry is durable and shared, and every test binary registers its own
+    // default version (a hash of its own executable) at launch — so a sibling
+    // binary whose registration is fresher would gate this engine off its own
+    // row forever. A private database per run makes that interference
+    // impossible by construction.
+    let dbname = format!("durare_interop_{}", uuid::Uuid::new_v4().simple());
+    let admin = sqlx::postgres::PgPool::connect(&base_url).await.unwrap();
+    sqlx::raw_sql(&format!("CREATE DATABASE {dbname}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let url = with_database(&base_url, &dbname);
     let wf_id = uuid::Uuid::new_v4().to_string();
 
     let provider = PostgresProvider::connect(&url)
@@ -274,7 +288,32 @@ async fn durare_runs_a_foreign_written_portable_workflow_pg() -> Result<()> {
     assert_eq!(stream, GOLDEN_STREAM_JSON);
 
     engine.shutdown(Duration::from_secs(1)).await?;
+    foreign.close().await;
+    drop(engine);
+    // Best-effort cleanup; FORCE terminates any connection the engine's pool
+    // has not finished closing yet (Postgres 13+).
+    if let Err(e) = sqlx::raw_sql(&format!("DROP DATABASE {dbname} WITH (FORCE)"))
+        .execute(&admin)
+        .await
+    {
+        eprintln!("interop test: leaving {dbname} behind: {e}");
+    }
     Ok(())
+}
+
+/// Swap the database name in a Postgres URL (`…/olddb?params` → `…/newdb?params`).
+fn with_database(url: &str, dbname: &str) -> String {
+    let (head, query) = match url.split_once('?') {
+        Some((h, q)) => (h, Some(q)),
+        None => (url, None),
+    };
+    let (prefix, _) = head
+        .rsplit_once('/')
+        .expect("postgres URL should end in /dbname");
+    match query {
+        Some(q) => format!("{prefix}/{dbname}?{q}"),
+        None => format!("{prefix}/{dbname}"),
+    }
 }
 
 /// durare reads a workflow another SDK ran and *failed*: the portable error
