@@ -23,6 +23,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that begins mid-recovery stops further dispatch — the run in flight finishes,
   the untouched remainder stays pending for a later recovery.
 
+### Changed
+
+- `shutdown` now stops the background loops promptly: they are signalled through
+  a cancellation token they await, instead of a flag they polled between
+  iterations — previously a queue dispatcher asleep on its poll interval would
+  not notice shutdown until it woke (up to the queue's base polling interval).
+  In-flight runs are likewise drained through a task tracker that counts a run
+  from the moment it is spawned. Internal modernization (`tokio-util`'s
+  `CancellationToken` + `TaskTracker`); no API change.
+
 ## [0.3.1] - 2026-07-12
 
 ### Added

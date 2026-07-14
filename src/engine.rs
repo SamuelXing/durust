@@ -2247,7 +2247,6 @@ impl Runtime {
     }
 }
 
-/// Decrements the in-flight counter when a workflow task ends (even on panic).
 /// Releases a per-partition worker-concurrency slot when a queued run finishes,
 /// even if it panics. (Shutdown-drain is handled separately by the engine's
 /// [`TaskTracker`]; this only bounds how many runs a queue starts at once.)
