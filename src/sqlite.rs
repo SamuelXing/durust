@@ -417,6 +417,7 @@ impl StateProvider for SqliteProvider {
                         recorded,
                     ));
                 }
+                tracing::Span::current().record("dbos.step.replayed", true);
                 return so.into_value_result();
             }
         }

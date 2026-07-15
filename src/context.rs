@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
+use tracing::Instrument;
 
 /// Predicate deciding whether a step error is retryable — see
 /// [`StepOptions::retry_if`]. Returning `false` stops retries at once.
@@ -196,6 +197,23 @@ impl DurableContext {
 
     fn next_seq(&self) -> i32 {
         self.seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// The span covering one durable operation (a step or a transaction),
+    /// carrying the DBOS trace attributes (see the
+    /// [`observability`](crate::observability) guide). Created inside the
+    /// workflow's instrumented future, so it parents under the workflow span
+    /// contextually.
+    fn op_span(&self, op: &'static str, name: &str, seq: i32) -> tracing::Span {
+        tracing::info_span!(
+            "step",
+            otel.name = %name,
+            dbos.operation.type = op,
+            dbos.operation.workflow_id = %self.workflow_id,
+            dbos.step.id = seq,
+            dbos.step.replayed = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+        )
     }
 
     /// The current step index — the `seq` the next durable operation will use,
@@ -430,14 +448,21 @@ impl DurableContext {
         Fut: Future<Output = Result<T>>,
     {
         let seq = self.next_seq();
-        if let Some(stored) = self.replay_or_guard::<T>(seq, name).await? {
-            return Ok(stored);
+        let span = self.op_span("step", name, seq);
+        let out = async {
+            if let Some(stored) = self.replay_or_guard::<T>(seq, name).await? {
+                return Ok(stored);
+            }
+            let started = chrono::Utc::now().timestamp_millis();
+            match run_step_catching(name, f()).await {
+                Ok(v) => self.checkpoint(seq, name, v, Some(started)).await,
+                Err(e) => self.record_failure(seq, name, e, Some(started)).await,
+            }
         }
-        let started = chrono::Utc::now().timestamp_millis();
-        match run_step_catching(name, f()).await {
-            Ok(v) => self.checkpoint(seq, name, v, Some(started)).await,
-            Err(e) => self.record_failure(seq, name, e, Some(started)).await,
-        }
+        .instrument(span.clone())
+        .await;
+        span.record("otel.status_code", if out.is_ok() { "OK" } else { "ERROR" });
+        out
     }
 
     /// Run a durable step with an explicit retry [`StepOptions`] policy.
@@ -478,16 +503,23 @@ impl DurableContext {
         Fut: Future<Output = Result<T>>,
     {
         let seq = self.next_seq();
-        if let Some(stored) = self.replay_or_guard::<T>(seq, &opts.name).await? {
-            return Ok(stored);
+        let span = self.op_span("step", &opts.name, seq);
+        let out = async {
+            if let Some(stored) = self.replay_or_guard::<T>(seq, &opts.name).await? {
+                return Ok(stored);
+            }
+            // Run with retries; only the final result/error is observed, then
+            // checkpointed — a success as its output, a failure as its error.
+            let started = chrono::Utc::now().timestamp_millis();
+            match self.run_with_retries(&opts, &mut f).await {
+                Ok(v) => self.checkpoint(seq, &opts.name, v, Some(started)).await,
+                Err(e) => self.record_failure(seq, &opts.name, e, Some(started)).await,
+            }
         }
-        // Run with retries; only the final result/error is observed, then
-        // checkpointed — a success as its output, a failure as its error.
-        let started = chrono::Utc::now().timestamp_millis();
-        match self.run_with_retries(&opts, &mut f).await {
-            Ok(v) => self.checkpoint(seq, &opts.name, v, Some(started)).await,
-            Err(e) => self.record_failure(seq, &opts.name, e, Some(started)).await,
-        }
+        .instrument(span.clone())
+        .await;
+        span.record("otel.status_code", if out.is_ok() { "OK" } else { "ERROR" });
+        out
     }
 
     /// Run a **transactional step**: the closure's SQL writes and this step's
@@ -575,6 +607,7 @@ impl DurableContext {
         let _reset = ResetOnDrop(&self.in_transaction);
 
         let seq = self.next_seq();
+        let span = self.op_span("transaction", &opts.name, seq);
         let started = chrono::Utc::now().timestamp_millis();
         // Separate the call from the `async move`: `f(tx)` borrows `f` and yields
         // a future that we move in, so the wrapper stays `Fn` (re-runnable).
@@ -585,11 +618,17 @@ impl DurableContext {
                 Ok::<_, Error>(serde_json::to_value(out)?)
             })
         });
-        let value = self
-            .provider
-            .run_transaction_step(&self.workflow_id, seq, started, &opts, body)
-            .await?;
-        Ok(serde_json::from_value(value)?)
+        let out = async {
+            let value = self
+                .provider
+                .run_transaction_step(&self.workflow_id, seq, started, &opts, body)
+                .await?;
+            Ok(serde_json::from_value(value)?)
+        }
+        .instrument(span.clone())
+        .await;
+        span.record("otel.status_code", if out.is_ok() { "OK" } else { "ERROR" });
+        out
     }
 
     /// Race several async `branches` and return the `(index, value)` of the first
@@ -682,6 +721,9 @@ impl DurableContext {
                     rec.name,
                 ));
             }
+            // Mark the enclosing operation span; a no-op for callers without
+            // one (the field is not declared on any other span).
+            tracing::Span::current().record("dbos.step.replayed", true);
             // A recorded failure replays as its error, so a failed step is not
             // re-run (and a non-deterministic step cannot succeed on replay).
             return Ok(Some(outcome_value(rec.outcome)?));

@@ -6,6 +6,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Tracing spans.** The engine now emits `tracing` spans around every
+  workflow execution (direct, queued, scheduled, child, and recovery runs)
+  and every durable operation (`step`, `step_with`, `transaction`), carrying
+  the DBOS trace attributes (`dbos.operation.workflow_id`,
+  `dbos.application.version`, `dbos.executor.id`, `dbos.queue.name`, the
+  user identity, and the recorded outcome). Step spans nest under their
+  workflow span, child workflows under their parent, and replayed steps are
+  marked `dbos.step.replayed = true` — so a post-crash trace shows exactly
+  which steps were served from checkpoints. Spans follow the
+  `tracing-opentelemetry` conventions (`otel.name`, `otel.status_code`), so
+  bridging them to an OTLP exporter needs no engine configuration. See the
+  new `observability` module guide.
+
 ## [0.3.2] - 2026-07-13
 
 Recovery ergonomics and shutdown correctness: launch can now (opt-in) resume
