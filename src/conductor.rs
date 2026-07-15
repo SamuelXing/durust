@@ -275,7 +275,7 @@ struct BaseMessage {
 
 #[derive(Deserialize)]
 struct RecoveryRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     executor_ids: Vec<String>,
 }
 
@@ -391,7 +391,7 @@ enum IdsAction {
 struct IdsRequest {
     #[serde(default)]
     workflow_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     workflow_ids: Vec<String>,
     #[serde(default)]
     delete_children: bool,
@@ -1507,6 +1507,18 @@ fn format_step_aggregate(a: &StepAggregate) -> Value {
     })
 }
 
+/// Deserialize an explicit JSON `null` as the type's default. The conductor
+/// service marshals absent lists as `null` (a Go nil slice), which
+/// `#[serde(default)]` alone does not cover — it only handles a *missing*
+/// field, and a bare `Vec<String>` rejects `null` outright.
+fn null_default<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 /// A conductor filter field that accepts either a single string or an array of
 /// strings (the wire `StringOrList`).
 #[derive(Default)]
@@ -1550,7 +1562,7 @@ struct ListRequest {
 
 #[derive(Default, Deserialize)]
 struct ListBody {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     workflow_uuids: Vec<String>,
     #[serde(default)]
     workflow_name: StringOrList,

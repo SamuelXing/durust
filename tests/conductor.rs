@@ -1075,3 +1075,77 @@ async fn conductor_closes_gracefully_on_shutdown() -> Result<()> {
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
+
+/// The conductor service (Go) marshals absent lists as explicit JSON `null` —
+/// the console's very first `list_workflows` arrives as
+/// `{"body":{"workflow_uuids":null,…}}`. Every list-typed request field must
+/// treat that as empty rather than failing deserialization (which surfaced as
+/// `failed to handle conductor message error=serialization error: invalid
+/// type: null, expected a sequence` against the live console).
+#[tokio::test]
+async fn conductor_tolerates_explicit_null_list_fields() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+
+        // The console's opening query, verbatim shape.
+        let list = exchange(
+            &mut ws,
+            json!({"type":"list_workflows","request_id":"n1",
+                   "body":{"workflow_uuids":null,"workflow_name":null,
+                           "status":null,"limit":50,"sort_desc":true}}),
+        )
+        .await;
+        let recovery = exchange(
+            &mut ws,
+            json!({"type":"recovery","request_id":"n2","executor_ids":null}),
+        )
+        .await;
+        let cancel = exchange(
+            &mut ws,
+            json!({"type":"cancel","request_id":"n3",
+                   "workflow_id":"","workflow_ids":null}),
+        )
+        .await;
+
+        (list, recovery, cancel)
+    });
+
+    let engine = Arc::new(DurableEngine::new(Arc::new(InMemoryProvider::new())).await?);
+    engine.launch().await?;
+    let conductor = Conductor::start(
+        engine.clone(),
+        ConductorConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            api_key: "test-key".into(),
+            app_name: "test-app".into(),
+            executor_metadata: None,
+            alert_handler: None,
+        },
+    )?;
+
+    let (list, recovery, cancel) = server.await.unwrap();
+
+    assert_eq!(list["request_id"], "n1");
+    assert!(
+        list.get("error_message").is_none(),
+        "null list filters must not error: {list}"
+    );
+    assert!(
+        list["output"].is_array(),
+        "a real listing came back: {list}"
+    );
+
+    assert_eq!(recovery["request_id"], "n2");
+    assert_eq!(recovery["success"], true, "null executor_ids: {recovery}");
+
+    assert_eq!(cancel["request_id"], "n3");
+    assert_eq!(cancel["success"], true, "null workflow_ids: {cancel}");
+
+    conductor.shutdown(Duration::from_secs(2)).await?;
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
