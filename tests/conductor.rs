@@ -107,7 +107,7 @@ async fn conductor_answers_lifecycle_messages() -> Result<()> {
 }
 
 #[tokio::test]
-async fn conductor_requires_api_key_and_url() -> Result<()> {
+async fn conductor_requires_api_key_and_defaults_url() -> Result<()> {
     let engine = Arc::new(DurableEngine::new(Arc::new(InMemoryProvider::new())).await?);
 
     let no_key = Conductor::start(
@@ -122,7 +122,12 @@ async fn conductor_requires_api_key_and_url() -> Result<()> {
     );
     assert!(no_key.is_err(), "missing API key is rejected");
 
-    let no_url = Conductor::start(
+    // An empty URL is accepted: it defaults to the hosted DBOS conductor.
+    // Point the domain at a closed local port so the background dial fails
+    // fast instead of contacting the real endpoint. Safe to mutate here: no
+    // other test in this binary reads DBOS_DOMAIN (they pass explicit URLs).
+    std::env::set_var("DBOS_DOMAIN", "127.0.0.1:1");
+    let defaulted = Conductor::start(
         engine.clone(),
         ConductorConfig {
             url: String::new(),
@@ -131,8 +136,10 @@ async fn conductor_requires_api_key_and_url() -> Result<()> {
             executor_metadata: None,
             alert_handler: None,
         },
-    );
-    assert!(no_url.is_err(), "missing URL is rejected");
+    )
+    .expect("empty URL defaults instead of erroring");
+    defaulted.shutdown(Duration::from_secs(2)).await?;
+    std::env::remove_var("DBOS_DOMAIN");
     Ok(())
 }
 

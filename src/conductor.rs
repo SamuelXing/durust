@@ -30,7 +30,7 @@
 //! let engine = Arc::new(DurableEngine::new(Arc::new(InMemoryProvider::new())).await?);
 //! engine.launch().await?;
 //! let conductor = Conductor::start(engine.clone(), ConductorConfig {
-//!     url: "wss://conductor.dbos.dev".into(),
+//!     url: String::new(), // empty = the hosted DBOS conductor
 //!     api_key: std::env::var("DBOS_CONDUCTOR_KEY").unwrap(),
 //!     app_name: "my-app".into(),
 //!     executor_metadata: None,
@@ -90,8 +90,10 @@ pub type AlertHandler = Arc<dyn Fn(&str, &str, &HashMap<String, String>) + Send 
 
 /// Configuration for [`Conductor::start`].
 pub struct ConductorConfig {
-    /// Base conductor URL, e.g. `wss://conductor.dbos.dev` (the
-    /// `/websocket/{app}/{key}` path is appended automatically).
+    /// Base conductor URL. Leave **empty** for the hosted DBOS conductor,
+    /// `wss://cloud.dbos.dev/conductor/v1alpha1` (the domain part honors the
+    /// `DBOS_DOMAIN` env var, like the other DBOS SDKs). The
+    /// `/websocket/{app}/{key}` path is appended automatically either way.
     pub url: String,
     /// API key for this application.
     pub api_key: String,
@@ -120,15 +122,7 @@ impl Conductor {
         if config.api_key.is_empty() {
             return Err(Error::app("conductor API key is required"));
         }
-        if config.url.is_empty() {
-            return Err(Error::app("conductor URL is required"));
-        }
-        let ws_url = format!(
-            "{}/websocket/{}/{}",
-            config.url.trim_end_matches('/'),
-            config.app_name,
-            config.api_key
-        );
+        let ws_url = websocket_url(&config);
         let token = CancellationToken::new();
         let task = tokio::spawn(connection_loop(engine, config, ws_url, token.clone()));
         Ok(Conductor { token, task })
@@ -147,6 +141,20 @@ impl Conductor {
         }
         Ok(())
     }
+}
+
+/// The full websocket URL: the configured base — or, when empty, the hosted
+/// DBOS conductor built from `DBOS_DOMAIN` (default `cloud.dbos.dev`), the
+/// same rule as the Go and Python SDKs — with `/websocket/{app}/{key}`
+/// appended.
+fn websocket_url(config: &ConductorConfig) -> String {
+    let base = if config.url.is_empty() {
+        let domain = std::env::var("DBOS_DOMAIN").unwrap_or_else(|_| "cloud.dbos.dev".to_string());
+        format!("wss://{domain}/conductor/v1alpha1")
+    } else {
+        config.url.trim_end_matches('/').to_string()
+    };
+    format!("{}/websocket/{}/{}", base, config.app_name, config.api_key)
 }
 
 /// Reconnect loop: connect, serve until the link drops or we are told to stop,
@@ -1786,4 +1794,41 @@ fn jittered(base: Duration, seed: &str) -> Duration {
     let frac = (h % 1000) as f64 / 1000.0; // 0.0..1.0
     let factor = 0.5 + frac; // 0.5..1.5
     base.mul_f64(factor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One test fn covers both the default and the `DBOS_DOMAIN` override:
+    /// they mutate process env, so they must not run as parallel tests.
+    #[test]
+    fn websocket_url_defaults_to_the_hosted_conductor() {
+        let config = |url: &str| ConductorConfig {
+            url: url.into(),
+            api_key: "k".into(),
+            app_name: "app".into(),
+            executor_metadata: None,
+            alert_handler: None,
+        };
+
+        std::env::remove_var("DBOS_DOMAIN");
+        assert_eq!(
+            websocket_url(&config("")),
+            "wss://cloud.dbos.dev/conductor/v1alpha1/websocket/app/k"
+        );
+
+        std::env::set_var("DBOS_DOMAIN", "example.test");
+        assert_eq!(
+            websocket_url(&config("")),
+            "wss://example.test/conductor/v1alpha1/websocket/app/k"
+        );
+        std::env::remove_var("DBOS_DOMAIN");
+
+        // An explicit base is used verbatim, trailing slash trimmed.
+        assert_eq!(
+            websocket_url(&config("ws://127.0.0.1:9000/")),
+            "ws://127.0.0.1:9000/websocket/app/k"
+        );
+    }
 }

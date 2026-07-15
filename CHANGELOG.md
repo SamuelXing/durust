@@ -6,6 +6,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- An empty `ConductorConfig::url` now defaults to the hosted DBOS conductor,
+  `wss://cloud.dbos.dev/conductor/v1alpha1` (the domain honors the
+  `DBOS_DOMAIN` env var), matching the Go and Python SDKs — previously an
+  empty URL was rejected.
+
+### Fixed
+
+- The conductor documentation pointed at `wss://conductor.dbos.dev`, a
+  hostname that does not exist — following it produced an endless
+  DNS-failure retry loop. The real endpoint is the default above.
+
 ## [0.3.2] - 2026-07-13
 
 Recovery ergonomics and shutdown correctness: launch can now (opt-in) resume
