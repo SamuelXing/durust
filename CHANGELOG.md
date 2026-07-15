@@ -21,6 +21,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bridging them to an OTLP exporter needs no engine configuration. See the
   new `observability` module guide.
 
+### Changed
+
+- An empty `ConductorConfig::url` now defaults to the hosted DBOS conductor,
+  `wss://cloud.dbos.dev/conductor/v1alpha1` (the domain honors the
+  `DBOS_DOMAIN` env var), matching the Go and Python SDKs — previously an
+  empty URL was rejected.
+
+### Fixed
+
+- The conductor documentation pointed at `wss://conductor.dbos.dev`, a
+  hostname that does not exist — following it produced an endless
+  DNS-failure retry loop. The real endpoint is the default above.
+- The conductor now tolerates explicit JSON `null` for list-typed request
+  fields (`workflow_uuids`, `workflow_ids`, `executor_ids`). The conductor
+  service marshals absent lists as `null`, so the console's very first
+  workflow-list query failed with `serialization error: invalid type: null,
+  expected a sequence` — every list view in the console was broken against
+  a Rust process. Found connecting a demo app to the live console.
+
 ## [0.3.2] - 2026-07-13
 
 Recovery ergonomics and shutdown correctness: launch can now (opt-in) resume
