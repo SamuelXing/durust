@@ -9,6 +9,8 @@ use durare::{
     PostgresProvider, RateLimiter, Result, ScheduledInput, Serializer, StateProvider,
     TransactionOptions, WorkflowOptions, WorkflowQueue, WorkflowStatus, STATUS_PENDING,
 };
+mod common;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1311,10 +1313,14 @@ async fn pg_dequeue_gates_by_version() -> Result<()> {
     let queue = format!("q-{tag}");
     let (v_foo, v_bar) = (format!("vf-{tag}"), format!("vb-{tag}"));
 
+    // This test's subject is latest-version gating, so it runs in a private
+    // database: in the shared one, any concurrently launching engine (e.g. a
+    // version-pinned sibling test) can steal "latest" between this test's
+    // set-up and its assertions.
+    let (admin, url, dbname) = common::hermetic_pg_db(&url, "durare_vgate").await;
     let provider = Arc::new(PostgresProvider::connect(&url).await?);
     provider.init().await?;
-    // This binary's version is (or is about to be) the latest — the same engine
-    // registration every other test performs.
+    // This binary's version is the latest here — the only registration around.
     let engine = DurableEngine::new(provider.clone()).await?;
     engine.launch().await?;
     engine
@@ -1375,7 +1381,9 @@ async fn pg_dequeue_gates_by_version() -> Result<()> {
     assert_eq!(got, vec![id_bare.clone()]);
 
     engine.shutdown(Duration::from_secs(1)).await?;
-    engine.delete_workflows(&[id_foo, id_bare], false).await?;
+    drop(engine);
+    drop(provider);
+    common::drop_hermetic_pg_db(&admin, &dbname).await;
     Ok(())
 }
 

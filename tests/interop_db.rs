@@ -14,6 +14,8 @@
 //! a single-struct argument: the foreign producer writes it as `positionalArgs[0]`
 //! (durare reads only the first positional arg of a portable input envelope).
 
+mod common;
+
 use durare::{
     DurableContext, DurableEngine, Error, PostgresProvider, Result, Serializer, SqliteProvider,
     WorkflowQueue,
@@ -202,13 +204,7 @@ async fn durare_runs_a_foreign_written_portable_workflow_pg() -> Result<()> {
     // binary whose registration is fresher would gate this engine off its own
     // row forever. A private database per run makes that interference
     // impossible by construction.
-    let dbname = format!("durare_interop_{}", uuid::Uuid::new_v4().simple());
-    let admin = sqlx::postgres::PgPool::connect(&base_url).await.unwrap();
-    sqlx::raw_sql(&format!("CREATE DATABASE {dbname}"))
-        .execute(&admin)
-        .await
-        .unwrap();
-    let url = with_database(&base_url, &dbname);
+    let (admin, url, dbname) = common::hermetic_pg_db(&base_url, "durare_interop").await;
     let wf_id = uuid::Uuid::new_v4().to_string();
 
     let provider = PostgresProvider::connect(&url)
@@ -290,30 +286,8 @@ async fn durare_runs_a_foreign_written_portable_workflow_pg() -> Result<()> {
     engine.shutdown(Duration::from_secs(1)).await?;
     foreign.close().await;
     drop(engine);
-    // Best-effort cleanup; FORCE terminates any connection the engine's pool
-    // has not finished closing yet (Postgres 13+).
-    if let Err(e) = sqlx::raw_sql(&format!("DROP DATABASE {dbname} WITH (FORCE)"))
-        .execute(&admin)
-        .await
-    {
-        eprintln!("interop test: leaving {dbname} behind: {e}");
-    }
+    common::drop_hermetic_pg_db(&admin, &dbname).await;
     Ok(())
-}
-
-/// Swap the database name in a Postgres URL (`…/olddb?params` → `…/newdb?params`).
-fn with_database(url: &str, dbname: &str) -> String {
-    let (head, query) = match url.split_once('?') {
-        Some((h, q)) => (h, Some(q)),
-        None => (url, None),
-    };
-    let (prefix, _) = head
-        .rsplit_once('/')
-        .expect("postgres URL should end in /dbname");
-    match query {
-        Some(q) => format!("{prefix}/{dbname}?{q}"),
-        None => format!("{prefix}/{dbname}"),
-    }
 }
 
 /// durare reads a workflow another SDK ran and *failed*: the portable error
