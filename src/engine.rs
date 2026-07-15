@@ -26,6 +26,7 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+use tracing::Instrument;
 
 /// How often the schedule reconciler lists persisted schedules and installs or
 /// retires per-schedule firing loops. Short so a freshly created or paused
@@ -1460,6 +1461,7 @@ impl DurableEngine {
 
         let join = rt.spawn_owned(
             id.clone(),
+            name,
             handler,
             canonical.input,
             canonical.deadline_ms,
@@ -2018,13 +2020,16 @@ pub(crate) async fn dispatch_pending_workflows(
         {
             // Best-effort: a workflow that fails again is marked ERROR by
             // `run_to_completion`; we keep going with the rest.
+            let auth = AuthContext::from_status(&record);
+            let span = rt.workflow_span(&record.id, &record.name, None, &auth);
             let _ = run_to_completion(
                 rt.clone(),
                 handler,
                 record.id.clone(),
                 record.input.clone(),
                 record.deadline_ms,
-                AuthContext::from_status(&record),
+                auth,
+                span,
             )
             .await;
             recovered.push(record.id);
@@ -2057,6 +2062,41 @@ pub(crate) struct Runtime {
 impl Runtime {
     pub(crate) fn provider(&self) -> &Arc<dyn StateProvider> {
         &self.provider
+    }
+
+    /// The span covering one workflow execution, carrying the DBOS trace
+    /// attributes (see the [`observability`](crate::observability) guide).
+    /// Created at the call site so a run started from inside another traced
+    /// context — a child workflow, an instrumented HTTP handler — parents
+    /// under it contextually.
+    fn workflow_span(
+        &self,
+        id: &str,
+        name: &str,
+        queue: Option<&str>,
+        auth: &AuthContext,
+    ) -> tracing::Span {
+        // Roles are recorded as a JSON array string, matching what the other
+        // DBOS SDKs emit for this attribute.
+        let roles = if auth.authenticated_roles.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&auth.authenticated_roles).ok()
+        };
+        tracing::info_span!(
+            "workflow",
+            otel.name = %name,
+            dbos.operation.type = "workflow",
+            dbos.operation.workflow_id = %id,
+            dbos.application.version = %self.app_version,
+            dbos.executor.id = %self.executor_id,
+            dbos.queue.name = queue,
+            dbos.user.name = auth.authenticated_user.as_deref(),
+            dbos.user.assumed_role = auth.assumed_role.as_deref(),
+            dbos.user.roles = roles.as_deref(),
+            dbos.workflow.status = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+        )
     }
 
     /// Build a new run's status row from `opts` and persist it idempotently,
@@ -2134,14 +2174,18 @@ impl Runtime {
     fn spawn_owned(
         self: &Arc<Self>,
         id: String,
+        name: &str,
         handler: WorkflowFn,
         input: Value,
         deadline_ms: Option<i64>,
         auth: AuthContext,
     ) -> JoinHandle<Result<Value>> {
+        // Built here, in the caller's context, so a child workflow's span
+        // parents under the workflow (or handler) span that started it.
+        let span = self.workflow_span(&id, name, None, &auth);
         let rt = self.clone();
         self.tasks.spawn(async move {
-            run_to_completion(rt, handler, id, input, deadline_ms, auth).await
+            run_to_completion(rt, handler, id, input, deadline_ms, auth, span).await
         })
     }
 
@@ -2151,12 +2195,13 @@ impl Runtime {
     fn spawn_detached(
         self: &Arc<Self>,
         id: String,
+        name: &str,
         handler: WorkflowFn,
         input: Value,
         deadline_ms: Option<i64>,
         auth: AuthContext,
     ) {
-        let join = self.spawn_owned(id, handler, input, deadline_ms, auth);
+        let join = self.spawn_owned(id, name, handler, input, deadline_ms, auth);
         // Detach: the run is tracked by the `TaskTracker`, so shutdown still
         // drains it.
         drop(join);
@@ -2206,6 +2251,7 @@ impl Runtime {
         if let Some(handler) = self.workflows.get(&schedule.workflow_name).cloned() {
             self.spawn_detached(
                 id.to_string(),
+                &schedule.workflow_name,
                 handler,
                 canonical.input,
                 canonical.deadline_ms,
@@ -2237,6 +2283,7 @@ impl Runtime {
         if !queued && !is_terminal(&canonical.status) {
             self.spawn_detached(
                 child_id.to_string(),
+                name,
                 handler,
                 canonical.input,
                 canonical.deadline_ms,
@@ -2368,6 +2415,8 @@ async fn queue_dispatch_loop(
                         let run_rt = rt.clone();
                         let local_guard = RunningGuard(counter.clone());
                         let auth = AuthContext::from_status(&wf);
+                        let span =
+                            rt.workflow_span(&wf.id, &wf.name, wf.queue_name.as_deref(), &auth);
                         // Spawn through the tracker so `shutdown` drains this run.
                         rt.tasks.spawn(async move {
                             let _local = local_guard;
@@ -2380,6 +2429,7 @@ async fn queue_dispatch_loop(
                                 wf.input,
                                 wf.deadline_ms,
                                 auth,
+                                span,
                             )
                             .await;
                         });
@@ -2423,7 +2473,12 @@ async fn run_to_completion(
     input: Value,
     deadline_ms: Option<i64>,
     auth: AuthContext,
+    span: tracing::Span,
 ) -> Result<Value> {
+    // The span covers the whole execution, terminal status write included;
+    // `recorder` sets the outcome fields declared `Empty` at creation.
+    let recorder = span.clone();
+    async move {
     let provider = rt.provider().clone();
     let ctx = DurableContext::new(id.clone(), rt, auth);
     // Catch a panic in the workflow body so it can't unwind past the status
@@ -2445,6 +2500,8 @@ async fn run_to_completion(
                     provider
                         .set_workflow_status(&id, STATUS_CANCELLED, None, Some("deadline exceeded"))
                         .await?;
+                    recorder.record("dbos.workflow.status", STATUS_CANCELLED);
+                    recorder.record("otel.status_code", "ERROR");
                     return Err(Error::Timeout);
                 }
             }
@@ -2464,6 +2521,8 @@ async fn run_to_completion(
         Err(payload) => {
             let msg = panic_message(&*payload);
             tracing::error!(id = %id, panic = %msg, "workflow panicked; left recoverable for recovery to re-run");
+            // No `dbos.workflow.status`: the row keeps its non-terminal state.
+            recorder.record("otel.status_code", "ERROR");
             return Err(Error::app(format!("workflow panicked: {msg}")));
         }
     };
@@ -2473,6 +2532,8 @@ async fn run_to_completion(
             provider
                 .set_workflow_status(&id, STATUS_SUCCESS, Some(&output), None)
                 .await?;
+            recorder.record("dbos.workflow.status", STATUS_SUCCESS);
+            recorder.record("otel.status_code", "OK");
             Ok(output)
         }
         Err(Error::Cancelled(_)) => {
@@ -2481,6 +2542,8 @@ async fn run_to_completion(
             provider
                 .set_workflow_status(&id, STATUS_CANCELLED, None, Some("cancelled"))
                 .await?;
+            recorder.record("dbos.workflow.status", STATUS_CANCELLED);
+            recorder.record("otel.status_code", "ERROR");
             Err(Error::Cancelled(id))
         }
         Err(e) => {
@@ -2491,9 +2554,14 @@ async fn run_to_completion(
             provider
                 .set_workflow_status(&id, STATUS_ERROR, None, Some(&stored))
                 .await?;
+            recorder.record("dbos.workflow.status", STATUS_ERROR);
+            recorder.record("otel.status_code", "ERROR");
             Err(e)
         }
     }
+    }
+    .instrument(span)
+    .await
 }
 
 /// A firing loop the reconciler has installed for one schedule.

@@ -1255,17 +1255,22 @@ async fn pg_client_debounces() -> Result<()> {
     engine.launch().await?;
 
     let client = Client::new(provider.clone()).with_app_version(&ver);
-    let delay = Duration::from_millis(300);
+    // The window must dwarf any scheduler stall on a loaded CI runner: if a
+    // later call's message reaches the collector only after the window fires,
+    // the dedup slot is already free and the debouncer *correctly* starts a
+    // fresh collector under a fresh target id — "new burst" semantics — and
+    // the same-id assertions below fail. 300ms flaked on a busy 2-vCPU runner.
+    let delay = Duration::from_secs(2);
     let h1: WorkflowHandle<String> = client
         .debouncer(&wf)
         .debounce(&key, delay, "a".to_string())
         .await?;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let h2: WorkflowHandle<String> = client
         .debouncer(&wf)
         .debounce(&key, delay, "b".to_string())
         .await?;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let h3: WorkflowHandle<String> = client
         .debouncer(&wf)
         .debounce(&key, delay, "c".to_string())
