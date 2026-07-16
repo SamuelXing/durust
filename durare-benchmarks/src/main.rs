@@ -124,9 +124,14 @@ fn mib(bytes: usize) -> f64 {
 // --- `steps` workload: mirrors dbos-workflow-benchmarks ---------------------
 
 /// Register the upstream-mirroring workflows: `bench_steps` (N sequential
-/// read-then-write transactions on one counter row) and `bench_setup` (its
-/// schema). Shared by the `steps` and `serve` modes.
+/// read-then-write transactions on one counter row), `bench_setup` (its
+/// schema), and `bench_sleeper` (durably parked, for memory measurements).
+/// Shared by the `steps`, `concurrent`, and `serve` modes.
 fn register_bench(engine: &mut DurableEngine) {
+    engine.register("bench_sleeper", |ctx: DurableContext, _: ()| async move {
+        ctx.sleep(Duration::from_secs(3600)).await?;
+        Ok::<_, Error>(())
+    });
     // The benchmark workflow: `n` sequential transactions, each a read-then-write
     // on a shared counter row — matching upstream's benchmarkWorkflow, whose
     // benchmarkTransaction reads a greet_count and writes it back incremented.
@@ -247,12 +252,10 @@ async fn run_steps(engine: &DurableEngine, steps: i64) -> Result<()> {
 async fn memory_workload(url: &str, count: usize) -> Result<()> {
     let mut engine = build_engine(url).await?;
 
-    // A workflow that parks durably for a long time: an in-flight, checkpointed
-    // workflow holding an async state machine but no database connection.
-    engine.register("bench_sleeper", |ctx: DurableContext, _: ()| async move {
-        ctx.sleep(Duration::from_secs(3600)).await?;
-        Ok::<_, Error>(())
-    });
+    // The parked workflow (`bench_sleeper`, registered with the bench set):
+    // in-flight and checkpointed, holding an async state machine but no
+    // database connection.
+    register_bench(&mut engine);
     engine.launch().await?;
 
     // Baseline taken after the engine and pool are established, so the delta is
@@ -307,8 +310,10 @@ async fn serve_workload(url: &str, port: u16) -> Result<()> {
     engine.launch().await?;
     let engine = Arc::new(engine);
     run_steps(&engine, 0).await?; // schema setup
+    run_steps(&engine, 1).await?; // warm-up: pool + query plans
 
     let app = axum::Router::new()
+        .route("/park/:count", axum::routing::get(park_handler))
         .route("/:num", axum::routing::get(bench_handler))
         .with_state(engine);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
@@ -414,4 +419,22 @@ async fn concurrent_workload(
 
     engine.shutdown(Duration::from_secs(5)).await?;
     Ok(())
+}
+
+/// `GET /park/:count` — start `count` durably-parked workflows and return this
+/// process's pid, so an external harness can measure RSS-per-workflow the same
+/// way across SDKs (`ps -o rss= -p <pid>` before and after).
+async fn park_handler(
+    axum::extract::Path(count): axum::extract::Path<usize>,
+    axum::extract::State(engine): axum::extract::State<Arc<DurableEngine>>,
+) -> axum::Json<serde_json::Value> {
+    for _ in 0..count {
+        if let Err(e) = engine
+            .start::<(), ()>("bench_sleeper", (), WorkflowOptions::default())
+            .await
+        {
+            return axum::Json(serde_json::json!({ "error": e.to_string() }));
+        }
+    }
+    axum::Json(serde_json::json!({ "parked": count, "pid": std::process::id() }))
 }

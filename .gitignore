@@ -13,3 +13,4 @@ Cargo.lock
 /PARITY.md
 # Internal cross-SDK conformance tracker; not for the public repo.
 /CONFORMANCE.md
+/durare-benchmarks/cross/go/durare-bench-go

@@ -81,3 +81,11 @@ For a fair cross-SDK number, point the other SDKs' benchmark apps at the
 **same Postgres** and drive them with the same `-n`/`-i`; never compare a
 local-Postgres run against DBOS Cloud numbers (the round-trip floors differ
 by an order of magnitude).
+
+## Cross-SDK baseline
+
+[`RESULTS.md`](RESULTS.md) holds the measured baseline — durare vs the DBOS
+Python and Go SDKs, same workload, same driver, same Postgres server — with
+the full methodology and its caveats. The comparison apps live under
+[`cross/`](cross/): each exposes the same HTTP contract, so the one upstream
+driver measures all three identically.
