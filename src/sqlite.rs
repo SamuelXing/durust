@@ -157,6 +157,30 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::sqlite::SqliteRow) -> Work
 
 #[async_trait]
 impl StateProvider for SqliteProvider {
+    async fn ping(&self) -> Result<()> {
+        // One round trip proves reachability and that the dbos system schema
+        // is migrated (see the Postgres provider for the rule; a newer schema
+        // than this binary embeds is healthy).
+        let expected = sqlx::migrate!("./migrations/sqlite")
+            .migrations
+            .iter()
+            .map(|m| m.version)
+            .max()
+            .unwrap_or(0);
+        let applied: Option<i64> = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations")
+            .fetch_one(&self.pool)
+            .await?;
+        match applied {
+            Some(v) if v >= expected => Ok(()),
+            Some(v) => Err(crate::error::Error::app(format!(
+                "dbos schema is behind: migration {v} applied, this binary expects {expected}"
+            ))),
+            None => Err(crate::error::Error::app(
+                "dbos schema is not migrated: no applied migrations recorded",
+            )),
+        }
+    }
+
     async fn init(&self) -> Result<()> {
         sqlx::migrate!("./migrations/sqlite")
             .run(&self.pool)

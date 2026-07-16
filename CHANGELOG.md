@@ -6,6 +6,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Readiness probe: `DurableEngine::health()` returns a `HealthReport` with a
+  reason per unhealthy axis — the state backend (reachable, dbos schema
+  present and migration-current, via the new `StateProvider::ping` method,
+  default healthy) and dispatch (launched, not deactivated, not shut down,
+  every dispatcher task alive). Never fails; failures are the report's
+  content. The admin server serves it as `GET /readyz` (`200`/`503` with the
+  per-axis report) — a durare extension alongside the cross-SDK static
+  `GET /dbos-healthz` liveness probe, so an orchestrator can drain a
+  deactivated process without restarting it.
+
 ## [0.3.3] - 2026-07-15
 
 Observability and DBOS-console compatibility: the engine now emits `tracing`

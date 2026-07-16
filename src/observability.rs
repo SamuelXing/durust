@@ -114,8 +114,27 @@
 //! [`fmt`](https://docs.rs/tracing-subscriber) subscriber the two appear as
 //! ordinary fields.
 //!
+//! # Probes
+//!
+//! Traces tell you what the engine *did*; a probe tells an orchestrator
+//! whether to send it work at all. [`DurableEngine::health`] returns a
+//! [`HealthReport`] with one entry per axis — the state backend (reachable,
+//! dbos schema present and current) and dispatch (launched, not deactivated,
+//! not shut down, every dispatcher task alive) — each `None` when healthy or
+//! carrying the reason when not. It never fails: failures are the report's
+//! content.
+//!
+//! With the `admin` feature, the admin server serves it as `GET /readyz` —
+//! `200` when ready, `503` with the failing axes otherwise — alongside the
+//! cross-SDK `GET /dbos-healthz` liveness probe (which stays unconditionally
+//! healthy, matching the other DBOS SDKs, so a deactivated process can drain
+//! without being restarted). Without the feature, wire
+//! [`health`](crate::DurableEngine::health) into any HTTP handler.
+//!
 //! [`tracing`]: https://docs.rs/tracing
 //! [`AuthContext`]: crate::AuthContext
+//! [`DurableEngine::health`]: crate::DurableEngine::health
+//! [`HealthReport`]: crate::HealthReport
 
 // This module is documentation only; the instrumentation lives in the engine
 // and context implementations.

@@ -21,6 +21,10 @@
 //!
 //! The endpoint set (verbatim paths, for cross-SDK tooling):
 //! - `GET  /dbos-healthz` — liveness
+//! - `GET  /readyz` — readiness ([`DurableEngine::health`]): `200` with the
+//!   report when ready, `503` with the failing axes otherwise. A durare
+//!   extension — the other SDKs expose only the static liveness probe —
+//!   for load-balancer / orchestrator checks.
 //! - `GET  /deactivate` — stop claiming new work, keep serving
 //! - `GET  /conductor` — conductor handshake placeholder
 //! - `GET  /dbos-workflow-queues-metadata` — registered-queue config
@@ -115,6 +119,7 @@ impl AdminServer {
 fn router(engine: Arc<DurableEngine>) -> Router {
     Router::new()
         .route("/dbos-healthz", get(health))
+        .route("/readyz", get(readyz))
         .route("/deactivate", get(deactivate))
         .route("/conductor", get(conductor))
         .route("/dbos-workflow-queues-metadata", get(queues_metadata))
@@ -139,6 +144,24 @@ type ApiResult = std::result::Result<axum::response::Response, (StatusCode, Stri
 
 async fn health() -> impl IntoResponse {
     Json(json!({ "status": "healthy" }))
+}
+
+/// Readiness: `200` when the engine is dispatching against a healthy backend,
+/// `503` otherwise — with the per-axis report either way, so an operator can
+/// read the failing axis straight off the probe.
+async fn readyz(State(engine): State<Arc<DurableEngine>>) -> impl IntoResponse {
+    let report = engine.health().await;
+    let status = if report.is_ready() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let body = Json(json!({
+        "ready": report.is_ready(),
+        "database": report.database.as_deref().unwrap_or("ok"),
+        "dispatch": report.dispatch.as_deref().unwrap_or("ok"),
+    }));
+    (status, body)
 }
 
 async fn conductor() -> impl IntoResponse {

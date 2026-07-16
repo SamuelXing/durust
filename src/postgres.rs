@@ -386,6 +386,32 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::postgres::PgRow) -> Workfl
 
 #[async_trait]
 impl StateProvider for PostgresProvider {
+    async fn ping(&self) -> Result<()> {
+        // One round trip proves reachability and that the dbos system schema
+        // is migrated: `_sqlx_migrations` (in this pool's search_path schema)
+        // must exist and hold every version this binary embeds. A *newer*
+        // schema is healthy — migrations are additive, and an older binary
+        // against an upgraded database is the normal rolling-deploy state.
+        let expected = sqlx::migrate!("./migrations/postgres")
+            .migrations
+            .iter()
+            .map(|m| m.version)
+            .max()
+            .unwrap_or(0);
+        let applied: Option<i64> = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations")
+            .fetch_one(&self.pool)
+            .await?;
+        match applied {
+            Some(v) if v >= expected => Ok(()),
+            Some(v) => Err(crate::error::Error::app(format!(
+                "dbos schema is behind: migration {v} applied, this binary expects {expected}"
+            ))),
+            None => Err(crate::error::Error::app(
+                "dbos schema is not migrated: no applied migrations recorded",
+            )),
+        }
+    }
+
     async fn init(&self) -> Result<()> {
         // Make sure the system-tables schema exists before migrating into it
         // (the pool's search_path already points there, so the unqualified DDL

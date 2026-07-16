@@ -130,12 +130,23 @@ async fn admin_server_endpoints() -> Result<()> {
     let (status, _) = http(port, "POST", "/dbos-garbage-collect", Some("{}")).await;
     assert_eq!(status, 204);
 
+    // Readiness (durare extension): a launched engine on a healthy backend.
+    let (status, body) = http(port, "GET", "/readyz", None).await;
+    assert_eq!(status, 200);
+    assert!(body.contains("\"ready\":true"), "readyz body: {body}");
+
     // Deactivate stops dispatch and reports it on the engine.
     assert!(!engine.is_deactivated());
     let (status, body) = http(port, "GET", "/deactivate", None).await;
     assert_eq!(status, 200);
     assert_eq!(body.trim(), "deactivated");
     assert!(engine.is_deactivated(), "engine marked deactivated");
+
+    // A deactivated process is no longer ready — 503 with the reason, so an
+    // orchestrator drains it while /dbos-healthz keeps reporting liveness.
+    let (status, body) = http(port, "GET", "/readyz", None).await;
+    assert_eq!(status, 503);
+    assert!(body.contains("deactivated"), "readyz body: {body}");
 
     admin.shutdown(Duration::from_secs(2)).await?;
     engine.shutdown(Duration::from_secs(1)).await?;

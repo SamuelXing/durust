@@ -421,6 +421,29 @@ impl WorkflowOptions {
     }
 }
 
+/// A point-in-time readiness report from [`DurableEngine::health`].
+///
+/// Each axis is `None` when healthy and carries the failure reason otherwise,
+/// so a probe handler can render the whole story without re-deriving it.
+#[derive(Debug, Clone)]
+pub struct HealthReport {
+    /// The state backend: `None` when it is reachable and its dbos system
+    /// schema is present and current; the reason otherwise (connection error,
+    /// schema missing, schema behind this binary).
+    pub database: Option<String>,
+    /// Work dispatch: `None` when this process is claiming work — launched,
+    /// not deactivated, not shut down, every dispatcher task alive; the
+    /// reason otherwise.
+    pub dispatch: Option<String>,
+}
+
+impl HealthReport {
+    /// Ready to serve: every axis is healthy.
+    pub fn is_ready(&self) -> bool {
+        self.database.is_none() && self.dispatch.is_none()
+    }
+}
+
 /// The durable execution engine.
 ///
 /// Holds the state backend, a registry of workflow functions by name, and this
@@ -1291,6 +1314,68 @@ impl DurableEngine {
     /// Whether [`deactivate`](Self::deactivate) has been called on this engine.
     pub fn is_deactivated(&self) -> bool {
         self.deactivated.load(Ordering::SeqCst)
+    }
+
+    /// A point-in-time readiness report: is the state backend reachable with a
+    /// current system schema, and is this process dispatching work?
+    ///
+    /// Never fails — a probe endpoint must always produce an answer; failures
+    /// are the report's *content*. One cheap backend round trip, suitable for
+    /// a load-balancer or orchestrator probe interval. The admin server
+    /// (feature `admin`) serves it as `GET /readyz`; wire it into your own
+    /// HTTP handler otherwise:
+    ///
+    /// ```
+    /// # use durare::{DurableEngine, InMemoryProvider, Result};
+    /// # use std::sync::Arc;
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<()> {
+    /// let engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    /// engine.launch().await?;
+    /// let report = engine.health().await;
+    /// assert!(report.is_ready());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn health(&self) -> HealthReport {
+        let database = self.provider.ping().await.err().map(|e| e.to_string());
+        HealthReport {
+            database,
+            dispatch: self.dispatch_state(),
+        }
+    }
+
+    /// The dispatch axis of [`health`](Self::health): `None` when this process
+    /// is claiming work, else why not. Ordered by intent — a deliberate state
+    /// (deactivated, shut down) is reported as itself, not as its side effect
+    /// (aborted dispatcher tasks).
+    fn dispatch_state(&self) -> Option<String> {
+        if self.is_deactivated() {
+            return Some("deactivated: this process stopped claiming new work".into());
+        }
+        if self
+            .shutdown_token
+            .lock()
+            .expect("shutdown token poisoned")
+            .is_cancelled()
+        {
+            return Some("shut down".into());
+        }
+        let dispatchers = self.dispatchers.lock().expect("dispatcher lock poisoned");
+        if dispatchers.is_empty() {
+            return Some("not launched".into());
+        }
+        // A dispatcher task can only be finished here if it died — launch
+        // spawned it to run until shutdown, and both deliberate stops were
+        // handled above.
+        let dead = dispatchers.iter().filter(|d| d.is_finished()).count();
+        if dead > 0 {
+            return Some(format!(
+                "{dead} of {} dispatcher tasks have exited unexpectedly",
+                dispatchers.len()
+            ));
+        }
+        None
     }
 
     /// Cancel every workflow still in a non-terminal queueable state

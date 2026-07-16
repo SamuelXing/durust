@@ -1114,6 +1114,17 @@ pub trait StateProvider: Send + Sync {
     /// Create tables / indexes if they do not yet exist.
     async fn init(&self) -> Result<()>;
 
+    /// Probe the backend for a readiness check: is it reachable, and is its
+    /// system schema present and at least as new as this binary expects? One
+    /// cheap round trip — suitable for a load-balancer probe interval. The
+    /// default is unconditionally healthy (right for the in-memory provider,
+    /// which cannot lose its own state); the SQL providers verify their
+    /// applied migrations. Surfaced through
+    /// [`DurableEngine::health`](crate::DurableEngine::health).
+    async fn ping(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// The serialization format this provider stores values in. The engine reads
     /// it to encode a failed workflow's error in that same format — errors are
     /// encoded at the engine because they carry a structured type the

@@ -202,7 +202,7 @@ pub use debounce::{Debouncer, DebouncerClient};
 #[doc(hidden)]
 pub use engine::WorkflowResult;
 pub use engine::{
-    erase, DeduplicationPolicy, DurableEngine, DurableEngineBuilder, EngineConfig,
+    erase, DeduplicationPolicy, DurableEngine, DurableEngineBuilder, EngineConfig, HealthReport,
     RegisteredWorkflow, WorkflowDef, WorkflowFn, WorkflowOptions, WorkflowRegistration,
 };
 pub use error::{Error, ErrorCode, Result};
