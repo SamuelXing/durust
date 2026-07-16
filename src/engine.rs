@@ -20,7 +20,7 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -444,6 +444,30 @@ impl HealthReport {
     }
 }
 
+/// A point-in-time metrics snapshot from [`DurableEngine::metrics`] — the
+/// poll-style shape (like tokio's runtime metrics): read it on your exporter's
+/// scrape interval and map the fields onto whatever metrics system you run.
+/// The `*_total` counters are process-lifetime and monotonic; the rest are
+/// instantaneous.
+#[derive(Debug, Clone)]
+pub struct EngineMetrics {
+    /// Workflow-run tasks currently in flight on this process (a background
+    /// launch-recovery dispatch, while active, counts as one).
+    pub workflows_in_flight: usize,
+    /// `ENQUEUED` workflows per registered queue (the shared internal queue
+    /// included) — work waiting fleet-wide, not just for this process. Every
+    /// registered queue has an entry, so exporters see stable keys.
+    pub queue_depth: HashMap<String, i64>,
+    /// Workflows this process re-dispatched through recovery.
+    pub workflows_recovered_total: u64,
+    /// Step retry attempts (each backoff-and-rerun of a retrying step body).
+    pub step_retries_total: u64,
+    /// Workflows this process parked in `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
+    pub dead_lettered_total: u64,
+    /// Failed dequeue polls across this process's queue dispatchers.
+    pub dequeue_errors_total: u64,
+}
+
 /// The durable execution engine.
 ///
 /// Holds the state backend, a registry of workflow functions by name, and this
@@ -820,6 +844,7 @@ impl DurableEngine {
                     executor_id: self.executor_id.clone(),
                     app_version: self.app_version.clone(),
                     tasks: self.tasks.clone(),
+                    counters: EngineCounters::default(),
                 })
             })
             .clone()
@@ -1343,6 +1368,49 @@ impl DurableEngine {
             database,
             dispatch: self.dispatch_state(),
         }
+    }
+
+    /// A point-in-time [`EngineMetrics`] snapshot: queue depths from one
+    /// backend aggregate query, everything else from process-local state.
+    /// Poll it on your exporter's scrape interval; see the
+    /// [`observability`](crate::observability) guide for wiring it into
+    /// Prometheus or any other metrics system.
+    ///
+    /// # Errors
+    ///
+    /// Fails only if the queue-depth query does — use
+    /// [`health`](Self::health) for a probe that never fails.
+    pub async fn metrics(&self) -> Result<EngineMetrics> {
+        let rows = self
+            .provider
+            .get_workflow_aggregates(&WorkflowAggregateQuery {
+                by_queue_name: true,
+                select_count: true,
+                status: vec![STATUS_ENQUEUED.to_string()],
+                ..Default::default()
+            })
+            .await?;
+        // Every registered queue gets an entry (0 when idle), so exporters
+        // see stable series; rows for unregistered queues (another process's
+        // registrations against the shared database) are included as-is.
+        let mut queue_depth: HashMap<String, i64> =
+            self.queues.keys().map(|q| (q.clone(), 0)).collect();
+        for row in rows {
+            if let (Some(Some(queue)), Some(count)) =
+                (row.group.get("queue_name").cloned(), row.count)
+            {
+                queue_depth.insert(queue, count);
+            }
+        }
+        let counters = &self.runtime().counters;
+        Ok(EngineMetrics {
+            workflows_in_flight: self.tasks.len(),
+            queue_depth,
+            workflows_recovered_total: counters.workflows_recovered.load(Ordering::Relaxed),
+            step_retries_total: counters.step_retries.load(Ordering::Relaxed),
+            dead_lettered_total: counters.dead_lettered.load(Ordering::Relaxed),
+            dequeue_errors_total: counters.dequeue_errors.load(Ordering::Relaxed),
+        })
     }
 
     /// The dispatch axis of [`health`](Self::health): `None` when this process
@@ -2080,6 +2148,7 @@ pub(crate) async fn dispatch_pending_workflows(
             .bump_recovery_attempts(&record.id, max_recovery_attempts)
             .await?;
         if attempts > max_recovery_attempts {
+            rt.counters.dead_lettered.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 id = %record.id,
                 attempts,
@@ -2094,6 +2163,9 @@ pub(crate) async fn dispatch_pending_workflows(
             rt.provider
                 .set_workflow_status(&record.id, STATUS_ENQUEUED, None, None)
                 .await?;
+            rt.counters
+                .workflows_recovered
+                .fetch_add(1, Ordering::Relaxed);
             recovered.push(record.id);
             continue;
         }
@@ -2117,6 +2189,9 @@ pub(crate) async fn dispatch_pending_workflows(
                 span,
             )
             .await;
+            rt.counters
+                .workflows_recovered
+                .fetch_add(1, Ordering::Relaxed);
             recovered.push(record.id);
         } else {
             tracing::warn!(
@@ -2142,6 +2217,17 @@ pub(crate) struct Runtime {
     executor_id: String,
     app_version: String,
     tasks: TaskTracker,
+    pub(crate) counters: EngineCounters,
+}
+
+/// Process-lifetime event counters behind [`DurableEngine::metrics`].
+/// Monotonic; `Relaxed` everywhere — pure tallies that publish no other memory.
+#[derive(Default)]
+pub(crate) struct EngineCounters {
+    pub(crate) workflows_recovered: AtomicU64,
+    pub(crate) step_retries: AtomicU64,
+    pub(crate) dead_lettered: AtomicU64,
+    pub(crate) dequeue_errors: AtomicU64,
 }
 
 impl Runtime {
@@ -2522,6 +2608,7 @@ async fn queue_dispatch_loop(
                 }
                 Err(e) => {
                     had_error = true;
+                    rt.counters.dequeue_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(queue = %queue.name, error = %e, "dequeue failed; backing off");
                 }
             }

@@ -131,10 +131,51 @@
 //! without being restarted). Without the feature, wire
 //! [`health`](crate::DurableEngine::health) into any HTTP handler.
 //!
+//! # Metrics
+//!
+//! [`DurableEngine::metrics`] returns a point-in-time [`EngineMetrics`]
+//! snapshot — the poll-style shape, like tokio's runtime metrics, so durare
+//! makes no metrics-system choice for you and adds no dependency. Gauges are
+//! instantaneous (in-flight runs on this process; `ENQUEUED` depth per
+//! registered queue, fleet-wide); the `*_total` counters are process-lifetime
+//! and monotonic (workflows recovered, step retries, dead-lettered workflows,
+//! failed dequeue polls).
+//!
+//! ```
+//! # use durare::{DurableEngine, InMemoryProvider, Result};
+//! # use std::sync::Arc;
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() -> Result<()> {
+//! # let engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+//! # engine.launch().await?;
+//! let m = engine.metrics().await?;
+//! assert_eq!(m.workflows_in_flight, 0);
+//! assert_eq!(m.dead_lettered_total, 0);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Poll it on your exporter's scrape interval and map the fields onto
+//! whatever system you run — e.g. with a Prometheus registry:
+//!
+//! ```ignore
+//! let m = engine.metrics().await?;
+//! in_flight_gauge.set(m.workflows_in_flight as i64);
+//! for (queue, depth) in &m.queue_depth {
+//!     queue_depth_gauge.with_label_values(&[queue]).set(*depth);
+//! }
+//! recovered_counter.absolute(m.workflows_recovered_total);
+//! ```
+//!
+//! Two readings a scrape apart give rates; the counters reset only with the
+//! process, so exporters treat them like any process-lifetime total.
+//!
 //! [`tracing`]: https://docs.rs/tracing
 //! [`AuthContext`]: crate::AuthContext
 //! [`DurableEngine::health`]: crate::DurableEngine::health
 //! [`HealthReport`]: crate::HealthReport
+//! [`DurableEngine::metrics`]: crate::DurableEngine::metrics
+//! [`EngineMetrics`]: crate::EngineMetrics
 
 // This module is documentation only; the instrumentation lives in the engine
 // and context implementations.

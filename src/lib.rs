@@ -202,8 +202,9 @@ pub use debounce::{Debouncer, DebouncerClient};
 #[doc(hidden)]
 pub use engine::WorkflowResult;
 pub use engine::{
-    erase, DeduplicationPolicy, DurableEngine, DurableEngineBuilder, EngineConfig, HealthReport,
-    RegisteredWorkflow, WorkflowDef, WorkflowFn, WorkflowOptions, WorkflowRegistration,
+    erase, DeduplicationPolicy, DurableEngine, DurableEngineBuilder, EngineConfig, EngineMetrics,
+    HealthReport, RegisteredWorkflow, WorkflowDef, WorkflowFn, WorkflowOptions,
+    WorkflowRegistration,
 };
 pub use error::{Error, ErrorCode, Result};
 /// Re-exported so callers can consume the asynchronous stream returned by

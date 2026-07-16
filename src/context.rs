@@ -806,6 +806,10 @@ impl DurableContext {
                     let backoff =
                         opts.base_interval.as_secs_f64() * opts.backoff_factor.powi(attempt as i32);
                     let delay = Duration::from_secs_f64(backoff).min(opts.max_interval);
+                    self.runtime
+                        .counters
+                        .step_retries
+                        .fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         step = %opts.name,
                         attempt = attempt + 1,

@@ -8,6 +8,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Metrics snapshot: `DurableEngine::metrics()` returns an `EngineMetrics` —
+  poll-style, like tokio's runtime metrics, so no metrics-system choice is
+  made for you and no dependency is added. Gauges: in-flight workflow runs on
+  this process, `ENQUEUED` depth per registered queue (fleet-wide, stable
+  keys). Process-lifetime counters: workflows recovered, step retries,
+  dead-lettered workflows, failed dequeue polls. Wiring examples in the
+  `observability` guide's new Metrics section.
 - Readiness probe: `DurableEngine::health()` returns a `HealthReport` with a
   reason per unhealthy axis — the state backend (reachable, dbos schema
   present and migration-current, via the new `StateProvider::ping` method,
