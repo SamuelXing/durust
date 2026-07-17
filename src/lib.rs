@@ -113,14 +113,14 @@
 //!
 //! # Guides
 //!
-//! Six module-level guides explain the concepts in depth, `std`-style, each
+//! Seven module-level guides explain the concepts in depth, `std`-style, each
 //! with tested examples: start with [`durability`] (checkpoints, replay, and
 //! the determinism contract — read this first), then its companion
 //! [`determinism`] (the rules for writing a correct workflow body — deterministic
 //! control flow, durable-safe data, and dependencies), and [`queues`],
-//! [`messaging`], [`transactions`], and [`observability`] (the `tracing`
-//! spans the engine emits and how to export them). Eleven runnable,
-//! end-to-end examples live in
+//! [`messaging`], [`transactions`], [`observability`] (spans, probes, and
+//! metrics), and [`operations`] (connections, pool sizing, and the resource
+//! model). Eleven runnable, end-to-end examples live in
 //! [`examples/`](https://github.com/SamuelXing/durare/tree/main/examples).
 //!
 //! # Cargo features
@@ -165,6 +165,7 @@ pub mod determinism;
 pub mod durability;
 pub mod messaging;
 pub mod observability;
+pub mod operations;
 pub mod queues;
 pub mod transactions;
 

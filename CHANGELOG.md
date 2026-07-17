@@ -25,6 +25,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `GET /dbos-healthz` liveness probe, so an orchestrator can drain a
   deactivated process without restarting it.
 
+### Documentation
+
+- Added an `operations` concept guide — the production resource model:
+  what durare opens per backend (pool defaults; the Postgres
+  `LISTEN`/`NOTIFY` listener holds one connection), who holds a connection
+  for how long (transactional steps are the real occupants; blocked
+  `recv`/`get_event` hold none), a pool-sizing rule of thumb and the
+  executors × pool-size fleet math (with the PgBouncer session-mode
+  caveat), statement-cache notes, and SQLite's single-writer shape.
+
 ## [0.3.3] - 2026-07-15
 
 Observability and DBOS-console compatibility: the engine now emits `tracing`
