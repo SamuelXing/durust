@@ -1,0 +1,52 @@
+name: bench
+
+# Nightly performance smoke: run the benchmark harness against a live Postgres
+# and publish the numbers in the job log. Report-only — thresholds live with a
+# human, not a flaky shared runner — but a *broken* benchmark (build failure,
+# workload error) fails the job, so the harness can't silently rot.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  DATABASE_URL: "postgres://postgres:postgres@localhost:5432/durare_bench"
+
+jobs:
+  bench:
+    name: benchmark smoke (postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: durare_bench
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: durare-benchmarks
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: durare-benchmarks
+      - name: steps (upstream-comparable workload)
+        run: cargo run --release -- steps --steps 10 --iterations 50
+      - name: concurrent (tail latency under load)
+        run: cargo run --release -- concurrent --workflows 200 --concurrency 32 --steps 5
+      - name: memory (per parked in-flight workflow)
+        run: cargo run --release -- memory --count 1000

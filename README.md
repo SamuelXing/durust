@@ -212,6 +212,16 @@ against `InMemoryProvider` with no infrastructure at all; the crate's own test
 suite runs against all three backends on every commit, with Postgres against a
 live server in CI.
 
+## Benchmarks
+
+[`durare-benchmarks/`](durare-benchmarks/) measures durare on the same
+workload the DBOS SDKs benchmark themselves with, plus the metrics where a
+compiled, GC-free runtime actually differs (tail latency under load, memory
+per in-flight workflow). Durable-execution throughput is dominated by
+database round-trips, so read the numbers with that framing — the harness
+README documents the methodology, and a nightly CI job keeps the workloads
+running.
+
 ## Minimum supported Rust version
 
 `durare` builds on Rust **1.88** and later, enforced by a dedicated CI job.

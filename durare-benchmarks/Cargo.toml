@@ -1,0 +1,27 @@
+[package]
+name = "durare-benchmarks"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Performance benchmarks for the durare durable-execution SDK (not published)."
+
+# Its own workspace: kept out of the durare workspace so its heavier dependencies
+# and long run times never touch the SDK's build, lint gate, or CI. It depends on
+# `durare` by path, so benchmarks always track the code in this checkout.
+[workspace]
+
+[dependencies]
+durare = { path = "..", default-features = false, features = ["postgres"] }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive", "env"] }
+# HdrHistogram: correct, low-overhead latency percentiles (p50/p99) without
+# storing every sample.
+hdrhistogram = "7"
+# Cross-platform resident-set-size reading for the memory-per-workflow metric.
+memory-stats = "1"
+anyhow = "1"
+# `serve` mode: the upstream dbos-benchmark-app's HTTP contract (GET /:num →
+# {output, runtime}), so dbos-workflow-benchmarks' benchmark_dbos.py drives
+# durare unmodified.
+axum = "0.7"
+serde_json = "1"

@@ -23,6 +23,8 @@ exclude = [
     "CONFORMANCE.md",
     "RELEASING.md",
     "tests/cycle_demo.rs",
+    # The benchmark harness is a separate, unpublished workspace.
+    "durare-benchmarks/",
 ]
 
 # Make the companion proc-macro crate a workspace member (it is already a path

@@ -1,10 +1,16 @@
 /target
 # Stray target dir from running cargo inside the workspace member directly.
 /durare-macros/target/
+# The benchmark harness is its own workspace with its own build dir.
+/durare-benchmarks/target/
 Cargo.lock
+# ... but the benchmark harness is a binary: its lockfile is committed so a
+# benchmarked dependency set is reproducible.
+!/durare-benchmarks/Cargo.lock
 **/*.rs.bk
 .env
 # Internal Go-parity development tracker; not for the public repo.
 /PARITY.md
 # Internal cross-SDK conformance tracker; not for the public repo.
 /CONFORMANCE.md
+/durare-benchmarks/cross/go/durare-bench-go
