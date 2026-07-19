@@ -123,15 +123,37 @@
 //! `workflow_status` eventually taxes the hottest queries in the system —
 //! the queue dispatchers'.
 //!
-//! [`garbage_collect`](crate::DurableEngine::garbage_collect) is the
-//! trimming primitive, with the same semantics as the other DBOS SDKs: pass
+//! The set-and-forget answer is the retention knob: configure a
+//! [`RetentionPolicy`](crate::RetentionPolicy) and `launch` runs a background
+//! sweeper that enforces it —
+//!
+//! ```no_run
+//! # use durare::{DurableEngine, EngineConfig, InMemoryProvider, RetentionPolicy, Result};
+//! # use std::{sync::Arc, time::Duration};
+//! # async fn run() -> Result<()> {
+//! let config = EngineConfig::default().retention(
+//!     RetentionPolicy::new().period(Duration::from_secs(90 * 24 * 3600)),
+//! );
+//! let engine = DurableEngine::with_config(Arc::new(InMemoryProvider::new()), config).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Sweeps are per-executor and need no coordination (the delete is
+//! idempotent; intervals are jittered so a fleet doesn't sweep in lockstep),
+//! and deletion runs in bounded batches so enabling a policy over a year of
+//! backlog is many short transactions, not one vacuum-pinning monster.
+//!
+//! Underneath sits [`garbage_collect`](crate::DurableEngine::garbage_collect),
+//! the trimming primitive with the same semantics as the other DBOS SDKs:
 //! an absolute `created_at` cutoff, a keep-the-newest-N rows bound, or both
 //! (the newer cutoff wins), and everything terminal that falls outside is
-//! deleted — in-flight and queued work survives regardless of age. Run it
-//! from a scheduled workflow, a cron job against the admin server's
+//! deleted — in-flight and queued work survives regardless of age. Drive it
+//! manually, from a cron job against the admin server's
 //! `POST /dbos-garbage-collect`, or let the DBOS console's retention policy
-//! drive it through the conductor. Deleted history is unrecoverable; export
-//! what you need first
+//! drive it through the conductor; all of these compose with the knob, since
+//! every path is a cutoff into the same idempotent delete. Deleted history
+//! is unrecoverable; export what you need first
 //! ([`export_workflow`](crate::DurableEngine::export_workflow)).
 //!
 //! # Watching it

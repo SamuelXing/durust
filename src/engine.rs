@@ -198,6 +198,91 @@ pub struct EngineConfig {
     /// `DBOS__VMID` per process; otherwise drive recovery yourself with
     /// [`recover`](DurableEngine::recover).
     pub recover_on_launch: Option<bool>,
+    /// Automatic history retention. When set, [`launch`](DurableEngine::launch)
+    /// starts a background sweeper that periodically enforces the policy via
+    /// [`garbage_collect`](DurableEngine::garbage_collect); `None` (the
+    /// default) means history is kept forever unless something else trims it.
+    /// See [`RetentionPolicy`].
+    pub retention: Option<RetentionPolicy>,
+}
+
+/// Automatic history-retention policy for [`EngineConfig::retention`]: how old
+/// (or how numerous) terminal workflow history may get before a background
+/// sweep deletes it via [`garbage_collect`](DurableEngine::garbage_collect).
+///
+/// At least one bound is required — [`launch`](DurableEngine::launch) rejects
+/// a boundless policy. In-flight and still-queued work
+/// (`PENDING`/`ENQUEUED`/`DELAYED`) is never collected regardless of the
+/// bounds, and deleted history is unrecoverable (export first if you need an
+/// archive).
+///
+/// Every executor configured with a policy sweeps independently; the delete is
+/// idempotent, so a fleet needs no coordination — configuring one process or
+/// all of them are both correct (sweep starts are jittered per executor so a
+/// fleet's sweeps don't land on the database in lockstep). A DBOS-console
+/// retention policy arriving over the conductor composes the same way: both
+/// are cutoffs into the same idempotent delete, so the stricter one wins.
+///
+/// ```no_run
+/// # use durare::{DurableEngine, EngineConfig, InMemoryProvider, RetentionPolicy, Result};
+/// # use std::sync::Arc;
+/// # use std::time::Duration;
+/// # async fn run() -> Result<()> {
+/// let config = EngineConfig::default().retention(
+///     RetentionPolicy::new()
+///         .period(Duration::from_secs(30 * 24 * 3600)) // keep 30 days
+///         .max_rows(1_000_000),                        // and at most 1M workflows
+/// );
+/// let engine = DurableEngine::with_config(Arc::new(InMemoryProvider::new()), config).await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug)]
+pub struct RetentionPolicy {
+    /// Collect terminal workflows *created* longer ago than this. (`created_at`
+    /// is the reference bound across the DBOS SDKs — a workflow created 100
+    /// days ago that finished yesterday is collectable under a 90-day period.)
+    pub period: Option<Duration>,
+    /// Keep at most the newest N workflows: the Nth-newest `created_at`
+    /// becomes the cutoff. Must be positive.
+    pub max_rows: Option<i64>,
+    /// How often the sweeper enforces the policy. Defaults to one hour.
+    pub sweep_interval: Duration,
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            period: None,
+            max_rows: None,
+            sweep_interval: Duration::from_secs(3600),
+        }
+    }
+}
+
+impl RetentionPolicy {
+    /// A policy with no bounds yet (set at least one) and an hourly sweep.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Collect terminal workflows created longer ago than `period`.
+    pub fn period(mut self, period: Duration) -> Self {
+        self.period = Some(period);
+        self
+    }
+
+    /// Keep at most the newest `max_rows` workflows.
+    pub fn max_rows(mut self, max_rows: i64) -> Self {
+        self.max_rows = Some(max_rows);
+        self
+    }
+
+    /// Sweep every `interval` instead of the hourly default.
+    pub fn sweep_interval(mut self, interval: Duration) -> Self {
+        self.sweep_interval = interval;
+        self
+    }
 }
 
 impl EngineConfig {
@@ -219,6 +304,12 @@ impl EngineConfig {
     /// [`recover`](DurableEngine::recover).
     pub fn recover_on_launch(mut self, yes: bool) -> Self {
         self.recover_on_launch = Some(yes);
+        self
+    }
+
+    /// Enable automatic history retention (see [`RetentionPolicy`]).
+    pub fn retention(mut self, policy: RetentionPolicy) -> Self {
+        self.retention = Some(policy);
         self
     }
 
@@ -466,6 +557,10 @@ pub struct EngineMetrics {
     pub dead_lettered_total: u64,
     /// Failed dequeue polls across this process's queue dispatchers.
     pub dequeue_errors_total: u64,
+    /// Workflows this process deleted through garbage collection — manual
+    /// [`garbage_collect`](DurableEngine::garbage_collect) calls and the
+    /// [`RetentionPolicy`] sweeper both count.
+    pub workflows_collected_total: u64,
 }
 
 /// The durable execution engine.
@@ -494,6 +589,9 @@ pub struct DurableEngine {
     /// workflows in the background on startup (off by default; opt-in). See
     /// [`EngineConfig::recover_on_launch`].
     recover_on_launch: bool,
+    /// Automatic history retention enforced by a [`launch`](Self::launch)-spawned
+    /// sweeper, if configured. See [`EngineConfig::retention`].
+    retention: Option<RetentionPolicy>,
     /// Cancelled by [`shutdown`](Self::shutdown) to stop the background loops.
     /// [`launch`](Self::launch) installs a fresh token after a shutdown, since a
     /// cancelled token can't be reset.
@@ -670,6 +768,7 @@ impl DurableEngineBuilder {
             app_version,
             max_recovery_attempts: self.max_recovery_attempts,
             recover_on_launch: self.config.resolve_recover_on_launch(),
+            retention: self.config.retention,
             shutdown_token: std::sync::Mutex::new(CancellationToken::new()),
             deactivated: Arc::new(AtomicBool::new(false)),
             tasks: TaskTracker::new(),
@@ -744,6 +843,7 @@ impl DurableEngine {
             app_version,
             max_recovery_attempts: 100,
             recover_on_launch: config.resolve_recover_on_launch(),
+            retention: config.retention,
             shutdown_token: std::sync::Mutex::new(CancellationToken::new()),
             deactivated: Arc::new(AtomicBool::new(false)),
             tasks: TaskTracker::new(),
@@ -1179,6 +1279,15 @@ impl DurableEngine {
         if self.is_deactivated() {
             return Ok(());
         }
+        // Reject a boundless retention policy up front, before any background
+        // loop starts — it is a configuration mistake, not a no-op.
+        if let Some(policy) = &self.retention {
+            if policy.period.is_none() && policy.max_rows.is_none() {
+                return Err(Error::app(
+                    "a retention policy needs a period or a max_rows bound",
+                ));
+            }
+        }
         // A prior `shutdown` cancelled the token and closed the tracker. Install a
         // fresh token (a cancelled one can't be reset) and reopen the tracker, so
         // this launch's loops and runs are live and the next `shutdown` stops and
@@ -1267,6 +1376,20 @@ impl DurableEngine {
             cancel.clone(),
             self.macro_schedules(),
         )));
+        if let Some(policy) = &self.retention {
+            // Jitter the interval per executor (±10%, derived from the executor
+            // id) so a fleet's sweeps don't land on the database in lockstep.
+            // The sweep itself is idempotent, so overlap is only wasted work.
+            let interval = policy
+                .sweep_interval
+                .mul_f64(jitter_factor(&self.executor_id));
+            tasks.push(tokio::spawn(retention_sweep_loop(
+                policy.clone(),
+                interval,
+                rt.clone(),
+                cancel.clone(),
+            )));
+        }
 
         // Dispatch the recovery snapshot taken above on a background task, so
         // launch stays prompt — a recovered workflow runs to completion, which
@@ -1410,6 +1533,7 @@ impl DurableEngine {
             step_retries_total: counters.step_retries.load(Ordering::Relaxed),
             dead_lettered_total: counters.dead_lettered.load(Ordering::Relaxed),
             dequeue_errors_total: counters.dequeue_errors.load(Ordering::Relaxed),
+            workflows_collected_total: counters.workflows_collected.load(Ordering::Relaxed),
         })
     }
 
@@ -1506,6 +1630,10 @@ impl DurableEngine {
             .garbage_collect(cutoff_epoch_ms, rows_threshold)
             .await?;
         if deleted > 0 {
+            self.runtime()
+                .counters
+                .workflows_collected
+                .fetch_add(deleted, Ordering::Relaxed);
             tracing::info!(deleted, "garbage collected workflows");
         }
         Ok(deleted)
@@ -2263,6 +2391,7 @@ pub(crate) struct EngineCounters {
     pub(crate) step_retries: AtomicU64,
     pub(crate) dead_lettered: AtomicU64,
     pub(crate) dequeue_errors: AtomicU64,
+    pub(crate) workflows_collected: AtomicU64,
 }
 
 impl Runtime {
@@ -2848,6 +2977,48 @@ async fn backfill_ticks(
         ids.push(id);
     }
     Ok(ids)
+}
+
+/// A deterministic per-executor interval multiplier in `[0.9, 1.1)`, so a
+/// fleet's periodic sweeps spread out instead of hitting the database in
+/// lockstep. Derived from the executor id: stable across restarts, no RNG.
+fn jitter_factor(executor_id: &str) -> f64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    executor_id.hash(&mut h);
+    0.9 + 0.2 * ((h.finish() % 1000) as f64 / 1000.0)
+}
+
+/// Background task: enforce the [`RetentionPolicy`] every `interval` — resolve
+/// the policy's age bound against the current clock and run the provider's
+/// garbage collection. The first sweep runs one interval after launch (not
+/// immediately, so startup cost stays flat); a failed sweep logs and waits for
+/// the next tick. Exits when `cancel` fires.
+async fn retention_sweep_loop(
+    policy: RetentionPolicy,
+    interval: Duration,
+    rt: Arc<Runtime>,
+    cancel: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(interval) => {}
+        }
+        let cutoff = policy
+            .period
+            .map(|p| chrono::Utc::now().timestamp_millis() - p.as_millis() as i64);
+        match rt.provider().garbage_collect(cutoff, policy.max_rows).await {
+            Ok(0) => {}
+            Ok(deleted) => {
+                rt.counters
+                    .workflows_collected
+                    .fetch_add(deleted, Ordering::Relaxed);
+                tracing::info!(deleted, "retention sweep collected workflow history");
+            }
+            Err(e) => tracing::warn!(error = %e, "retention sweep failed"),
+        }
+    }
 }
 
 /// Reconciles the desired set of schedules with running firing loops. Each pass
