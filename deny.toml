@@ -1,0 +1,38 @@
+# cargo-deny configuration — the supply-chain gate beyond `cargo audit`:
+# RustSec advisories, license allow-listing, and registry/source pinning.
+# Run locally with `cargo deny check`; CI runs it in security.yml.
+
+[graph]
+# Police the full surface, not just the default-feature slice.
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# Permissive licenses only. Adding a dependency under anything else is a
+# deliberate decision: extend this list in the same PR, with review.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "CDLA-Permissive-2.0",
+]
+
+[bans]
+# Duplicate versions are common in a deep tree; surface them without failing.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Everything must come from crates.io — no git or alternate-registry
+# dependencies can enter the tree unnoticed.
+unknown-registry = "deny"
+unknown-git = "deny"

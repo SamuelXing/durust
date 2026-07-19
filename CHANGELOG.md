@@ -8,6 +8,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `AdminServer::start_on` binds the admin server to an explicit address —
+  e.g. loopback, so the unauthenticated control surface is reachable only
+  from the machine itself. `start` keeps the cross-SDK all-interfaces
+  default (orchestrator probes arrive over the pod network); the admin
+  module docs now spell out the exposure model.
 - Metrics snapshot: `DurableEngine::metrics()` returns an `EngineMetrics` —
   poll-style, like tokio's runtime metrics, so no metrics-system choice is
   made for you and no dependency is added. Gauges: in-flight workflow runs on
@@ -34,6 +39,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `recv`/`get_event` hold none), a pool-sizing rule of thumb and the
   executors × pool-size fleet math (with the PgBouncer session-mode
   caveat), statement-cache notes, and SQLite's single-writer shape.
+- Added a `security` concept guide — the trust map: the dynamic-SQL
+  invariant (no caller-supplied string becomes SQL text; every value is a
+  bind parameter — now enforced by an injection sweep in `tests/security.rs`
+  across both SQL backends), secret handling (the database URL and conductor
+  API key are never logged; `ConductorConfig` has no `Debug` impl, pinned by
+  a `compile_fail` doctest), the network-exposure model of the opt-in admin
+  and conductor surfaces, and the payloads-live-in-the-database trust
+  boundary.
+
+### Security
+
+- CI now runs `cargo deny` (RustSec advisories, a permissive-license
+  allow-list, and crates.io-only source pinning, per the new `deny.toml`)
+  alongside `cargo audit`, weekly and on dependency changes.
 
 ## [0.3.3] - 2026-07-15
 
