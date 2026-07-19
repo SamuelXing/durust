@@ -1406,6 +1406,31 @@ impl StateProvider for PostgresProvider {
         Ok(())
     }
 
+    async fn garbage_collect(
+        &self,
+        cutoff_epoch_ms: Option<i64>,
+        rows_threshold: Option<i64>,
+    ) -> Result<u64> {
+        let Some(cutoff) =
+            crate::provider::resolve_gc_cutoff(self, cutoff_epoch_ms, rows_threshold).await?
+        else {
+            return Ok(0);
+        };
+        // The canonical DBOS GC delete: strictly-older terminal (and dead-letter)
+        // rows go; in-flight work survives regardless of age. Children cascade.
+        let res = sqlx::query(
+            "DELETE FROM workflow_status
+             WHERE created_at < $1 AND status NOT IN ($2, $3, $4)",
+        )
+        .bind(cutoff)
+        .bind(STATUS_PENDING)
+        .bind(STATUS_ENQUEUED)
+        .bind(STATUS_DELAYED)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     async fn set_workflow_delay(&self, id: &str, delay_until_ms: i64) -> Result<bool> {
         let res = sqlx::query(
             "UPDATE workflow_status SET delay_until_epoch_ms = $2, updated_at = $3

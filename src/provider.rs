@@ -158,6 +158,47 @@ pub(crate) fn group_stream_rows(
 /// the producer is still active.
 const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+/// Resolve the effective garbage-collection cutoff from the two bounds — the
+/// newer of the absolute `cutoff_epoch_ms` and the `created_at` of the
+/// `rows_threshold`-th-newest workflow. `None` means nothing to collect (no
+/// bound given, or fewer than `rows_threshold` workflows exist and no absolute
+/// cutoff). Validates `rows_threshold > 0`. Shared by the trait's default
+/// [`garbage_collect`](StateProvider::garbage_collect) and the SQL overrides.
+pub(crate) async fn resolve_gc_cutoff<P: StateProvider + ?Sized>(
+    provider: &P,
+    cutoff_epoch_ms: Option<i64>,
+    rows_threshold: Option<i64>,
+) -> Result<Option<i64>> {
+    if let Some(t) = rows_threshold {
+        if t <= 0 {
+            return Err(Error::app(format!(
+                "rows_threshold must be positive, got {t}"
+            )));
+        }
+    }
+    let mut cutoff = cutoff_epoch_ms;
+    if let Some(threshold) = rows_threshold {
+        let nth_newest = provider
+            .list_workflows(&ListFilter {
+                sort_desc: true,
+                limit: Some(1),
+                offset: Some(threshold - 1),
+                load_input: false,
+                load_output: false,
+                ..Default::default()
+            })
+            .await?;
+        if let Some(w) = nth_newest.first() {
+            let rows_cutoff = w.created_at.timestamp_millis();
+            // The more restrictive (newer) bound wins.
+            if cutoff.is_none_or(|c| rows_cutoff > c) {
+                cutoff = Some(rows_cutoff);
+            }
+        }
+    }
+    Ok(cutoff)
+}
+
 /// Read stream `key` on `workflow_id` in order, blocking until it is closed (a
 /// producer called `close_stream`) or the producing workflow goes inactive (no
 /// longer `PENDING`/`ENQUEUED`) — after which no more values can arrive. Returns
@@ -1360,6 +1401,56 @@ pub trait StateProvider: Send + Sync {
     /// `parent_workflow_id` (transitively) is deleted too. Missing ids are
     /// skipped. An empty slice is a no-op.
     async fn delete_workflows(&self, ids: &[String], delete_children: bool) -> Result<()>;
+
+    /// Garbage-collect workflow history: delete every workflow **not** in
+    /// `PENDING`/`ENQUEUED`/`DELAYED` created strictly before a cutoff, along
+    /// with its step / event / stream rows. Returns how many workflows were
+    /// deleted.
+    ///
+    /// The cutoff is the more restrictive (newer) of the two bounds, matching
+    /// the other DBOS SDKs:
+    ///
+    /// - `cutoff_epoch_ms` — an absolute epoch-milliseconds threshold;
+    /// - `rows_threshold` — keep (at most) the newest N workflows: the
+    ///   `created_at` of the Nth-newest becomes the cutoff. Must be positive.
+    ///
+    /// With both `None` the call is a no-op returning `0`. In-flight work is
+    /// never collected: `PENDING`/`ENQUEUED`/`DELAYED` rows survive regardless
+    /// of age.
+    ///
+    /// The default implementation composes
+    /// [`list_workflows`](Self::list_workflows) and
+    /// [`delete_workflows`](Self::delete_workflows); the SQL backends override
+    /// it with a single `DELETE`.
+    async fn garbage_collect(
+        &self,
+        cutoff_epoch_ms: Option<i64>,
+        rows_threshold: Option<i64>,
+    ) -> Result<u64> {
+        let Some(cutoff) = resolve_gc_cutoff(self, cutoff_epoch_ms, rows_threshold).await? else {
+            return Ok(0);
+        };
+        let victims = self
+            .list_workflows(&ListFilter {
+                status: vec![
+                    STATUS_SUCCESS.to_string(),
+                    STATUS_ERROR.to_string(),
+                    STATUS_CANCELLED.to_string(),
+                    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED.to_string(),
+                ],
+                // The delete bound is *strictly* before the cutoff; the filter's
+                // bound is inclusive, so step one millisecond back.
+                end_time_ms: Some(cutoff - 1),
+                load_input: false,
+                load_output: false,
+                ..Default::default()
+            })
+            .await?;
+        let ids: Vec<String> = victims.into_iter().map(|w| w.id).collect();
+        let deleted = ids.len() as u64;
+        self.delete_workflows(&ids, false).await?;
+        Ok(deleted)
+    }
 
     /// Reschedule a `DELAYED` workflow: set its `delay_until` to
     /// `delay_until_ms`. Only affects a row currently in `DELAYED` (a queue

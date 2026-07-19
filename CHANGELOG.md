@@ -8,6 +8,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Garbage collection: `DurableEngine::garbage_collect(cutoff_epoch_ms,
+  rows_threshold)` deletes workflow history — every non-in-flight workflow
+  created strictly before the cutoff, with its step/event/stream rows — and
+  returns the deleted count. The cutoff is the newer of the absolute bound
+  and the Nth-newest workflow's `created_at`, matching the other DBOS SDKs;
+  `PENDING`/`ENQUEUED`/`DELAYED` work survives regardless of age. Backed by
+  a new `StateProvider::garbage_collect` (single-statement overrides on
+  Postgres/SQLite; a generic default implementation covers custom
+  providers). The conductor's `retention` message now enforces its GC
+  bounds — so DBOS Cloud's server-side retention policy actually takes
+  effect on a console-connected app — and the admin server's
+  `POST /dbos-garbage-collect` runs the real collection instead of the
+  reserved no-op.
+
 - `AdminServer::start_on` binds the admin server to an explicit address —
   e.g. loopback, so the unauthenticated control surface is reachable only
   from the machine itself. `start` keeps the cross-SDK all-interfaces

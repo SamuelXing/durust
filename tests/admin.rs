@@ -230,3 +230,47 @@ fn local_non_loopback_v4() -> Option<std::net::Ipv4Addr> {
         _ => None,
     }
 }
+
+/// `POST /dbos-garbage-collect` deletes history per the given bounds: a
+/// future cutoff collects the completed run, and the endpoint answers 204
+/// like the reference SDK.
+#[tokio::test]
+async fn admin_garbage_collect_endpoint_deletes_history() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("echo", |_ctx: DurableContext, msg: String| async move {
+        Ok::<_, Error>(msg)
+    });
+    let engine = Arc::new(engine);
+    engine.launch().await?;
+    engine
+        .start::<String, String>(
+            "echo",
+            "hi".into(),
+            WorkflowOptions {
+                workflow_id: Some("gc-target".into()),
+                ..Default::default()
+            },
+        )
+        .await?
+        .await?;
+
+    let admin = AdminServer::start(engine.clone(), 0).await?;
+    let port = admin.port();
+
+    let cutoff = chrono::Utc::now().timestamp_millis() + 3_600_000;
+    let (status, _) = http(
+        port,
+        "POST",
+        "/dbos-garbage-collect",
+        Some(&format!("{{\"cutoff_epoch_timestamp_ms\":{cutoff}}}")),
+    )
+    .await;
+    assert_eq!(status, 204);
+
+    let (status, _) = http(port, "GET", "/workflows/gc-target", None).await;
+    assert_eq!(status, 404, "collected workflow is gone");
+
+    admin.shutdown(Duration::from_secs(2)).await?;
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}

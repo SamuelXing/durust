@@ -113,6 +113,27 @@
 //! - It is a per-process database: two processes can share the file, but a
 //!   fleet belongs on Postgres.
 //!
+//! # History retention
+//!
+//! Every workflow leaves rows behind — its status, step checkpoints, events,
+//! and streams — and nothing removes them automatically: the history tables
+//! grow without bound until you decide otherwise. That is deliberate
+//! (history is the audit trail and the recovery substrate), but a production
+//! deployment needs a retention decision, because table and index bloat on
+//! `workflow_status` eventually taxes the hottest queries in the system —
+//! the queue dispatchers'.
+//!
+//! [`garbage_collect`](crate::DurableEngine::garbage_collect) is the
+//! trimming primitive, with the same semantics as the other DBOS SDKs: pass
+//! an absolute `created_at` cutoff, a keep-the-newest-N rows bound, or both
+//! (the newer cutoff wins), and everything terminal that falls outside is
+//! deleted — in-flight and queued work survives regardless of age. Run it
+//! from a scheduled workflow, a cron job against the admin server's
+//! `POST /dbos-garbage-collect`, or let the DBOS console's retention policy
+//! drive it through the conductor. Deleted history is unrecoverable; export
+//! what you need first
+//! ([`export_workflow`](crate::DurableEngine::export_workflow)).
+//!
 //! # Watching it
 //!
 //! The [`observability`](crate::observability) guide covers the runtime

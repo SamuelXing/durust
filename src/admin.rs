@@ -30,7 +30,8 @@
 //! - `GET  /dbos-workflow-queues-metadata` — registered-queue config
 //! - `POST /dbos-workflow-recovery` — recover a set of executors' pending work
 //! - `POST /dbos-global-timeout` — cancel everything created before a cutoff
-//! - `POST /dbos-garbage-collect` — reserved (no-op, matching the reference)
+//! - `POST /dbos-garbage-collect` — delete workflow history per the given
+//!   retention bounds ([`DurableEngine::garbage_collect`])
 //! - `POST /workflows` — list workflows (JSON filter body)
 //! - `POST /queues` — list queued workflows
 //! - `GET  /workflows/{id}` — one workflow
@@ -238,16 +239,16 @@ async fn global_timeout(State(engine): State<Arc<DurableEngine>>, body: Bytes) -
 
 #[derive(Default, Deserialize)]
 struct GarbageCollectRequest {
-    #[allow(dead_code)]
     cutoff_epoch_timestamp_ms: Option<i64>,
-    #[allow(dead_code)]
     rows_threshold: Option<i64>,
 }
 
-async fn garbage_collect(body: Bytes) -> ApiResult {
-    // Reserved: parse the body for shape-compatibility, but garbage collection
-    // is not yet implemented (matching the reference SDK's no-op endpoint).
-    let _req: GarbageCollectRequest = parse_optional(&body)?;
+async fn garbage_collect(State(engine): State<Arc<DurableEngine>>, body: Bytes) -> ApiResult {
+    let req: GarbageCollectRequest = parse_optional(&body)?;
+    engine
+        .garbage_collect(req.cutoff_epoch_timestamp_ms, req.rows_threshold)
+        .await
+        .map_err(internal)?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 

@@ -1476,6 +1476,41 @@ impl DurableEngine {
         Ok(ids.len())
     }
 
+    /// Garbage-collect workflow history: delete every workflow **not** in
+    /// `PENDING`/`ENQUEUED`/`DELAYED` created strictly before a cutoff —
+    /// along with its step, event, and stream rows — and return how many were
+    /// deleted. The retention counterpart to
+    /// [`delete_workflows`](Self::delete_workflows)' targeted delete, with the
+    /// same cross-SDK semantics as the other DBOS SDKs (the DBOS console's
+    /// retention policy calls this through the conductor, and the admin
+    /// server's `POST /dbos-garbage-collect` exposes it over HTTP).
+    ///
+    /// The cutoff is the more restrictive (newer) of the two bounds:
+    ///
+    /// - `cutoff_epoch_ms` — delete anything created before this epoch-ms
+    ///   instant;
+    /// - `rows_threshold` — keep (at most) the newest N workflows: the
+    ///   `created_at` of the Nth-newest becomes the cutoff. Must be positive.
+    ///
+    /// Both `None` is a no-op returning `0`. In-flight and still-queued work
+    /// survives regardless of age; deleted history is gone — run exports
+    /// ([`export_workflow`](Self::export_workflow)) first if you need an
+    /// archive.
+    pub async fn garbage_collect(
+        &self,
+        cutoff_epoch_ms: Option<i64>,
+        rows_threshold: Option<i64>,
+    ) -> Result<u64> {
+        let deleted = self
+            .provider
+            .garbage_collect(cutoff_epoch_ms, rows_threshold)
+            .await?;
+        if deleted > 0 {
+            tracing::info!(deleted, "garbage collected workflows");
+        }
+        Ok(deleted)
+    }
+
     /// Stop the queue dispatchers and wait for in-flight workflow tasks started
     /// here to drain (up to `timeout`). Runs re-dispatched by recovery —
     /// [`recover`](Self::recover) or

@@ -710,7 +710,16 @@ async fn conductor_handles_metrics_and_retention() -> Result<()> {
                    "body":{"timeout_cutoff_epoch_ms":9999999999999i64}}),
         )
         .await;
-        (metrics, bad_class, retention)
+        // Then garbage collection, the same way DBOS Cloud's retention policy
+        // drives it: a far-future cutoff collects everything now terminal —
+        // the completed run and the workflow the timeout pass just cancelled.
+        let gc = exchange(
+            &mut ws,
+            json!({"type":"retention","request_id":"gc",
+                   "body":{"gc_cutoff_epoch_ms":9999999999999i64}}),
+        )
+        .await;
+        (metrics, bad_class, retention, gc)
     });
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
@@ -754,7 +763,7 @@ async fn conductor_handles_metrics_and_retention() -> Result<()> {
         },
     )?;
 
-    let (metrics, bad_class, retention) = server.await.unwrap();
+    let (metrics, bad_class, retention, gc) = server.await.unwrap();
 
     // metrics -> workflow_count for "work" and step_count for "s1".
     let ms = metrics["metrics"].as_array().unwrap();
@@ -774,10 +783,16 @@ async fn conductor_handles_metrics_and_retention() -> Result<()> {
         .contains("Unexpected metric class"));
     assert!(bad_class["metrics"].is_null());
 
-    // retention timeout -> success, and the delayed workflow is now cancelled.
+    // retention timeout -> success; the follow-up GC then collected all
+    // terminal history: the completed run and the delayed workflow — which
+    // only became collectable because the timeout pass cancelled it (DELAYED
+    // itself survives GC), so an empty table proves both halves ran.
     assert_eq!(retention["success"], true);
-    let status = engine.retrieve_workflow::<String>("delayed-1").await?;
-    assert_eq!(status.get_status().await?.status, "CANCELLED");
+    assert_eq!(gc["success"], true);
+    let remaining = engine
+        .list_workflows(&durare::ListFilter::default())
+        .await?;
+    assert!(remaining.is_empty(), "history collected: {remaining:?}");
 
     conductor.shutdown(Duration::from_secs(2)).await?;
     engine.shutdown(Duration::from_secs(1)).await?;

@@ -1290,11 +1290,7 @@ struct RetentionRequest {
 
 #[derive(Default, Deserialize)]
 struct RetentionBody {
-    // GC parameters are accepted for wire-compatibility but not yet acted on
-    // (garbage collection is unimplemented, like the admin server's endpoint).
-    #[allow(dead_code)]
     gc_cutoff_epoch_ms: Option<i64>,
-    #[allow(dead_code)]
     gc_rows_threshold: Option<i64>,
     timeout_cutoff_epoch_ms: Option<i64>,
 }
@@ -1306,17 +1302,26 @@ async fn handle_retention(
     text: &str,
 ) -> Result<()> {
     let req: RetentionRequest = serde_json::from_str(text)?;
-    // Timeout enforcement: cancel everything still pending before the cutoff.
-    // (Garbage collection is not yet implemented — a no-op, matching the admin
-    // server's GC endpoint.)
-    let err = match req.body.timeout_cutoff_epoch_ms {
-        Some(cutoff) => engine
-            .cancel_all_before(cutoff)
+    // The retention policy has two independent halves, applied in order:
+    // garbage-collect old history first, then time out anything still pending
+    // before the timeout cutoff — the second only runs if the first succeeded.
+    let mut err = None;
+    if req.body.gc_cutoff_epoch_ms.is_some() || req.body.gc_rows_threshold.is_some() {
+        err = engine
+            .garbage_collect(req.body.gc_cutoff_epoch_ms, req.body.gc_rows_threshold)
             .await
             .err()
-            .map(|e| format!("failed to timeout workflows: {e}")),
-        None => None,
-    };
+            .map(|e| format!("failed to garbage collect workflows: {e}"));
+    }
+    if err.is_none() {
+        if let Some(cutoff) = req.body.timeout_cutoff_epoch_ms {
+            err = engine
+                .cancel_all_before(cutoff)
+                .await
+                .err()
+                .map(|e| format!("failed to timeout workflows: {e}"));
+        }
+    }
     let mut resp = base_response("retention", rid, err.clone());
     resp.insert("success".into(), json!(err.is_none()));
     send(ws, resp).await
