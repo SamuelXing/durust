@@ -187,3 +187,46 @@ async fn admin_fork_endpoint_returns_new_id() -> Result<()> {
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
+
+/// `start_on` restricts the bind address: bound to loopback, the server
+/// answers on 127.0.0.1 but is not listening on the machine's other
+/// interfaces (the security-posture escape hatch from the all-interfaces
+/// default).
+#[tokio::test]
+async fn admin_server_binds_loopback_only() -> Result<()> {
+    use std::net::Ipv4Addr;
+
+    let engine = Arc::new(DurableEngine::new(Arc::new(InMemoryProvider::new())).await?);
+    engine.launch().await?;
+    let admin = AdminServer::start_on(engine.clone(), (Ipv4Addr::LOCALHOST, 0).into()).await?;
+    let port = admin.port();
+
+    let (status, _) = http(port, "GET", "/dbos-healthz", None).await;
+    assert_eq!(status, 200);
+
+    // A non-loopback local address must refuse the connection. (Skipped when
+    // the host has no such address, e.g. a loopback-only CI runner.)
+    if let Some(external) = local_non_loopback_v4() {
+        let refused = TcpStream::connect((external, port)).await;
+        assert!(
+            refused.is_err(),
+            "loopback-bound admin server reachable on {external}"
+        );
+    }
+
+    admin.shutdown(Duration::from_secs(2)).await?;
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// A non-loopback IPv4 address of this host, if it has one: connecting a UDP
+/// socket to a public address reveals the local interface address without
+/// sending a packet.
+fn local_non_loopback_v4() -> Option<std::net::Ipv4Addr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("192.0.2.1:9").ok()?; // TEST-NET-1: never routed, nothing sent
+    match sock.local_addr().ok()? {
+        std::net::SocketAddr::V4(a) if !a.ip().is_loopback() => Some(*a.ip()),
+        _ => None,
+    }
+}

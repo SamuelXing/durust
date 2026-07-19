@@ -1,9 +1,11 @@
 name: security
 
-# Vulnerability scan of the dependency tree — the Rust analog of the Go SDK's
-# govulncheck. Deliberately NOT a PR gate: a freshly published advisory should
-# never block unrelated work from landing on main. It runs on a weekly schedule,
-# on demand, and whenever the dependency manifests change.
+# Supply-chain scans of the dependency tree: cargo audit (RustSec advisories —
+# the Rust analog of the Go SDK's govulncheck) and cargo deny (advisories plus
+# license allow-listing and source pinning, per deny.toml). Deliberately NOT a
+# PR gate: a freshly published advisory should never block unrelated work from
+# landing on main. Runs on a weekly schedule, on demand, and whenever the
+# dependency manifests or the policy change.
 
 on:
   schedule:
@@ -14,6 +16,7 @@ on:
     branches: [main]
     paths:
       - '**/Cargo.toml'
+      - 'deny.toml'
       - '.github/workflows/security.yml'
 
 permissions:
@@ -37,3 +40,14 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: audit
         run: cargo audit
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Advisories + license allow-list + registry/source pinning (deny.toml).
+      # Generates its own lockfile (Cargo.lock is gitignored).
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

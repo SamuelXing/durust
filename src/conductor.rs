@@ -95,7 +95,16 @@ pub struct ConductorConfig {
     /// `DBOS_DOMAIN` env var, like the other DBOS SDKs). The
     /// `/websocket/{app}/{key}` path is appended automatically either way.
     pub url: String,
-    /// API key for this application.
+    /// API key for this application. A secret: it is embedded in the websocket
+    /// URL per the conductor protocol, and durare never logs it — connection
+    /// failures log only the transport error. `ConductorConfig` deliberately
+    /// implements no `Debug`, so a config cannot leak through `{:?}` formatting:
+    ///
+    /// ```compile_fail
+    /// fn debug_it(c: &durare::ConductorConfig) -> String {
+    ///     format!("{c:?}")
+    /// }
+    /// ```
     pub api_key: String,
     /// Application name.
     pub app_name: String,

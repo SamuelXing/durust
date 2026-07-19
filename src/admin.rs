@@ -36,6 +36,20 @@
 //! - `GET  /workflows/{id}` — one workflow
 //! - `GET  /workflows/{id}/steps` — its steps
 //! - `POST /workflows/{id}/{cancel,resume,fork}` — management
+//!
+//! # Security
+//!
+//! The admin API is **unauthenticated by design**, matching the other DBOS
+//! SDKs: whoever can reach the port can read state and cancel, resume, fork,
+//! or recover workflows. [`AdminServer::start`] binds all interfaces — the
+//! cross-SDK default, and what orchestrator health probes (which arrive over
+//! the pod network, not loopback) require — so treat the port like a database
+//! port: keep it on a private network or behind a firewall / network policy.
+//! To keep it reachable only from the machine itself, bind loopback instead
+//! with [`AdminServer::start_on`], and front it with your own authenticated
+//! proxy if it must be exposed further. The wider posture — what durare
+//! trusts, opens, and guarantees — is in the [`security`](crate::security)
+//! guide.
 
 use crate::engine::{DurableEngine, WorkflowOptions};
 use crate::error::{Error, Result};
@@ -69,8 +83,23 @@ impl AdminServer {
     /// Bind and start the admin server on `port` (use `0` for an OS-assigned
     /// ephemeral port — read it back with [`port`](Self::port)). The server runs
     /// on its own task until [`shutdown`](Self::shutdown) is called.
+    ///
+    /// Binds **all interfaces**, like the other DBOS SDKs — required for
+    /// orchestrator probes, but the API is unauthenticated, so read the
+    /// [`security`](crate::security) guide's exposure notes before opening
+    /// the port; [`start_on`](Self::start_on) restricts the bind address.
     pub async fn start(engine: Arc<DurableEngine>, port: u16) -> Result<AdminServer> {
-        let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+        Self::start_on(engine, (std::net::Ipv4Addr::UNSPECIFIED, port).into()).await
+    }
+
+    /// Like [`start`](Self::start), but bound to an explicit address — e.g.
+    /// `(Ipv4Addr::LOCALHOST, 3001)` keeps the unauthenticated control surface
+    /// reachable only from the machine itself.
+    pub async fn start_on(
+        engine: Arc<DurableEngine>,
+        addr: std::net::SocketAddr,
+    ) -> Result<AdminServer> {
+        let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| Error::app(format!("admin server bind failed: {e}")))?;
         let port = listener
