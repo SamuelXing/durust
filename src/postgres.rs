@@ -1418,17 +1418,29 @@ impl StateProvider for PostgresProvider {
         };
         // The canonical DBOS GC delete: strictly-older terminal (and dead-letter)
         // rows go; in-flight work survives regardless of age. Children cascade.
-        let res = sqlx::query(
-            "DELETE FROM workflow_status
-             WHERE created_at < $1 AND status NOT IN ($2, $3, $4)",
-        )
-        .bind(cutoff)
-        .bind(STATUS_PENDING)
-        .bind(STATUS_ENQUEUED)
-        .bind(STATUS_DELAYED)
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected())
+        // Batched so a large backlog is many short transactions, not one long
+        // delete pinning the MVCC horizon of the hottest table.
+        let mut total = 0u64;
+        loop {
+            let res = sqlx::query(
+                "DELETE FROM workflow_status
+                 WHERE workflow_uuid IN (
+                     SELECT workflow_uuid FROM workflow_status
+                     WHERE created_at < $1 AND status NOT IN ($2, $3, $4)
+                     LIMIT $5)",
+            )
+            .bind(cutoff)
+            .bind(STATUS_PENDING)
+            .bind(STATUS_ENQUEUED)
+            .bind(STATUS_DELAYED)
+            .bind(crate::provider::GC_BATCH)
+            .execute(&self.pool)
+            .await?;
+            total += res.rows_affected();
+            if res.rows_affected() < crate::provider::GC_BATCH as u64 {
+                return Ok(total);
+            }
+        }
     }
 
     async fn set_workflow_delay(&self, id: &str, delay_until_ms: i64) -> Result<bool> {

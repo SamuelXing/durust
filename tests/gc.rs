@@ -289,3 +289,119 @@ async fn pg_gc_deletes_terminal_history_and_cascades() -> Result<()> {
     common::drop_hermetic_pg_db(&admin, &dbname).await;
     Ok(())
 }
+
+/// The retention knob end to end: a configured policy sweeps automatically
+/// after launch — terminal history goes, in-flight work survives, the
+/// collected count shows up in the metrics — and shutdown stops the sweeper.
+#[tokio::test]
+async fn retention_policy_sweeps_automatically() -> Result<()> {
+    use durare::{EngineConfig, RetentionPolicy};
+
+    let config = EngineConfig::default().retention(
+        RetentionPolicy::new()
+            .period(Duration::ZERO) // everything already-created is collectable
+            .sweep_interval(Duration::from_millis(200)),
+    );
+    let mut engine = DurableEngine::with_config(Arc::new(InMemoryProvider::new()), config).await?;
+    engine.register("done", |_ctx: DurableContext, (): ()| async move {
+        Ok::<_, Error>(())
+    });
+    engine.register("waiter", |ctx: DurableContext, (): ()| async move {
+        ctx.recv::<String>("go", Duration::from_secs(30)).await?;
+        Ok::<_, Error>(())
+    });
+    engine.launch().await?;
+
+    engine
+        .start::<(), ()>(
+            "done",
+            (),
+            WorkflowOptions {
+                workflow_id: Some("swept".into()),
+                ..Default::default()
+            },
+        )
+        .await?
+        .await?;
+    let waiting = engine
+        .start::<(), ()>(
+            "waiter",
+            (),
+            WorkflowOptions {
+                workflow_id: Some("survivor".into()),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+    // Give the sweeper a few intervals to fire.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if all_ids(&engine).await? == vec!["survivor"] {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sweep did not collect within 5s: {:?}",
+            all_ids(&engine).await?
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(engine.metrics().await?.workflows_collected_total >= 1);
+
+    // The in-flight survivor still completes normally.
+    engine.send("survivor", "on".to_string(), "go").await?;
+    waiting.await?;
+
+    engine.shutdown(Duration::from_secs(2)).await?;
+    Ok(())
+}
+
+/// A policy with neither bound is a configuration mistake, rejected at launch.
+#[tokio::test]
+async fn boundless_retention_policy_is_rejected() -> Result<()> {
+    use durare::{EngineConfig, RetentionPolicy};
+
+    let config = EngineConfig::default().retention(RetentionPolicy::new());
+    let engine = DurableEngine::with_config(Arc::new(InMemoryProvider::new()), config).await?;
+    let err = engine.launch().await.expect_err("boundless policy");
+    assert!(err.to_string().contains("retention policy"), "{err}");
+    Ok(())
+}
+
+/// Collection over a backlog larger than one delete batch (10k rows) loops
+/// until done: 12k seeded terminal rows go in two batches, with the full
+/// count returned.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_gc_batches_large_backlogs() -> Result<()> {
+    use durare::SqliteProvider;
+
+    let mut path = std::env::temp_dir();
+    path.push(format!("durare-gc-{}.db", uuid::Uuid::new_v4()));
+    let url = format!("sqlite://{}", path.display());
+
+    // Engine construction runs the migrations; the backlog is seeded raw.
+    let engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    let pool = sqlx::sqlite::SqlitePool::connect(&url).await.unwrap();
+    sqlx::query(
+        "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 12000)
+         INSERT INTO workflow_status (workflow_uuid, status, name, created_at, updated_at)
+         SELECT 'seed-' || n, 'SUCCESS', 'seeded', 1000 + n, 1000 + n FROM seq",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let deleted = engine.garbage_collect(Some(far_future_ms()), None).await?;
+    assert_eq!(deleted, 12_000, "both batches counted");
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_status")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+    pool.close().await;
+
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}

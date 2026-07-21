@@ -206,7 +206,7 @@ pub use debounce::{Debouncer, DebouncerClient};
 pub use engine::WorkflowResult;
 pub use engine::{
     erase, DeduplicationPolicy, DurableEngine, DurableEngineBuilder, EngineConfig, EngineMetrics,
-    HealthReport, RegisteredWorkflow, WorkflowDef, WorkflowFn, WorkflowOptions,
+    HealthReport, RegisteredWorkflow, RetentionPolicy, WorkflowDef, WorkflowFn, WorkflowOptions,
     WorkflowRegistration,
 };
 pub use error::{Error, ErrorCode, Result};

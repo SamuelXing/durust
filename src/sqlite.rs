@@ -1099,17 +1099,29 @@ impl StateProvider for SqliteProvider {
         };
         // The canonical DBOS GC delete: strictly-older terminal (and dead-letter)
         // rows go; in-flight work survives regardless of age. Children cascade.
-        let res = sqlx::query(
-            "DELETE FROM workflow_status
-             WHERE created_at < ? AND status NOT IN (?, ?, ?)",
-        )
-        .bind(cutoff)
-        .bind(STATUS_PENDING)
-        .bind(STATUS_ENQUEUED)
-        .bind(STATUS_DELAYED)
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected())
+        // Batched so a large backlog is many short write transactions — under
+        // WAL, long writes starve every other writer in the process.
+        let mut total = 0u64;
+        loop {
+            let res = sqlx::query(
+                "DELETE FROM workflow_status
+                 WHERE workflow_uuid IN (
+                     SELECT workflow_uuid FROM workflow_status
+                     WHERE created_at < ? AND status NOT IN (?, ?, ?)
+                     LIMIT ?)",
+            )
+            .bind(cutoff)
+            .bind(STATUS_PENDING)
+            .bind(STATUS_ENQUEUED)
+            .bind(STATUS_DELAYED)
+            .bind(crate::provider::GC_BATCH)
+            .execute(&self.pool)
+            .await?;
+            total += res.rows_affected();
+            if res.rows_affected() < crate::provider::GC_BATCH as u64 {
+                return Ok(total);
+            }
+        }
     }
 
     async fn set_workflow_delay(&self, id: &str, delay_until_ms: i64) -> Result<bool> {

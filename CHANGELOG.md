@@ -8,6 +8,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Retention policy: `EngineConfig::retention(RetentionPolicy)` makes history
+  trimming set-and-forget — `launch` starts a background sweeper that
+  periodically garbage-collects per the policy (an age bound, a
+  keep-the-newest-N bound, or both; a boundless policy is rejected at
+  launch). Sweeps are per-executor with jittered intervals, so a fleet
+  needs no coordination, and stop with `shutdown`. A new
+  `workflows_collected_total` counter in `EngineMetrics` makes trimming
+  observable. Garbage-collection deletes now run in bounded batches
+  (10k rows per statement) on all backends, so enabling a policy over a
+  large backlog is many short transactions instead of one long
+  vacuum-pinning delete.
 - Garbage collection: `DurableEngine::garbage_collect(cutoff_epoch_ms,
   rows_threshold)` deletes workflow history — every non-in-flight workflow
   created strictly before the cutoff, with its step/event/stream rows — and

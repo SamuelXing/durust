@@ -158,6 +158,12 @@ pub(crate) fn group_stream_rows(
 /// the producer is still active.
 const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+/// How many workflows one garbage-collection `DELETE` may remove: collection
+/// over a large backlog runs as a sequence of short transactions of this size,
+/// so vacuum keeps up and the hot `workflow_status` table is never pinned by
+/// one long delete.
+pub(crate) const GC_BATCH: i64 = 10_000;
+
 /// Resolve the effective garbage-collection cutoff from the two bounds — the
 /// newer of the absolute `cutoff_epoch_ms` and the `created_at` of the
 /// `rows_threshold`-th-newest workflow. `None` means nothing to collect (no
@@ -1418,10 +1424,13 @@ pub trait StateProvider: Send + Sync {
     /// never collected: `PENDING`/`ENQUEUED`/`DELAYED` rows survive regardless
     /// of age.
     ///
-    /// The default implementation composes
-    /// [`list_workflows`](Self::list_workflows) and
+    /// Deletion happens in bounded batches (10,000 rows at a time), so a
+    /// first sweep over a large backlog is many short transactions instead of
+    /// one long one — a long-running delete would pin the MVCC horizon and
+    /// bloat the hottest table in the system. The default implementation
+    /// composes [`list_workflows`](Self::list_workflows) and
     /// [`delete_workflows`](Self::delete_workflows); the SQL backends override
-    /// it with a single `DELETE`.
+    /// it with a direct batched `DELETE`.
     async fn garbage_collect(
         &self,
         cutoff_epoch_ms: Option<i64>,
@@ -1430,26 +1439,36 @@ pub trait StateProvider: Send + Sync {
         let Some(cutoff) = resolve_gc_cutoff(self, cutoff_epoch_ms, rows_threshold).await? else {
             return Ok(0);
         };
-        let victims = self
-            .list_workflows(&ListFilter {
-                status: vec![
-                    STATUS_SUCCESS.to_string(),
-                    STATUS_ERROR.to_string(),
-                    STATUS_CANCELLED.to_string(),
-                    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED.to_string(),
-                ],
-                // The delete bound is *strictly* before the cutoff; the filter's
-                // bound is inclusive, so step one millisecond back.
-                end_time_ms: Some(cutoff - 1),
-                load_input: false,
-                load_output: false,
-                ..Default::default()
-            })
-            .await?;
-        let ids: Vec<String> = victims.into_iter().map(|w| w.id).collect();
-        let deleted = ids.len() as u64;
-        self.delete_workflows(&ids, false).await?;
-        Ok(deleted)
+        let filter = ListFilter {
+            status: vec![
+                STATUS_SUCCESS.to_string(),
+                STATUS_ERROR.to_string(),
+                STATUS_CANCELLED.to_string(),
+                STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED.to_string(),
+            ],
+            // The delete bound is *strictly* before the cutoff; the filter's
+            // bound is inclusive, so step one millisecond back.
+            end_time_ms: Some(cutoff - 1),
+            limit: Some(GC_BATCH),
+            load_input: false,
+            load_output: false,
+            ..Default::default()
+        };
+        let mut total = 0u64;
+        loop {
+            let ids: Vec<String> = self
+                .list_workflows(&filter)
+                .await?
+                .into_iter()
+                .map(|w| w.id)
+                .collect();
+            let batch = ids.len() as u64;
+            self.delete_workflows(&ids, false).await?;
+            total += batch;
+            if batch < GC_BATCH as u64 {
+                return Ok(total);
+            }
+        }
     }
 
     /// Reschedule a `DELAYED` workflow: set its `delay_until` to
